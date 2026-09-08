@@ -33,6 +33,7 @@ struct SubscriptionsView: View {
                     SubscriptionOverviewCard { metric in
                         sourceManagementRoute = metric.managementRoute
                     }
+                    NodeMapOverview(nodes: model.enabledNodes)
                 }
 
                 if model.subscriptions.isEmpty && model.localNodes.isEmpty {
