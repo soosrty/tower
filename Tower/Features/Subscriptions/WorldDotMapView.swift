@@ -453,21 +453,11 @@ struct WorldDotMapView: View {
             .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
             .contentShape(Rectangle())
             .clipped()
-            // Keep the map's gestures below the page scroll gesture while at
-            // the overview scale. Pan is only installed after zooming in.
-            .simultaneousGesture(magnifyGesture(in: geometry.size))
-            .simultaneousGesture(
-                mapTapGesture(
-                    layout: layout,
-                    displayItems: displayItems,
-                    presentedLabels: presentedLabels,
-                    in: geometry.size
-                )
-            )
-            .gesture(
-                panGesture(in: geometry.size),
-                including: viewport.scale > Viewport.minimumScale + 0.001 ? .gesture : .none
-            )
+            // Do not attach a DragGesture, MagnificationGesture, or
+            // SpatialTapGesture here. This view is embedded in the page's
+            // ScrollView; on iOS 16 even simultaneous gestures can win the
+            // vertical arena and make the page snap back after a swipe.
+            // The map remains display-only so the page scroll is deterministic.
             .onChange(of: geometry.size) { size in
                 let normalized = viewport.normalized(in: size)
                 viewport = normalized
