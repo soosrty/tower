@@ -110,7 +110,7 @@ final class AppModel: ObservableObject {
     private var lastAutoRefreshAt: Date?
     @Published var configurationName = TowerBrand.localizedName
     @Published var preferRuleSets = false
-    @Published private var preferRuleSetsWasExplicitlySet = false
+    private var preferRuleSetsWasExplicitlySet = false
     /// Off by default because enabling it places credential-bearing airport
     /// URLs in the profile handed to another app.
     @Published var embedRemoteSubscriptionLinks = false

@@ -378,7 +378,7 @@ struct WorldDotMapView: View {
                     )
                     .equatable()
                     .frame(width: geometry.size.width * viewport.scale, height: geometry.size.height * viewport.scale)
-                    .drawingGroup()
+                    .drawingGroup(opaque: false, colorMode: .linear)
                     .offset(RenderPlanner.rasterOrigin(size: geometry.size, scale: viewport.scale, offset: viewport.offset))
                 } else {
                     WorldDotCanvas(
@@ -453,6 +453,8 @@ struct WorldDotMapView: View {
             .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
             .contentShape(Rectangle())
             .clipped()
+            // Keep the map's gestures below the page scroll gesture while at
+            // the overview scale. Pan is only installed after zooming in.
             .simultaneousGesture(magnifyGesture(in: geometry.size))
             .simultaneousGesture(
                 mapTapGesture(
@@ -462,9 +464,10 @@ struct WorldDotMapView: View {
                     in: geometry.size
                 )
             )
-            .highPriorityGesture(
-                panGesture(in: geometry.size),
-                including: viewport.scale > Viewport.minimumScale + 0.001 ? .gesture : .none
+            .gesture(
+                viewport.scale > Viewport.minimumScale + 0.001
+                    ? AnyGesture(panGesture(in: geometry.size))
+                    : AnyGesture(EmptyGesture())
             )
             .onChange(of: geometry.size) { size in
                 let normalized = viewport.normalized(in: size)
