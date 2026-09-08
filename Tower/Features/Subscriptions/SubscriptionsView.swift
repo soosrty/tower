@@ -12,139 +12,122 @@ struct SubscriptionsView: View {
     @State private var editingLocalNode: ProxyNode?
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 22) {
-                    Color.clear
-                        .frame(height: 0)
-                        .id(SubscriptionScrollTarget.top)
-                    if TowerPlatform.isMac {
-                        macHeader
-                        if isMacMapExpanded {
-                            NodeMapOverview(nodes: model.enabledNodes)
-                                .frame(maxWidth: .infinity)
-                                .transition(.opacity)
-                                .accessibilityIdentifier("inline-node-map")
-                        }
-                        if !model.subscriptions.isEmpty || !model.localNodes.isEmpty {
-                            MacSubscriptionSummary { metric in
-                                sourceManagementRoute = metric.managementRoute
-                            }
-                        }
-                    } else {
-                        SubscriptionOverviewCard { metric in
+        ScrollView {
+            LazyVStack(spacing: 22) {
+                Color.clear.frame(height: 0).id(SubscriptionScrollTarget.top)
+
+                if TowerPlatform.isMac {
+                    macHeader
+                    if isMacMapExpanded {
+                        NodeMapOverview(nodes: model.enabledNodes)
+                            .frame(maxWidth: .infinity)
+                            .transition(.opacity)
+                            .accessibilityIdentifier("inline-node-map")
+                    }
+                    if !model.subscriptions.isEmpty || !model.localNodes.isEmpty {
+                        MacSubscriptionSummary { metric in
                             sourceManagementRoute = metric.managementRoute
                         }
-                        NodeMapOverview(nodes: model.enabledNodes)
                     }
+                } else {
+                    SubscriptionOverviewCard { metric in
+                        sourceManagementRoute = metric.managementRoute
+                    }
+                }
 
-                    if model.subscriptions.isEmpty && model.localNodes.isEmpty {
-                        SubscriptionEmptyState {
-                            isAddSourcePresented = true
-                        }
-                        .frame(maxWidth: TowerPlatform.isMac ? 600 : .infinity)
-                        .padding(.top, TowerPlatform.isMac ? 32 : 0)
-                    } else {
-                        subscriptionsSection
-                        localNodesSection
+                if model.subscriptions.isEmpty && model.localNodes.isEmpty {
+                    SubscriptionEmptyState {
+                        isAddSourcePresented = true
+                    }
+                    .frame(maxWidth: TowerPlatform.isMac ? 600 : .infinity)
+                    .padding(.top, TowerPlatform.isMac ? 32 : 0)
+                } else {
+                    subscriptionsSection
+                    localNodesSection
 
-                        if TowerPlatform.isMac {
-                            HStack {
-                                PrivacyBadge()
-                                Spacer()
-                                Button("继续选择规则", systemImage: "arrow.right") {
-                                    model.selectedTab = .rules
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.large)
-                                .accessibilityIdentifier("continue-to-rules")
-                            }
-                        } else {
-                            Button {
+                    if TowerPlatform.isMac {
+                        HStack {
+                            PrivacyBadge()
+                            Spacer()
+                            Button("继续选择规则", systemImage: "arrow.right") {
                                 model.selectedTab = .rules
-                            } label: {
-                                PrimaryActionLabel(title: "继续选择规则", symbol: "arrow.right")
                             }
-                            .buttonStyle(ResponsivePressButtonStyle())
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.large)
                             .accessibilityIdentifier("continue-to-rules")
                         }
+                    } else {
+                        Button {
+                            model.selectedTab = .rules
+                        } label: {
+                            PrimaryActionLabel(title: "继续选择规则", symbol: "arrow.right")
+                        }
+                        .buttonStyle(ResponsivePressButtonStyle())
+                        .accessibilityIdentifier("continue-to-rules")
                     }
                 }
-                .frame(maxWidth: TowerPlatform.isMac ? TowerTheme.macContentMaxWidth : .infinity)
-                .padding(.horizontal, TowerPlatform.isMac ? 28 : TowerTheme.pagePadding)
-                .frame(maxWidth: .infinity)
-                .padding(.top, 12)
-                .padding(.bottom, 34)
             }
-            .background(TowerTheme.background.ignoresSafeArea())
-            .navigationTitle("我的订阅")
-            .navigationBarTitleDisplayMode(TowerPlatform.isMac ? .inline : .large)
-            .task(id: TowerPlatform.isMac ? model.enabledNodes : []) {
-                guard TowerPlatform.isMac else { return }
-                await model.resolveIPCountries(for: model.enabledNodes)
-            }
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("管理") {
-                        sourceManagementRoute = .subscriptions
-                    }
-                    .accessibilityLabel("批量管理订阅和自有节点")
-                    .accessibilityIdentifier("source-management-button")
+            .frame(maxWidth: TowerPlatform.isMac ? TowerTheme.macContentMaxWidth : .infinity)
+            .padding(.horizontal, TowerPlatform.isMac ? 28 : TowerTheme.pagePadding)
+            .frame(maxWidth: .infinity)
+            .padding(.top, 12)
+            .padding(.bottom, 34)
+        }
+        .background(TowerTheme.background.ignoresSafeArea())
+        .navigationTitle("我的订阅")
+        .navigationBarTitleDisplayMode(TowerPlatform.isMac ? .inline : .large)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button("管理") {
+                    sourceManagementRoute = .subscriptions
                 }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        isAddSourcePresented = true
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                    .accessibilityLabel("添加订阅或节点")
-                    .accessibilityIdentifier("add-source-button")
+                .accessibilityLabel("批量管理订阅和自有节点")
+                .accessibilityIdentifier("source-management-button")
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    isAddSourcePresented = true
+                } label: {
+                    Image(systemName: "plus")
                 }
+                .accessibilityLabel("添加订阅或节点")
+                .accessibilityIdentifier("add-source-button")
             }
-            .refreshable {
-                await model.refreshAllSubscriptions()
-                // A refresh replaces the subscription rows, and the new
-                // identities leave the scroll view holding the offset the
-                // spinner had pushed it to — so the list stays pulled down
-                // with a gap above it. Returning to the anchor is what the
-                // gesture implies anyway: you pulled from the top to see the
-                // top.
-                withAnimation(reduceMotion ? .easeOut(duration: 0.2) : .spring(response: 0.35, dampingFraction: 1)) {
-                    proxy.scrollTo(SubscriptionScrollTarget.top, anchor: .top)
-                }
+        }
+        .refreshable {
+            await model.refreshAllSubscriptions()
+        }
+        .sheet(isPresented: $isAddSourcePresented) {
+            AddSourceSheet()
+        }
+        .sheet(item: $editingSubscription) { source in
+            EditSubscriptionSheet(source: source, nameDraft: $subscriptionNameDraft)
+        }
+        .sheet(item: $editingLocalNode) { node in
+            AddSourceSheet(editingNode: node)
+        }
+        .subscriptionRefreshReport()
+        .sheet(item: $sourceManagementRoute) { route in
+            NavigationStack {
+                SourceManagementView(initialRoute: route)
             }
-            .sheet(isPresented: $isAddSourcePresented) {
-                AddSourceSheet()
+        }
+        .alert(
+            pendingDeletion?.title ?? String(localized: "确认删除"),
+            isPresented: Binding(
+                get: { pendingDeletion != nil },
+                set: { if !$0 { pendingDeletion = nil } }
+            ),
+            presenting: pendingDeletion
+        ) { deletion in
+            Button("删除", role: .destructive) {
+                if case .subscription(let source) = deletion { model.deleteSubscription(source) }
+                if case .node(let node) = deletion { model.deleteNode(node) }
+                pendingDeletion = nil
             }
-            .sheet(item: $editingSubscription) { source in
-                EditSubscriptionSheet(source: source, nameDraft: $subscriptionNameDraft)
-            }
-            .sheet(item: $editingLocalNode) { node in
-                AddSourceSheet(editingNode: node)
-            }
-            .subscriptionRefreshReport()
-            .sheet(item: $sourceManagementRoute) { route in
-                NavigationStack {
-                    SourceManagementView(initialRoute: route)
-                }
-            }
-            .alert(
-                pendingDeletion?.title ?? String(localized: "确认删除"),
-                isPresented: Binding(
-                    get: { pendingDeletion != nil },
-                    set: { if !$0 { pendingDeletion = nil } }
-                ),
-                presenting: pendingDeletion
-            ) { deletion in
-                Button("删除", role: .destructive) {
-                    if case .subscription(let source) = deletion { model.deleteSubscription(source) }
-                    if case .node(let node) = deletion { model.deleteNode(node) }
-                    pendingDeletion = nil
-                }
-                Button("取消", role: .cancel) { pendingDeletion = nil }
-            } message: { deletion in
-                Text(deletion.message)
-            }
+            Button("取消", role: .cancel) { pendingDeletion = nil }
+        } message: { deletion in
+            Text(deletion.message)
         }
     }
 
