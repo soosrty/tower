@@ -465,9 +465,8 @@ struct WorldDotMapView: View {
                 )
             )
             .gesture(
-                viewport.scale > Viewport.minimumScale + 0.001
-                    ? AnyGesture(panGesture(in: geometry.size))
-                    : AnyGesture(EmptyGesture())
+                panGesture(in: geometry.size),
+                including: viewport.scale > Viewport.minimumScale + 0.001 ? .gesture : .none
             )
             .onChange(of: geometry.size) { size in
                 let normalized = viewport.normalized(in: size)
