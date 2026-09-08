@@ -608,8 +608,8 @@ struct WorldDotMapView: View {
     }
 
     private func magnifyGesture(in size: CGSize) -> some Gesture {
-        MagnifyGesture()
-            .onChanged { value in
+        MagnificationGesture()
+            .onChanged { magnification in
                 isManipulatingViewport = true
                 if magnifyStartViewport == nil {
                     cancelSelectionRecenter()
@@ -617,16 +617,16 @@ struct WorldDotMapView: View {
                 }
                 guard let start = magnifyStartViewport else { return }
                 viewport = start.zoomed(
-                    to: start.scale * value.magnification,
-                    anchor: value.startAnchor,
+                    to: start.scale * magnification,
+                    anchor: .center,
                     in: size
                 )
             }
-            .onEnded { value in
+            .onEnded { magnification in
                 guard let start = magnifyStartViewport else { return }
                 let settled = start.zoomed(
-                    to: start.scale * value.magnification,
-                    anchor: value.startAnchor,
+                    to: start.scale * magnification,
+                    anchor: .center,
                     in: size
                 ).normalized(in: size)
                 magnifyStartViewport = nil
@@ -809,17 +809,16 @@ struct WorldDotMapView: View {
         withAnimation(.spring(response: 0.38, dampingFraction: 1)) {
             viewport = target
             displayedLevel = target.level
-        } completion: {
-            guard selectionRecenterToken == token else { return }
-            selectionRecenterToken = nil
-            var transaction = Transaction()
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-                frozenLabels = nil
-            }
-            withAnimation(.easeOut(duration: 0.14)) {
-                isRecenteringSelection = false
-            }
+        }
+        guard selectionRecenterToken == token else { return }
+        selectionRecenterToken = nil
+        var cleanupTransaction = Transaction()
+        cleanupTransaction.disablesAnimations = true
+        withTransaction(cleanupTransaction) {
+            frozenLabels = nil
+        }
+        withAnimation(.easeOut(duration: 0.14)) {
+            isRecenteringSelection = false
         }
     }
 

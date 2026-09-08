@@ -523,14 +523,12 @@ struct ClientFilterView: View {
         dragSession = nil
         let token = session.token
         withAnimation(
-            TowerMotion.disclosure(reduceMotion: false),
-            completionCriteria: .removed
+            TowerMotion.disclosure(reduceMotion: false)
         ) {
             settlingSession = session
-        } completion: {
+        }
             guard settlingSession?.token == token else { return }
             settlingSession = nil
-        }
     }
 
     private func cancelDragging(_ destination: ExportDestination) {
@@ -555,15 +553,13 @@ struct ClientFilterView: View {
         dragSession = nil
         let token = session.token
         withAnimation(
-            TowerMotion.disclosure(reduceMotion: false),
-            completionCriteria: .removed
+            TowerMotion.disclosure(reduceMotion: false)
         ) {
             orderedDestinations = session.originalOrder
             settlingSession = session
-        } completion: {
+        }
             guard settlingSession?.token == token else { return }
             settlingSession = nil
-        }
     }
 
     private func resetDragState() {

@@ -313,7 +313,6 @@ struct CheckmarkToggleStyle: ToggleStyle {
                 .contentShape(Rectangle())
         }
         .buttonStyle(SelectionIndicatorButtonStyle())
-        .accessibilityAddTraits(.isToggle)
         // Every other choice in the app taps back — the tab bar, the rule
         // list, the client picker. This one was the exception.
     }

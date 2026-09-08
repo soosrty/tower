@@ -123,8 +123,10 @@ struct SubscriptionsView: View {
                 AddSourceSheet(editingNode: node)
             }
             .subscriptionRefreshReport()
-            .navigationDestination(item: $sourceManagementRoute) { route in
-                SourceManagementView(initialRoute: route)
+            .sheet(item: $sourceManagementRoute) { route in
+                NavigationStack {
+                    SourceManagementView(initialRoute: route)
+                }
             }
             .alert(
                 pendingDeletion?.title ?? String(localized: "确认删除"),

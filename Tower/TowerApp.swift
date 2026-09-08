@@ -138,7 +138,7 @@ private struct TabSelectionFeedback: View {
     }
 
     var body: some View {
-        Color.clear.frame(width: 0, height: 0) { _, _ in tabHapticsEnabled }
+        Color.clear.frame(width: 0, height: 0)
             .allowsHitTesting(false)
             .accessibilityHidden(true)
     }

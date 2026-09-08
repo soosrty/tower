@@ -778,7 +778,6 @@ private struct RuleCustomizationSheet: View {
                         } label: {
                             Label("显示策略组 Emoji", systemImage: "face.smiling")
                         }
-                        .menuActionDismissBehavior(.enabled)
                         Button {
                             networkSettingsEditor = model.customizableScheme(for: scheme)
                         } label: {
