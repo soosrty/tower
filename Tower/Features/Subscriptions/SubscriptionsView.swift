@@ -13,7 +13,7 @@ struct SubscriptionsView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(spacing: 22) {
+            VStack(spacing: 22) {
                 Color.clear.frame(height: 0).id(SubscriptionScrollTarget.top)
 
                 if TowerPlatform.isMac {
@@ -93,9 +93,6 @@ struct SubscriptionsView: View {
                 .accessibilityLabel("添加订阅或节点")
                 .accessibilityIdentifier("add-source-button")
             }
-        }
-        .refreshable {
-            await model.refreshAllSubscriptions()
         }
         .sheet(isPresented: $isAddSourcePresented) {
             AddSourceSheet()
