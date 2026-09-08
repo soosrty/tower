@@ -84,7 +84,6 @@ struct SharePayloadSheet: View {
                 }
             }
             .task(id: payload.id) { await renderQRCode() }
-            .sensoryFeedback(.success, trigger: copied)
         }
         .presentationDetents([.large])
     }
@@ -104,7 +103,7 @@ struct SharePayloadSheet: View {
                     .accessibilityLabel("\(payload.title) 的二维码")
                     .transition(.opacity)
             } else if qrGenerationFailed {
-                ContentUnavailableView("无法生成二维码", systemImage: "qrcode")
+                TowerEmptyState("无法生成二维码", systemImage: "qrcode")
             } else {
                 VStack(spacing: 12) {
                     ProgressView()

@@ -3,7 +3,7 @@ import UIKit
 
 struct AddSourceSheet: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     private let editingNode: ProxyNode?
     @State private var name = ""
@@ -133,11 +133,11 @@ struct AddSourceSheet: View {
                 saveTask?.cancel()
                 cancelClipboardRead()
             }
-            .onChange(of: sourceValue) {
+            .onChange(of: sourceValue) { _ in
                 cancelClipboardRead()
                 errorMessage = nil
             }
-            .onChange(of: entryMode) {
+            .onChange(of: entryMode) { _ in
                 cancelClipboardRead()
                 focusedField = nil
                 errorMessage = nil
@@ -269,7 +269,7 @@ struct AddSourceSheet: View {
                     .tag(kind)
                 }
             }
-            .onChange(of: manualDraft.kind) { _, selectedKind in
+            .onChange(of: manualDraft.kind) { selectedKind in
                 manualDraft.applyDefaults(for: selectedKind)
             }
         }

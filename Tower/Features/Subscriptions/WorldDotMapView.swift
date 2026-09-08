@@ -466,12 +466,12 @@ struct WorldDotMapView: View {
                 panGesture(in: geometry.size),
                 including: viewport.scale > Viewport.minimumScale + 0.001 ? .gesture : .none
             )
-            .onChange(of: geometry.size) { _, size in
+            .onChange(of: geometry.size) { size in
                 let normalized = viewport.normalized(in: size)
                 viewport = normalized
                 displayedLevel = normalized.level
             }
-            .onChange(of: selectedMarkerID) { _, markerID in
+            .onChange(of: selectedMarkerID) { markerID in
                 guard let markerID,
                       let marker = markers.first(where: { $0.id == markerID }) else {
                     return

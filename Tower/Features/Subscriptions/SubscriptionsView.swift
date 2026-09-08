@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct SubscriptionsView: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isAddSourcePresented = false
     @State private var isMacMapExpanded = false
@@ -236,7 +236,7 @@ extension View {
 }
 
 private struct SubscriptionRefreshReportHost: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -255,7 +255,7 @@ private struct SubscriptionRefreshReportHost: View {
 }
 
 private struct SubscriptionRefreshReportOverlay: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let report: SubscriptionRefreshReport
@@ -393,7 +393,7 @@ private enum PendingDeletion {
 }
 
 private struct EditSubscriptionSheet: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     let source: SubscriptionSource
     @Binding var nameDraft: SubscriptionNameDraft
@@ -492,7 +492,7 @@ private struct EditSubscriptionSheet: View {
 }
 
 private struct MacSubscriptionSummary: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     let onMetricTap: (SubscriptionOverviewMetric) -> Void
 
     var body: some View {
@@ -536,7 +536,7 @@ private struct MacSubscriptionSummary: View {
 }
 
 private struct SubscriptionOverviewCard: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     let onMetricTap: (SubscriptionOverviewMetric) -> Void
 
     var body: some View {
@@ -663,7 +663,7 @@ struct SubscriptionCardMetrics: Equatable {
 }
 
 private struct SubscriptionCard: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let source: SubscriptionSource
     let onRefresh: () -> Void
@@ -782,8 +782,6 @@ private struct SubscriptionCard: View {
         // A map region's node list can move this whole card by a large amount.
         // Keep text and the progress bar in the same animated
         // coordinate space, instead of independently interpolating their origins.
-        .geometryGroup()
-        .sensoryFeedback(.selection, trigger: isExpanded)
         .sheet(item: $sharePayload) { payload in
             SharePayloadSheet(payload: payload)
         }

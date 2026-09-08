@@ -3,7 +3,7 @@ import UIKit
 import UniformTypeIdentifiers
 
 struct ExportView: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.scenePhase) private var scenePhase
     @State private var surgeSchemeAvailable = false
     @State private var preparedConfiguration: GeneratedConfiguration?
@@ -78,7 +78,7 @@ struct ExportView: View {
             preparedRequest = request
         }
         .onAppear { surgeSchemeAvailable = MacClientImportCapability.surgeSchemeAvailable }
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: scenePhase) { phase in
             if phase == .active { surgeSchemeAvailable = MacClientImportCapability.surgeSchemeAvailable }
         }
         .fileExporter(isPresented: $isSavingMacFile, document: macDocument,
@@ -137,14 +137,13 @@ struct ExportView: View {
         // down — and a name typed but never committed is simply lost. Catching
         // the flag covers every path; committing twice is harmless because the
         // draft is the same either way.
-        .onChange(of: isSettingsPresented) { _, isPresented in
+        .onChange(of: isSettingsPresented) { isPresented in
             guard !isPresented else { return }
             model.setConfigurationName(configurationNameDraft.committedName)
         }
         .fullScreenCover(item: $previewPayload) { payload in
             ConfigurationPreviewSheet(configuration: payload.configuration)
         }
-        .sensoryFeedback(.selection, trigger: selectedDestinationID)
         // Deliberately no .onDisappear teardown. Handing the link to another
         // app backgrounds Tower, and SwiftUI may call onDisappear when it does
         // — which killed the server before the client had fetched. Hiddify
@@ -244,7 +243,7 @@ struct ExportView: View {
 }
 
 private struct ExportContentModePicker: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
 
     var body: some View {
         if model.selectedTarget.supportedContentModes.count > 1 {
@@ -286,7 +285,7 @@ private struct ExportContentModePicker: View {
 
 private struct ExportSettingsSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Binding var configurationNameDraft: ConfigurationNameDraft
 
     var body: some View {
@@ -316,7 +315,7 @@ private struct ConfigurationPreviewPayload: Identifiable {
 }
 
 private struct ClientPicker: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
     @Binding var isLANSharingSelected: Bool
@@ -430,7 +429,7 @@ private struct ClientPicker: View {
                         }
                         .scrollIndicators(TowerPlatform.isMac ? .visible : .hidden)
                         .onAppear { scrollProxy.scrollTo(currentDestination.id) }
-                        .onChange(of: currentDestination) { _, destination in
+                        .onChange(of: currentDestination) { destination in
                             guard dragSession == nil, settlingSession == nil else { return }
                             // Without an anchor, ScrollViewReader only moves enough
                             // to reveal a clipped card and leaves visible cards in place.
@@ -483,16 +482,15 @@ private struct ClientPicker: View {
             .frame(height: pickerHeight + (TowerPlatform.isMac ? 16 : 0))
         }
         .onAppear(perform: synchronizeOrder)
-        .onChange(of: model.exportDestinationOrder) { _, destinations in
+        .onChange(of: model.exportDestinationOrder) { destinations in
             guard dragSession == nil else { return }
             orderedDestinations = destinations
         }
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: scenePhase) { phase in
             guard phase != .active, dragSession != nil || settlingSession != nil else { return }
             resetDragState()
             suppressSelection = false
         }
-        .sensoryFeedback(.selection, trigger: reorderFeedback)
     }
 
     @ViewBuilder
@@ -974,7 +972,7 @@ enum ProtocolFilterPolicy {
 /// needs a paid tier for AnyTLS — and Tower cannot detect that, so the choice
 /// is offered per client and only for protocols the nodes actually contain.
 private struct ProtocolFilter: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
 
     var body: some View {
         let kinds = model.filterableKinds(for: model.selectedTarget)
@@ -1037,7 +1035,7 @@ private struct ProtocolSymbolBadge: View {
 }
 
 private struct ConversionSummary: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     let configuration: GeneratedConfiguration
 
     var body: some View {
@@ -1118,7 +1116,7 @@ private struct ConfigurationPreview: View {
 }
 
 private struct ConfigurationPreviewSheet: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     let configuration: GeneratedConfiguration
     @State private var highlightedSpans: [ConfigurationSyntaxHighlighter.Span]?

@@ -4,7 +4,7 @@ import UIKit
 struct SettingsView: View {
     @Binding var configurationNameDraft: ConfigurationNameDraft
 
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var showsOnboarding = false
 
@@ -65,7 +65,7 @@ private struct ConfigurationManagementCard: View {
 /// to drift on iPad. An alert stays centered and gives the consequences enough
 /// room to remain readable on every device size.
 private struct ResetAllConfigurationRow: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Binding var configurationNameDraft: ConfigurationNameDraft
     @State private var isConfirmingReset = false
     @State private var isResetting = false
@@ -120,7 +120,7 @@ private struct ResetAllConfigurationRow: View {
 /// named for that moment — "打开塔台时" — rather than promising the
 /// subscription stays current on its own.
 private struct AutoRefreshSection: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
 
     private var binding: Binding<Bool> {
         Binding(get: { model.autoRefreshOnOpen }, set: model.setAutoRefreshOnOpen)
@@ -147,7 +147,7 @@ private struct AutoRefreshSection: View {
 /// happens rather than "sync your settings" — the user is agreeing to put
 /// subscription URLs and node passwords in their iCloud account.
 private struct CloudSyncControls: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @State private var isConfirming = false
     @State private var isConfirmingDisable = false
     @State private var isConfirmingRemoval = false
@@ -330,7 +330,7 @@ struct SecurityAndSourceView: View {
 
 private struct NodeAndExportSettingsCard: View {
     @Binding var configurationNameDraft: ConfigurationNameDraft
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
 
     private var appendNameBinding: Binding<Bool> {
         Binding(
@@ -542,7 +542,7 @@ struct SettingsRowLabel: View {
 /// with my subscriptions", which is the question that card is already about.
 /// As separate cards they read as three unrelated topics stacked up.
 private struct RenewalReminderSection: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isExpanded = false
 
@@ -619,8 +619,7 @@ private struct RenewalReminderSection: View {
             }
         }
         .accessibilityIdentifier("renewal-reminder-card")
-        .sensoryFeedback(.selection, trigger: isExpanded)
-        .onChange(of: model.renewalRemindersEnabled) { _, isEnabled in
+        .onChange(of: model.renewalRemindersEnabled) { isEnabled in
             if !isEnabled { isExpanded = false }
         }
     }
@@ -674,7 +673,7 @@ private struct RenewalReminderDetailRow: View {
 }
 
 struct LANSharingDestinationCard: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @State private var selectedClient: LANSubscriptionFormat?
     @State private var isConfirmingTokenRotation = false
 
@@ -860,7 +859,7 @@ private struct LANClientIcon: View {
 }
 
 private struct URLPanel: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let url: URL
 
@@ -906,7 +905,6 @@ private struct URLPanel: View {
                 }
                 .buttonStyle(ResponsivePressButtonStyle())
             }
-            .sensoryFeedback(.success, trigger: didCopy)
 
             if isShowingQRCode {
                 qrCode
@@ -1018,7 +1016,7 @@ private struct URLPanel: View {
 }
 
 struct LANSharingGuide: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {

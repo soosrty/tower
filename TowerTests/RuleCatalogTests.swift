@@ -1,4 +1,4 @@
-import Observation
+import Combine
 import XCTest
 @testable import Tower
 
@@ -248,13 +248,13 @@ final class RuleCatalogTests: XCTestCase {
         model.upsertCustomRuleFlow(try entry.makeCustomization(for: scheme))
         let before = model.customizableRuleGroups(for: scheme)
         let changed = expectation(description: "Cached rule presentation invalidated")
-        withObservationTracking {
-            _ = model.customizableRuleGroups(for: scheme)
-        } onChange: {
+        var cancellable: AnyCancellable?
+        cancellable = model.objectWillChange.sink {
             changed.fulfill()
         }
         model.removeCatalogEntry(entry, from: scheme)
         await fulfillment(of: [changed], timeout: 1)
+        cancellable?.cancel()
         XCTAssertNotEqual(model.customizableRuleGroups(for: scheme), before)
     }
 

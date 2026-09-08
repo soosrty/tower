@@ -77,7 +77,7 @@ enum NodeExportGroupSelectionState: Equatable {
 }
 
 struct NodeFilterSections: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     @Binding var searchText: String
@@ -109,7 +109,7 @@ struct NodeFilterSections: View {
 
             Section {
                 if filteredNodes.isEmpty {
-                    ContentUnavailableView.search(text: searchText)
+                    TowerEmptyState.search(text: searchText)
                         .listRowBackground(Color.clear)
                 } else {
                     ForEach(filteredNodes) { node in
@@ -119,7 +119,7 @@ struct NodeFilterSections: View {
             } header: {
                 HStack(spacing: 12) {
                     Text("节点 · \(includedFilteredNodeCount) / \(filteredNodes.count)")
-                        .contentTransition(.numericText())
+                        .contentTransition(.opacity)
                     Spacer()
                     bulkSelectionButton(
                         filteredNodes: filteredNodes,

@@ -5,14 +5,14 @@ struct TowerApp: App {
     // Coalesced rather than immediate: a burst of edits — ticking through the
     // node filter, reordering policy groups — becomes one write shortly after
     // the user stops, instead of a full snapshot encode inside every tap.
-    @State private var model = AppModel(persistencePolicy: .coalesced(.milliseconds(250)))
+    @StateObject private var model = AppModel(persistencePolicy: .coalesced(.milliseconds(250)))
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("hasSeenWelcome") private var hasSeenWelcome = false
 
     var body: some Scene {
         WindowGroup {
             AppRootView()
-                .environment(model)
+                .environmentObject(model)
                 .onAppear {
                     #if targetEnvironment(macCatalyst)
                     for scene in UIApplication.shared.connectedScenes {
@@ -31,7 +31,7 @@ struct TowerApp: App {
                     await model.synchronizeWithCloud()
                     await model.refreshOnOpenIfEnabled()
                 }
-                .onChange(of: scenePhase) { _, phase in
+                .onChange(of: scenePhase) { phase in
                     guard phase == .active else {
                         // Leaving the foreground is the last reliable moment to
                         // close the coalescing window: iOS may stop the process
@@ -54,7 +54,7 @@ struct TowerApp: App {
 }
 
 struct AppRootView: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Whether the privacy introduction has been shown. Stored rather than
     /// derived so a user who already trusts the app never sees it twice, and
@@ -98,8 +98,6 @@ struct AppRootView: View {
     }
 
     private var mainInterface: some View {
-        @Bindable var model = model
-
         return TabView(selection: $model.selectedTab) {
             NavigationStack {
                 SubscriptionsView()
@@ -128,7 +126,7 @@ struct AppRootView: View {
 /// Keep the haptic trigger's observation out of the complete tab hierarchy.
 /// The feedback dependency no longer invalidates the root on each selection.
 private struct TabSelectionFeedback: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     // Development-only A/B control for device haptics profiling. Default UI
     // behavior is unchanged; a simulator cannot measure Taptic Engine cost.
     private var tabHapticsEnabled: Bool {
@@ -140,8 +138,7 @@ private struct TabSelectionFeedback: View {
     }
 
     var body: some View {
-        Color.clear.frame(width: 0, height: 0)
-            .sensoryFeedback(.selection, trigger: model.selectedTab) { _, _ in tabHapticsEnabled }
+        Color.clear.frame(width: 0, height: 0) { _, _ in tabHapticsEnabled }
             .allowsHitTesting(false)
             .accessibilityHidden(true)
     }
@@ -158,7 +155,7 @@ extension View {
 }
 
 private struct ToastOverlay: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var presentedToast: ToastMessage?
 
@@ -182,7 +179,7 @@ private struct ToastOverlay: View {
         .onAppear {
             presentedToast = model.toast
         }
-        .onChange(of: model.toast) { _, toast in
+        .onChange(of: model.toast) { toast in
             withAnimation(appearance) {
                 presentedToast = toast
             }

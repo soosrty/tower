@@ -32,7 +32,7 @@ struct NodeMapPresentation {
 }
 
 struct NodeMapOverview: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
     let nodes: [ProxyNode]
@@ -61,7 +61,6 @@ struct NodeMapOverview: View {
             .id(SubscriptionScrollTarget.nodes)
             .accessibilityIdentifier("nodes-section")
         }
-        .sensoryFeedback(.selection, trigger: selectedRegionCode)
         .task(id: ipCountryTaskID) {
             await model.resolveIPCountries(for: nodes)
         }
@@ -87,7 +86,7 @@ struct NodeMapOverview: View {
             presentation = prepared
             preparedRevision = revision
         }
-        .onChange(of: clusters.map(\.id)) { _, clusterIDs in
+        .onChange(of: clusters.map(\.id)) { clusterIDs in
             // A collapsed list stays collapsed; only a selection that no longer
             // exists is cleared.
             guard let selectedRegionCode, !clusterIDs.contains(selectedRegionCode) else { return }
@@ -228,7 +227,7 @@ struct NodeMapOverview: View {
             }
             .id(cluster.id)
         } else if !TowerPlatform.isMac && canShowUnavailable && clusters.isEmpty && !nodes.isEmpty {
-            ContentUnavailableView(
+            TowerEmptyState(
                 "还不能定位节点",
                 systemImage: "mappin.slash",
                 description: Text("优先使用手动地区和节点名称；未标注时查询离线 IP 国家库。")
@@ -249,7 +248,7 @@ struct NodeMapOverview: View {
 }
 
 private struct SelectedRegionNodes: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     let cluster: NodeRegionCluster
     let onCollapse: () -> Void
 
@@ -303,7 +302,7 @@ private struct SelectedRegionNodes: View {
 }
 
 struct CompactNodeRow: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     let node: ProxyNode
     let resolvesRegionOnAppear: Bool
     @State private var sharePayload: SharePayload?
@@ -374,7 +373,7 @@ struct CompactNodeRow: View {
 }
 
 struct ExpandableNodeRow: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let node: ProxyNode
     let resolvesRegionOnAppear: Bool
@@ -528,7 +527,6 @@ struct ExpandableNodeRow: View {
         .sheet(isPresented: $showsCountryPicker) {
             NodeCountryPicker(node: node)
         }
-        .sensoryFeedback(.selection, trigger: isExpanded)
         .sheet(item: $sharePayload) { payload in
             SharePayloadSheet(payload: payload)
         }
@@ -545,7 +543,7 @@ private struct NodeDisplayNameLabel: View {
 }
 
 private struct NodeRegionLogo: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     let node: ProxyNode
     let resolvesRegionOnAppear: Bool
     let diameter: CGFloat
@@ -671,7 +669,7 @@ private struct CountryFlagEmoji: View {
 }
 
 private struct NodeLatencyBadge: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     let node: ProxyNode
     let showsUntestedState: Bool
 

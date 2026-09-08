@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct RulesView: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @State private var isImportPresented = false
     @State private var pendingDeletion: RuleScheme?
     @State private var editingImportedScheme: RuleScheme?
@@ -50,7 +50,6 @@ struct RulesView: View {
                 .accessibilityIdentifier("import-rule-scheme")
             }
         }
-        .sensoryFeedback(.selection, trigger: model.selectedPresetID)
         .sheet(isPresented: $isImportPresented) {
             ImportRuleSchemeSheet()
         }
@@ -169,7 +168,7 @@ struct RulesView: View {
 }
 
 private struct RulesOverviewCard: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -482,7 +481,6 @@ private struct RuleSchemeCard: View {
                 .stroke(isSelected ? Color.accentColor.opacity(0.65) : Color.clear, lineWidth: 1.5)
                 .animation(TowerMotion.selection(reduceMotion: reduceMotion), value: isSelected)
         }
-        .sensoryFeedback(.selection, trigger: isExpanded)
     }
 
     private func description(of group: RuleSchemeGroup) -> String {
@@ -500,7 +498,7 @@ private struct RuleSchemeCard: View {
 }
 
 private struct ImportedRuleSchemeEditor: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var requestsDiscard = false
     let scheme: RuleScheme
@@ -550,7 +548,7 @@ private struct ImportedRuleSchemeEditor: View {
 }
 
 private struct ImportRuleSchemeSheet: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var requestsDiscard = false
     @State private var urlString = ""
@@ -607,7 +605,7 @@ private struct ImportRuleSchemeSheet: View {
                 }
             }
             .onAppear { isURLFocused = true }
-            .onChange(of: urlString) { errorMessage = nil }
+            .onChange(of: urlString) { _ in errorMessage = nil }
         }
     }
 
@@ -699,7 +697,7 @@ private enum RuleCustomizationDeletion {
 /// hand-written rules. Search is the primary path; raw syntax stays one level
 /// deeper for people who actually need it.
 private struct RuleCustomizationSheet: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     let scheme: RuleScheme
     @State private var editingGroups: [RuleSchemeGroup] = []
@@ -888,7 +886,7 @@ private struct RuleCustomizationSheet: View {
         .onAppear {
             synchronizeGroupDraft(with: model.customizableRuleGroups(for: scheme))
         }
-        .onChange(of: model.customizableRuleGroups(for: scheme)) { _, groups in
+        .onChange(of: model.customizableRuleGroups(for: scheme)) { groups in
             synchronizeGroupDraft(with: groups)
         }
         .onDisappear { commitEditingGroupOrder() }
@@ -960,7 +958,7 @@ private struct RuleCustomizationSheet: View {
         }
 
         if visibleCatalogEntries.isEmpty {
-            ContentUnavailableView.search(text: trimmedSearch)
+            TowerEmptyState.search(text: trimmedSearch)
                 .listRowBackground(Color.clear)
         } else {
             Section {
@@ -1322,7 +1320,7 @@ private struct RuleCustomizationSheet: View {
 
 private struct RuleSchemeNetworkSettingsEditor: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var requestsDiscard = false
     let scheme: RuleScheme
@@ -1506,7 +1504,7 @@ private struct RuleSchemeNetworkSettingsEditor: View {
 
                 Section {
                     Button {
-                        withAnimation(reduceMotion ? nil : .smooth(duration: 0.2)) {
+                        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
                             draft = RuleSchemeNetworkSettingsDraft(settings: nil)
                             latencyTestPreset = RuleSchemeLatencyTestPreset.selection(
                                 for: draft.proxyTestURLString
@@ -1523,7 +1521,6 @@ private struct RuleSchemeNetworkSettingsEditor: View {
             .navigationBarTitleDisplayMode(.inline)
             .confirmDiscardChanges(hasChanges: draft != originalDraft, requested: $requestsDiscard)
             .scrollDismissesKeyboard(.interactively)
-            .sensoryFeedback(.selection, trigger: latencyTestPreset)
             .accessibilityIdentifier("rule-network-settings-editor")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -1631,7 +1628,7 @@ private struct RuleSchemeLatencyTestBrandLogoView: View {
 
 private struct RuleSchemeConfigurationEditor: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var requestsDiscard = false
     let scheme: RuleScheme
@@ -1660,7 +1657,7 @@ private struct RuleSchemeConfigurationEditor: View {
             VStack(spacing: 0) {
                 VStack(alignment: .leading, spacing: 0) {
                     Button {
-                        withAnimation(reduceMotion ? nil : .smooth(duration: 0.22)) {
+                        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) {
                             showsHelp.toggle()
                         }
                     } label: {
@@ -1757,7 +1754,7 @@ private struct RuleSchemeConfigurationEditor: View {
 }
 
 private struct RuleGroupIdentityEditor: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var requestsDiscard = false
     let scheme: RuleScheme
@@ -1844,7 +1841,7 @@ private struct RuleGroupIdentityEditor: View {
 }
 
 private struct RuleGroupEditor: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var requestsDiscard = false
     let scheme: RuleScheme
@@ -2188,7 +2185,7 @@ enum RulePolicyPresentation {
 }
 
 private struct CatalogRuleRouteEditor: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var requestsDiscard = false
     let scheme: RuleScheme
@@ -2302,7 +2299,7 @@ private struct LocalRuleSetEditor: View {
         case rules
     }
 
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var requestsDiscard = false
     let existingRuleSet: LocalRuleSet?

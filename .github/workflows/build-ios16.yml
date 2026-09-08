@@ -1,0 +1,66 @@
+name: Build iOS 16 unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ios16
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          set -euxo pipefail
+          XCODE_PATH="$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1)"
+          test -n "$XCODE_PATH"
+          sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
+          xcodebuild -version
+
+      - name: Build unsigned app
+        run: |
+          set -euxo pipefail
+          rm -rf build
+          xcodebuild \
+            -project Tower.xcodeproj \
+            -scheme Tower \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            IPHONEOS_DEPLOYMENT_TARGET=16.0 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            clean build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euxo pipefail
+          APP_PATH="$(find build/DerivedData/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -print -quit)"
+          test -n "$APP_PATH"
+          mkdir -p build/Payload
+          cp -R "$APP_PATH" build/Payload/
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP_PATH/Info.plist"
+          cd build
+          ditto -c -k --sequesterRsrc --keepParent Payload Tower-iOS16-unsigned.ipa
+          shasum -a 256 Tower-iOS16-unsigned.ipa > Tower-iOS16-unsigned.ipa.sha256
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tower-iOS16-unsigned
+          path: |
+            build/Tower-iOS16-unsigned.ipa
+            build/Tower-iOS16-unsigned.ipa.sha256
+          if-no-files-found: error
+          retention-days: 30

@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct NodeCountryPicker: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     let node: ProxyNode
     @State private var search = ""

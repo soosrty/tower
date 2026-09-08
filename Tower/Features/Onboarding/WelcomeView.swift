@@ -56,7 +56,6 @@ struct WelcomeView: View {
         .frame(maxWidth: readableContentWidth)
         .frame(maxWidth: .infinity)
         .background(TowerTheme.background.ignoresSafeArea())
-        .sensoryFeedback(.selection, trigger: page)
     }
 
     private var journey: some View {
@@ -74,7 +73,7 @@ struct WelcomeView: View {
     private func journeyItem(_ title: LocalizedStringKey, symbol: String, step: Int) -> some View {
         HStack(spacing: 5) {
             Image(systemName: page > step ? "checkmark" : symbol)
-                .contentTransition(.symbolEffect(.replace))
+                .contentTransition(.opacity)
             Text(title).lineLimit(1).minimumScaleFactor(0.7)
         }
         .font(.caption.weight(.semibold))
@@ -154,7 +153,7 @@ struct WelcomeView: View {
         let destination = min(3, max(0, target))
         guard destination != page else { return }
         withAnimation(reduceMotion ? .easeOut(duration: TowerMotion.reducedMotionDuration)
-                      : .spring(duration: 0.5, bounce: 0.2)) {
+                      : .spring(response: 0.5, dampingFraction: 0.8)) {
             page = destination
         }
     }
@@ -254,7 +253,6 @@ private struct WelcomePageContent: View {
             }
             .padding(.horizontal, 26).padding(.bottom, 24)
         }
-        .scrollBounceBehavior(.basedOnSize)
     }
 
     private var introductionHeading: some View {
@@ -505,7 +503,7 @@ private struct WelcomeEntrance: ViewModifier {
             .offset(y: reduceMotion || active ? 0 : 18)
             .scaleEffect(reduceMotion || active ? 1 : 0.97, anchor: .top)
             .animation(reduceMotion ? .easeOut(duration: TowerMotion.reducedMotionDuration)
-                       : .spring(duration: 0.5, bounce: 0.2).delay(active ? Double(order) * 0.04 : 0),
+                       : .spring(response: 0.5, dampingFraction: 0.8).delay(active ? Double(order) * 0.04 : 0),
                        value: active)
     }
 }
@@ -541,7 +539,7 @@ private struct WelcomeExportExample: View {
                                 Text(verbatim: target.name).font(.caption.weight(.semibold))
                                     .lineLimit(1).minimumScaleFactor(0.7)
                                 Image(systemName: client == target ? "checkmark.circle.fill" : "circle")
-                                    .contentTransition(.symbolEffect(.replace))
+                                    .contentTransition(.opacity)
                             }
                         }
                         .foregroundStyle(client == target ? Color.accentColor : Color.primary)
@@ -596,6 +594,5 @@ private struct WelcomeExportExample: View {
             .padding(18).towerCard()
             .modifier(WelcomeEntrance(active: isActive, order: 5))
         }
-        .sensoryFeedback(.selection, trigger: client)
     }
 }
