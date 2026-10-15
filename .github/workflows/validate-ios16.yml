@@ -1,0 +1,42 @@
+name: Validate iOS 16 backport
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  core-tests:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode and simulator
+        run: |
+          set -euo pipefail
+          XCODE_PATH="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+          export DEVELOPER_DIR="$XCODE_PATH/Contents/Developer"
+          echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          xcodebuild -version
+          DEVICE_ID="$(xcrun simctl list devices available -j | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next(x["udid"] for group in reversed(list(d["devices"].values())) for x in group if "iPhone" in x["name"]))')"
+          echo "SIMULATOR_ID=$DEVICE_ID" >> "$GITHUB_ENV"
+      - name: Test model notifications, subscriptions and new rule features
+        run: |
+          set -o pipefail
+          xcodebuild test -project Tower.xcodeproj -scheme Tower \
+            -configuration Debug -destination "platform=iOS Simulator,id=$SIMULATOR_ID" \
+            -derivedDataPath validation/DerivedData \
+            -resultBundlePath validation/CoreTests.xcresult \
+            -parallel-testing-enabled NO \
+            -only-testing:TowerTests/RuleCatalogTests \
+            -only-testing:TowerTests/GroupSupplementRuleTests \
+            -only-testing:TowerTests/SubscriptionRefreshTests \
+            IPHONEOS_DEPLOYMENT_TARGET=16.0 CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY='' 2>&1 | tee validation.log
+      - name: Preserve test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios16-core-tests
+          path: |
+            validation.log
+            validation/CoreTests.xcresult
+          retention-days: 14
