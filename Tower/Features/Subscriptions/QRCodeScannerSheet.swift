@@ -74,7 +74,7 @@ struct QRCodeScannerPreview: View {
             retry()
             isRequestingPermission = false
         }
-        .onChange(of: scenePhase) { phase in if phase == .active { retry() } }
+        .towerOnChange(of: scenePhase) { phase in if phase == .active { retry() } }
     }
 
     private func retry() {

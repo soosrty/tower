@@ -64,7 +64,7 @@ final class MotionDesignTests: XCTestCase {
         )
     }
 
-    func testDisclosureHeadersAnimateOnlyTheirChevrons() throws {
+    func testDisclosureHeadersPreserveGeometryWithSubtlePressFeedback() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -99,12 +99,18 @@ final class MotionDesignTests: XCTestCase {
         )
         let reminderHeader = String(settings[reminderStart.lowerBound..<reminderList.lowerBound])
 
-        for header in [subscriptionHeader, nodeHeader, reminderHeader] {
+        // Node rows share `CompactNodeRow`'s geometry and carry no chevron;
+        // the other disclosure headers still rotate theirs.
+        XCTAssertFalse(nodeHeader.contains("Image(systemName: \"chevron.down\")"))
+        for header in [subscriptionHeader, reminderHeader] {
             XCTAssertTrue(header.contains(".rotationEffect(.degrees(isExpanded ? 180 : 0))"))
-            XCTAssertTrue(header.contains(".buttonStyle(.plain)"))
+        }
+        for header in [subscriptionHeader, nodeHeader, reminderHeader] {
+            XCTAssertTrue(header.contains(".buttonStyle(.plain)")
+                || header.contains(".buttonStyle(SelectionIndicatorButtonStyle())"))
             XCTAssertFalse(
                 header.contains(".buttonStyle(ResponsivePressButtonStyle())"),
-                "展开按钮不能让名称、图标和整行跟着缩放或改变透明度"
+                "展开按钮允许局部明暗反馈，但不能让名称、图标和整行跟着缩放"
             )
         }
     }

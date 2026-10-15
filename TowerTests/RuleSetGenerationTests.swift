@@ -5,6 +5,38 @@ import XCTest
 final class RuleSetGenerationTests: XCTestCase {
     private let url = URL(string: "https://rules.example.com/Streaming.list")!
 
+    func testSurgeIPRulesDoNotResolveBeforeLaterDomainRules() throws {
+        let fixture = try makeFixture(content: """
+        IP-CIDR,203.0.113.0/24
+        IP-CIDR6,2620:120:e000::/40
+        IP-ASN,64496
+        IP-CIDR,198.51.100.0/24,no-resolve
+        DOMAIN-SUFFIX,example.com
+        """)
+        for target in ClientTarget.allCases where target.supportsFullConfigurationExport {
+            let content = fixture.generator.generate(
+                nodes: [], scheme: fixture.scheme, target: target,
+                schemes: fixture.repository, preferRuleSets: false
+            ).content
+            XCTAssertFalse(content.isEmpty, target.rawValue)
+            if [.surge, .surgeMac].contains(target) {
+                for rule in ["IP-CIDR,203.0.113.0/24", "IP-CIDR6,2620:120:e000::/40", "IP-ASN,64496", "IP-CIDR,198.51.100.0/24"] {
+                    XCTAssertTrue(content.contains("\(rule),Proxy,no-resolve\n"), "\(target): \(rule)")
+                }
+                XCTAssertFalse(content.contains("no-resolve,no-resolve"))
+                XCTAssertTrue(content.contains("DOMAIN-SUFFIX,example.com,Proxy\n"))
+                XCTAssertLessThan(
+                    try XCTUnwrap(content.range(of: "IP-CIDR6,2620:120:e000::/40")?.lowerBound),
+                    try XCTUnwrap(content.range(of: "DOMAIN-SUFFIX,example.com")?.lowerBound)
+                )
+            } else if target.usesClashFormat {
+                // Other dialects keep the source's explicit resolution flags.
+                XCTAssertTrue(content.contains("IP-CIDR,203.0.113.0/24,Proxy"))
+                XCTAssertFalse(content.contains("IP-CIDR,203.0.113.0/24,Proxy,no-resolve"))
+            }
+        }
+    }
+
     func testClashUsesClassicalRuleProviderWhenEnabled() throws {
         let fixture = try makeFixture(content: "DOMAIN-SUFFIX,example.com")
         let content = fixture.generator.generate(
@@ -74,7 +106,11 @@ final class RuleSetGenerationTests: XCTestCase {
         ).content
         XCTAssertFalse(shadowrocket.contains(domainURL.absoluteString), shadowrocket)
         XCTAssertFalse(shadowrocket.contains(ipURL.absoluteString), shadowrocket)
-        XCTAssertTrue(shadowrocket.contains(url.absoluteString), shadowrocket)
+        // PROCESS-NAME is not in Shadowrocket's rule vocabulary, so the list
+        // is written locally and only that line is left out.
+        XCTAssertFalse(shadowrocket.contains(url.absoluteString), shadowrocket)
+        XCTAssertTrue(shadowrocket.contains("DOMAIN,exact.example,Proxy"), shadowrocket)
+        XCTAssertFalse(shadowrocket.contains("PROCESS-NAME"), shadowrocket)
 
         let karing = fixture.generator.generate(
             nodes: [],
@@ -778,7 +814,7 @@ final class RuleSetGenerationTests: XCTestCase {
                 XCTAssertFalse(content.contains(#""rule_set""#), content)
             case .egern:
                 XCTAssertTrue(content.contains("  - domain_suffix:"), content)
-            case .v2box:
+            case .v2box, .anywhere:
                 XCTAssertTrue(content.isEmpty, "V2Box 只接收节点订阅，不生成完整规则配置")
             }
         }
@@ -819,7 +855,14 @@ final class RuleSetGenerationTests: XCTestCase {
         XCTAssertTrue(clash.contains("/Rulesets/ACL4SSR/"), clash)
         XCTAssertFalse(clash.contains("/main/Rulesets/ACL4SSR/"), clash)
         XCTAssertTrue(surge.contains("RULE-SET,https://raw.githubusercontent.com/"), surge)
-        XCTAssertTrue(loon.contains("[Remote Rule]"), loon)
+        // Loon matches every local rule before any remote list, and ACL4SSR
+        // ends with a local GEOIP,CN. Referencing the lists remotely would let
+        // that rule overtake them, so they are written locally, in order.
+        XCTAssertFalse(loon.contains("[Remote Rule]"), loon)
+        let loonRules = try XCTUnwrap(loon.components(separatedBy: "[Rule]\n").last)
+        let geoIP = try XCTUnwrap(loonRules.range(of: "GEOIP,CN,"))
+        let lanRule = try XCTUnwrap(loonRules.range(of: "IP-CIDR,10.0.0.0/8,"))
+        XCTAssertLessThan(lanRule.lowerBound, geoIP.lowerBound)
 
         // ACL4SSR's IP-only resource uses Clash's trailing `no-resolve`, which
         // is not valid QuanX filter syntax. It must be normalized locally

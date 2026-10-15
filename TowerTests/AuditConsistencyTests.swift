@@ -21,6 +21,7 @@ private actor PausedCloud: CloudSnapshotSyncing {
     }
     func finish(_ snapshot: AppSnapshot?) { continuation?.resume(returning: snapshot); continuation = nil }
     func upload(_ snapshot: AppSnapshot) { uploads.append(snapshot) }
+    func commit(_ snapshot: AppSnapshot, replacing expected: AppSnapshot?) { uploads.append(snapshot) }
     func removeRemoteSnapshot() {}
 }
 
@@ -154,7 +155,11 @@ struct AuditConsistencyTests {
         defer { CloudSyncPreference.setEnabled(previous) }
         let store = temporaryStore()
         let source = SubscriptionSource(name: "old", urlString: "https://old.example.test/sub")
-        try store.save(AppSnapshot(subscriptions: [source], nodes: [], selectedPresetID: "acl4ssr-default", selectedTarget: .surge, updatedAt: .distantPast))
+        let shared = AppSnapshot(subscriptions: [source], nodes: [], selectedPresetID: "acl4ssr-default", selectedTarget: .surge, updatedAt: .distantPast)
+        try store.save(shared)
+        // A missing source is an explicit remote deletion only after both
+        // devices have shared this baseline. First sync must preserve it.
+        try store.saveCloudBaseline(shared)
         let fetcher = PausedSourceFetcher()
         let cloud = PausedCloud()
         let model = AppModel(persistence: store, cloudSync: cloud, subscriptionService: fetcher, arguments: [])

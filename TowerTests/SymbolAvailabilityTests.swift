@@ -28,11 +28,16 @@ final class SymbolAvailabilityTests: XCTestCase {
             .hysteria: .system("hare.fill"),
             .hysteria2: .system("hare.fill"),
             .tuic: .system("bolt.circle.fill"),
+            .masque: .system("network"),
             .wireguard: .system("shield.checkered"),
             .anytls: .system("lock.shield.fill"),
             .snell: .system("s.square.fill"),
             .socks5: .system("5.circle.fill"),
             .http: .system("globe"),
+            // A terminal for SSH's shell heritage; TrustTunnel is a verified
+            // TLS tunnel from AdGuard.
+            .ssh: .system("terminal.fill"),
+            .trustTunnel: .system("checkmark.shield.fill"),
             .unknown: .system("questionmark.circle.fill"),
         ]
 

@@ -2,6 +2,29 @@ import XCTest
 @testable import Tower
 
 final class LocalNodeImportTests: XCTestCase {
+    func testManualEditingPreservesCertificatePin() throws {
+        let pin = String(repeating: "AB", count: 32)
+        let original = ProxyNode(kind: .trojan, name: "Pin", server: "pin.example.com", port: 443,
+                                 password: "test-password", tls: true, certificateFingerprint: pin, rawURI: "")
+        let saved = try ManualNodeDraft(node: original).makeNode()
+        XCTAssertEqual(saved.certificateFingerprint, pin)
+    }
+
+    func testManualCertificatePinValidationAndTLSMode() throws {
+        var draft = ManualNodeDraft(kind: .vmess, server: "pin.example.com", port: "443", secret: "test-uuid", security: "tls")
+        draft.certificateFingerprint = Array(repeating: "ab", count: 32).joined(separator: ":")
+        XCTAssertEqual(try draft.makeNode().certificateFingerprint, String(repeating: "ab", count: 32))
+        for invalid in ["chrome", "abc", String(repeating: "GG", count: 32)] {
+            draft.certificateFingerprint = invalid
+            XCTAssertThrowsError(try draft.makeNode())
+        }
+        draft.security = "none"
+        XCTAssertNil(try draft.makeNode().certificateFingerprint)
+        draft.certificateFingerprint = ""
+        draft.security = "tls"
+        XCTAssertNil(try draft.makeNode().certificateFingerprint)
+    }
+
     func testBatchImportPreservesEveryNodeName() throws {
         let auth = Data("aes-256-gcm:secret".utf8).base64EncodedString()
         let content = """

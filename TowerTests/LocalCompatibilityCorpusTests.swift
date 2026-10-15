@@ -27,6 +27,8 @@ final class LocalCompatibilityCorpusTests: XCTestCase {
         let ruleCount: Int
         let byteCount: Int
         let sha256: String
+        /// "name: reason" for each skipped node; names are the corpus's own labels.
+        let skipped: [String]?
     }
 
     private struct SourceReport: Codable {
@@ -52,16 +54,10 @@ final class LocalCompatibilityCorpusTests: XCTestCase {
 
     func testPrivateCompatibilityCorpus() throws {
         let environment = ProcessInfo.processInfo.environment
-        let repositoryRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let defaultCorpus = repositoryRoot
-            .appendingPathComponent(".codex_work/subscription-compat", isDirectory: true)
-        let corpusPath = environment["TOWER_COMPAT_CORPUS_DIR"] ?? defaultCorpus.path
-        let defaultRuleConfig = defaultCorpus.appendingPathComponent(
-            "tools/acl4ssr/Clash/config/ACL4SSR_Online_Full.ini"
-        ).path
-        let ruleConfigPath = environment["TOWER_COMPAT_RULE_CONFIG"] ?? defaultRuleConfig
+        guard let corpusPath = environment["TOWER_COMPAT_CORPUS_DIR"],
+              let ruleConfigPath = environment["TOWER_COMPAT_RULE_CONFIG"] else {
+            throw XCTSkip("Set TOWER_COMPAT_CORPUS_DIR and TOWER_COMPAT_RULE_CONFIG to run the private corpus")
+        }
         guard FileManager.default.fileExists(atPath: corpusPath),
               FileManager.default.fileExists(atPath: ruleConfigPath) else {
             throw XCTSkip("Set TOWER_COMPAT_CORPUS_DIR and TOWER_COMPAT_RULE_CONFIG to run the private corpus")
@@ -190,7 +186,7 @@ final class LocalCompatibilityCorpusTests: XCTestCase {
                     }
                 }
 
-                guard target.supportsNodesOnlyImport else { continue }
+                guard target.supportsNodesOnlyExport else { continue }
                 let generated = generator.generateNodeSubscription(
                     nodes: selected.nodes,
                     target: target,
@@ -267,7 +263,8 @@ final class LocalCompatibilityCorpusTests: XCTestCase {
             skippedNodeCount: generated.skippedNodeCount,
             ruleCount: generated.ruleCount,
             byteCount: data.count,
-            sha256: SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+            sha256: SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(),
+            skipped: generated.skippedNodes.map { "\($0.name): \($0.reason)" }
         )
     }
 

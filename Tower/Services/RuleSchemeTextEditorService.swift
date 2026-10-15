@@ -81,8 +81,8 @@ struct RuleSchemeTextEditorService {
         }
 
         let groupNames = Set(parsed.groups.map(\.name))
-        let builtins = Set(["DIRECT", "REJECT"])
-        for ruleset in parsed.rulesets where !groupNames.contains(ruleset.groupName) {
+        let builtins = RoutingBuiltinPolicies.names
+        for ruleset in parsed.rulesets where !groupNames.contains(ruleset.groupName) && !builtins.contains(ruleset.groupName) {
             throw RuleSchemeTextValidationError.unknownPolicy(
                 name: ruleset.groupName,
                 line: lineNumber(containing: ruleset.groupName, in: text)
@@ -125,9 +125,9 @@ struct RuleSchemeTextEditorService {
         in text: String
     ) throws {
         guard let settings else { return }
-        for value in settings.encryptedDNSServers {
+        for value in settings.encryptedDNSServers + settings.remoteDNSServers {
             guard let url = URL(string: value),
-                  ["https", "tls", "quic"].contains(url.scheme?.lowercased() ?? ""),
+                  ["https", "h3", "tls", "quic"].contains(url.scheme?.lowercased() ?? ""),
                   url.host != nil else {
                 throw RuleSchemeTextValidationError.invalidEncryptedDNS(
                     value: value,
@@ -227,6 +227,11 @@ struct RuleSchemeTextEditorService {
                     "encrypted-dns-server = \(settings.encryptedDNSServers.joined(separator: ", "))"
                 )
             }
+            if !settings.remoteDNSServers.isEmpty {
+                lines.append(
+                    "tower-remote-dns-server = \(settings.remoteDNSServers.joined(separator: ", "))"
+                )
+            }
             if let url = settings.proxyTestURLString { lines.append("proxy-test-url = \(url)") }
             lines.append("")
         }
@@ -255,6 +260,9 @@ struct RuleSchemeTextEditorService {
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
+        if scheme.rulesets.contains(where: { $0.options != nil || $0.provider != nil }), let data = try? encoder.encode(scheme.rulesets) {
+            lines.append("tower_rule_metadata=\(data.base64EncodedString())")
+        }
         lines += scheme.groups.compactMap { group in
             guard let data = try? encoder.encode(group) else { return nil }
             return "tower_group_metadata=\(data.base64EncodedString())"

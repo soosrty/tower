@@ -426,11 +426,18 @@ enum ProxyKind: String, Codable, CaseIterable, Identifiable {
     case hysteria
     case hysteria2
     case tuic
+    /// HTTP/3 CONNECT + CONNECT-UDP with optional HTTP Basic auth (Surge).
+    /// This is not the Cloudflare CONNECT-IP/key-pair variant.
+    case masque
     case wireguard
     case anytls
     case snell
     case socks5
     case http
+    /// SSH port forwarding (`direct-tcpip`), TCP only.
+    case ssh
+    /// AdGuard's TrustTunnel: HTTP/2 over TLS, or HTTP/3 with `quic`.
+    case trustTunnel = "trusttunnel"
     case unknown
 
     var id: String { rawValue }
@@ -445,11 +452,14 @@ enum ProxyKind: String, Codable, CaseIterable, Identifiable {
         case .hysteria: "Hysteria"
         case .hysteria2: "Hysteria 2"
         case .tuic: "TUIC"
+        case .masque: "MASQUE"
         case .wireguard: "WireGuard"
         case .anytls: "AnyTLS"
         case .snell: "Snell"
         case .socks5: "SOCKS5"
         case .http: "HTTP"
+        case .ssh: "SSH"
+        case .trustTunnel: "TrustTunnel"
         case .unknown: String(localized: "未知协议")
         }
     }
@@ -470,6 +480,7 @@ enum ProxyKind: String, Codable, CaseIterable, Identifiable {
         // TUIC is the low-latency QUIC option. Keep it distinct from the
         // Shadowsocks bolt while matching the filled, circular protocol icons
         // used by the export filter.
+        case .masque: .system("network")
         case .tuic: .system("bolt.circle.fill")
         case .wireguard: .system("shield.checkered")
         case .anytls: .system("lock.shield.fill")
@@ -479,11 +490,67 @@ enum ProxyKind: String, Codable, CaseIterable, Identifiable {
         case .snell: .system("s.square.fill")
         case .socks5: .system("5.circle.fill")
         case .http: .system("globe")
+        case .ssh: .system("terminal.fill")
+        case .trustTunnel: .system("checkmark.shield.fill")
         case .unknown: .system("questionmark.circle.fill")
         }
     }
 
     var symbol: String { iconDescriptor.systemFallback }
+}
+
+/// ShadowTLS wraps the SS TCP stream. Its credential and SNI are independent
+/// of the inner Shadowsocks password and must survive sync and sharing.
+struct ShadowTLSOptions: Codable, Hashable {
+    var version: Int
+    var host: String
+    var password: String
+    var skipCertificateVerification: Bool = false
+
+    var isValid: Bool {
+        (1...3).contains(version) && !host.isEmpty
+            && !host.contains(where: { $0.isWhitespace || $0 == "," })
+            && (version == 1 || !password.isEmpty)
+    }
+}
+
+/// SSH authentication beyond the username/password every node carries.
+/// Host keys pin the server; dropping them would silently accept any server.
+struct SSHOptions: Codable, Hashable {
+    var privateKey: String?
+    var privateKeyPassphrase: String?
+    var hostKeys: [String] = []
+    var hostKeyAlgorithms: [String] = []
+}
+
+/// TrustTunnel runs over HTTP/2 + TLS unless `quic` selects HTTP/3.
+struct TrustTunnelOptions: Codable, Hashable {
+    var quic: Bool = false
+}
+
+/// MASQUE has incompatible wire dialects. Never infer CONNECT-IP from a
+/// Surge CONNECT/CONNECT-UDP node merely because both use HTTP Basic auth.
+struct MASQUEOptions: Codable, Hashable {
+    enum Mode: String, Codable { case keyConnectIP, basicConnectIP }
+    var mode: Mode
+    var privateKey: String?
+    var publicKey: String?
+    var ipv4: String?
+    var ipv6: String?
+    var network: String?
+    var mtu: Int?
+    var dns: [String]?
+    var remoteDNSResolve: Bool?
+    var httpVersion: Int?
+    var disableVersionFallback: Bool?
+    var headers: [String: String]?
+    var certificate: [String]?
+
+    var identity: String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return (try? encoder.encode(self)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+    }
 }
 
 struct ProxyNode: Identifiable, Codable, Hashable {
@@ -506,6 +573,10 @@ struct ProxyNode: Identifiable, Codable, Hashable {
     var plugin: String?
     /// nil means the source did not declare plugin multiplexing.
     var pluginMux: Bool?
+    var shadowTLS: ShadowTLSOptions?
+    var masque: MASQUEOptions?
+    var ssh: SSHOptions?
+    var trustTunnel: TrustTunnelOptions?
     var tls: Bool
     var sni: String?
     var hostHeader: String?
@@ -525,6 +596,9 @@ struct ProxyNode: Identifiable, Codable, Hashable {
     var certificateFingerprint: String?
     var fingerprint: String?
     var flow: String?
+    /// Xray's VLESS encryption (`mlkem768x25519plus…`); nil means `none`.
+    /// A node that needs it cannot connect as plain VLESS.
+    var vlessEncryption: String?
     var skipCertificateVerification: Bool
     var alterID: Int?
     var protocolName: String?
@@ -544,6 +618,8 @@ struct ProxyNode: Identifiable, Codable, Hashable {
     /// airport makes, so a wrong guess costs UDP or throughput.
     var congestionControl: String?
     var udpRelayMode: String?
+    /// Explicit SS UDP preference; nil preserves the historical export default.
+    var udpRelayEnabled: Bool?
     /// Alternate QUIC destination ports used by Hysteria 2 (and, where a
     /// producer supports it, TUIC). Providers call this `ports`, `mport`,
     /// `server-ports`, or `port-hopping`; using only the display `port` makes
@@ -590,6 +666,8 @@ struct ProxyNode: Identifiable, Codable, Hashable {
         transportMode: String? = nil,
         plugin: String? = nil,
         pluginMux: Bool? = nil,
+        shadowTLS: ShadowTLSOptions? = nil,
+        masque: MASQUEOptions? = nil,
         tls: Bool = false,
         sni: String? = nil,
         hostHeader: String? = nil,
@@ -612,6 +690,7 @@ struct ProxyNode: Identifiable, Codable, Hashable {
         version: Int? = nil,
         congestionControl: String? = nil,
         udpRelayMode: String? = nil,
+        udpRelayEnabled: Bool? = nil,
         portHopping: String? = nil,
         upMbps: Int? = nil,
         downMbps: Int? = nil,
@@ -626,7 +705,10 @@ struct ProxyNode: Identifiable, Codable, Hashable {
         wireGuardPersistentKeepalive: Int? = nil,
         wireGuardDNS: String? = nil,
         rawURI: String,
-        isSubscriptionMetadata: Bool? = nil
+        isSubscriptionMetadata: Bool? = nil,
+        vlessEncryption: String? = nil,
+        ssh: SSHOptions? = nil,
+        trustTunnel: TrustTunnelOptions? = nil
     ) {
         self.id = id
         self.sourceID = sourceID
@@ -642,6 +724,8 @@ struct ProxyNode: Identifiable, Codable, Hashable {
         self.transportMode = transportMode
         self.plugin = plugin
         self.pluginMux = pluginMux
+        self.shadowTLS = shadowTLS
+        self.masque = masque
         self.tls = tls
         self.sni = sni
         self.hostHeader = hostHeader
@@ -664,6 +748,7 @@ struct ProxyNode: Identifiable, Codable, Hashable {
         self.version = version
         self.congestionControl = congestionControl
         self.udpRelayMode = udpRelayMode
+        self.udpRelayEnabled = udpRelayEnabled
         self.portHopping = portHopping
         self.upMbps = upMbps
         self.downMbps = downMbps
@@ -679,6 +764,9 @@ struct ProxyNode: Identifiable, Codable, Hashable {
         self.wireGuardDNS = wireGuardDNS
         self.rawURI = rawURI
         self.isSubscriptionMetadata = isSubscriptionMetadata
+        self.vlessEncryption = vlessEncryption
+        self.ssh = ssh
+        self.trustTunnel = trustTunnel
     }
 
     var endpoint: String {
@@ -704,7 +792,7 @@ struct ProxyNode: Identifiable, Codable, Hashable {
             skipCertificateVerification ? "1" : "0"
         ])
         fields.append(contentsOf: [
-            alterID.map(String.init) ?? "", protocolName ?? "", protocolParam ?? "",
+            alterID.map { String($0) } ?? "", protocolName ?? "", protocolParam ?? "",
             obfs ?? "", obfsParam ?? ""
         ])
         let idleCheck = idleSessionCheckInterval.map { String($0) } ?? ""
@@ -714,23 +802,28 @@ struct ProxyNode: Identifiable, Codable, Hashable {
         fields.append(contentsOf: [certificateFingerprint ?? "", idleCheck, idleTimeout, minimumIdle, protocolVersion])
         fields.append(contentsOf: [
             congestionControl ?? "", udpRelayMode ?? "", portHopping ?? "",
-            upMbps.map(String.init) ?? "", downMbps.map(String.init) ?? ""
+            udpRelayEnabled.map { $0 ? "1" : "0" } ?? "",
+            upMbps.map { String($0) } ?? "", downMbps.map { String($0) } ?? ""
         ])
-        let wireGuardMTUValue = wireGuardMTU.map(String.init) ?? ""
-        let wireGuardKeepaliveValue = wireGuardPersistentKeepalive.map(String.init) ?? ""
-        let wireGuardFields: [String] = [
-            wireGuardPrivateKey ?? "",
-            wireGuardPublicKey ?? "",
-            wireGuardPreSharedKey ?? "",
-            wireGuardIPv4 ?? "",
-            wireGuardIPv6 ?? "",
-            wireGuardAllowedIPs ?? "",
-            wireGuardReserved ?? "",
-            wireGuardMTUValue,
-            wireGuardKeepaliveValue,
-            wireGuardDNS ?? ""
-        ]
-        fields.append(contentsOf: wireGuardFields)
+        fields.append(contentsOf: [
+            wireGuardPrivateKey ?? "", wireGuardPublicKey ?? "", wireGuardPreSharedKey ?? "",
+            wireGuardIPv4 ?? "", wireGuardIPv6 ?? "", wireGuardAllowedIPs ?? "",
+            wireGuardReserved ?? "", wireGuardMTU.map { String($0) } ?? "",
+            wireGuardPersistentKeepalive.map { String($0) } ?? "", wireGuardDNS ?? ""
+        ])
+        if let shadowTLS {
+            // Append only for wrapped nodes: existing persisted exclusion keys
+            // for ordinary nodes must not change when adding this feature.
+            fields.append(contentsOf: ["shadow-tls", String(shadowTLS.version), shadowTLS.host,
+                                      shadowTLS.password, String(shadowTLS.skipCertificateVerification)])
+        }
+        if let masque { fields.append(masque.identity) }
+        if let vlessEncryption { fields.append(contentsOf: ["vless-encryption", vlessEncryption]) }
+        if let ssh {
+            fields.append(contentsOf: ["ssh", ssh.privateKey ?? "", ssh.privateKeyPassphrase ?? "",
+                                      ssh.hostKeys.joined(separator: "\n"), ssh.hostKeyAlgorithms.joined(separator: ",")])
+        }
+        if let trustTunnel { fields.append(contentsOf: ["trusttunnel", trustTunnel.quic ? "quic" : "h2"]) }
         return fields.joined(separator: "\u{1F}")
     }
 
@@ -763,6 +856,50 @@ struct ProxyNode: Identifiable, Codable, Hashable {
     var exportablePath: String? {
         guard let path, !path.isEmpty else { return nil }
         return path.hasPrefix("/") ? path : "/" + path
+    }
+
+    /// A VMess/VLESS/Trojan link without `sni` means "use the Host header"
+    /// (v2rayN's rule), which is how CDN-fronted nodes on a bare IP are
+    /// written. Mihomo and sing-box apply it themselves; Stash, Surge, Loon,
+    /// QuanX, Egern and Anywhere instead fall back to the server address, so
+    /// they got the IP as SNI and failed the certificate check. Every writer
+    /// spells it out instead.
+    var withTransportHostAsSNI: ProxyNode {
+        guard [.vmess, .vless, .trojan].contains(kind), tls, !usesReality,
+              (sni ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              ["ws", "h2", "httpupgrade"].contains(transport?.lowercased() ?? ""),
+              let host = hostHeader?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !host.isEmpty, host.lowercased() != server.lowercased() else { return self }
+        var node = self
+        node.sni = host
+        return node
+    }
+
+    /// Xray-style links put WebSocket early data in the path as `?ed=2048`.
+    /// Mihomo and Shadowrocket read it from there; other clients either take
+    /// it as separate settings or not at all.
+    var webSocketEarlyData: Int? {
+        earlyDataSplit?.earlyData
+    }
+
+    /// `exportablePath` without the `ed` hint. A client that does not
+    /// understand it sends it literally, and a server matching the whole path
+    /// (sing-box does) then rejects every request.
+    var exportablePathWithoutEarlyData: String? {
+        earlyDataSplit?.path ?? exportablePath
+    }
+
+    private var earlyDataSplit: (path: String, earlyData: Int)? {
+        guard let path = exportablePath, let mark = path.firstIndex(of: "?"),
+              var components = URLComponents(string: "x" + path[mark...]),
+              let items = components.queryItems,
+              let index = items.firstIndex(where: { $0.name == "ed" }),
+              let earlyData = items[index].value.flatMap(Int.init), earlyData > 0 else { return nil }
+        var remaining = items
+        remaining.remove(at: index)
+        components.queryItems = remaining.isEmpty ? nil : remaining
+        let query = components.percentEncodedQuery.map { "?" + $0 } ?? ""
+        return (String(path[..<mark]) + query, earlyData)
     }
 
     /// The HTTP Host value a generated transport should use.
@@ -835,6 +972,7 @@ struct ProxyNode: Identifiable, Codable, Hashable {
 
     var protocolSummary: String {
         var parts: [String] = [protocolDisplayName]
+        if let shadowTLS { parts.append("ShadowTLS v\(shadowTLS.version)") }
 
         if let transportDisplayName, !parts.contains(transportDisplayName) {
             parts.append(transportDisplayName)
@@ -852,19 +990,22 @@ struct ProxyNode: Identifiable, Codable, Hashable {
 
     private var protocolDisplayName: String {
         switch kind {
-        case .shadowsocks: "SHADOWSOCKS"
-        case .shadowsocksR: "SHADOWSOCKS R"
-        case .vmess: "VMESS"
+        case .shadowsocks: "Shadowsocks"
+        case .shadowsocksR: "ShadowsocksR"
+        case .vmess: "VMess"
         case .vless: "VLESS"
-        case .trojan: "TROJAN"
-        case .hysteria: "HYSTERIA"
-        case .hysteria2: "HYSTERIA 2"
+        case .trojan: "Trojan"
+        case .hysteria: "Hysteria"
+        case .hysteria2: "Hysteria 2"
         case .tuic: "TUIC"
-        case .wireguard: "WIREGUARD"
-        case .anytls: "ANYTLS"
-        case .snell: version.map { "SNELL V\($0)" } ?? "SNELL"
+        case .masque: "MASQUE"
+        case .wireguard: "WireGuard"
+        case .anytls: "AnyTLS"
+        case .snell: version.map { "Snell v\($0)" } ?? "Snell"
         case .socks5: "SOCKS5"
         case .http: tls ? "HTTPS" : "HTTP"
+        case .ssh: "SSH"
+        case .trustTunnel: trustTunnel?.quic == true ? "TrustTunnel H3" : "TrustTunnel"
         case .unknown: "未知协议"
         }
     }
@@ -889,10 +1030,10 @@ struct ProxyNode: Identifiable, Codable, Hashable {
 
         return switch normalized {
         case "ws", "websocket": "WS"
-        case "grpc": "GRPC"
+        case "grpc": "gRPC"
         case "http", "http_simple": "HTTP"
         case "h2", "http2": "H2"
-        case "httpupgrade": "HTTP UPGRADE"
+        case "httpupgrade": "HTTPUpgrade"
         case "xhttp", "splithttp": "XHTTP"
         case "kcp", "mkcp": "KCP"
         case "quic": "QUIC"
@@ -901,9 +1042,48 @@ struct ProxyNode: Identifiable, Codable, Hashable {
         }
     }
 
+    /// Validate each MASQUE dialect independently. A legacy nil options value
+    /// means Surge Basic-auth CONNECT/CONNECT-UDP, never CONNECT-IP.
+    var hasSupportedMASQUEFields: Bool {
+        guard kind == .masque else { return false }
+        if let masque {
+            guard !server.isEmpty, (1...65535).contains(port),
+                  !server.contains(where: { $0.isWhitespace || ",/\\@?#=".contains($0) }),
+                  !usesReality, shadowTLS == nil, portHopping == nil,
+                  masque.mtu.map({ (1280...1500).contains($0) }) ?? true else { return false }
+            switch masque.mode {
+            case .keyConnectIP:
+                guard tls, certificateFingerprint == nil, !skipCertificateVerification,
+                      (username ?? "").isEmpty, (password ?? "").isEmpty,
+                      (alpn ?? "").isEmpty else { return false }
+                return masque.privateKey.flatMap { Data(base64Encoded: $0) }.flatMap { try? P256.Signing.PrivateKey(derRepresentation: $0) } != nil
+                    && masque.publicKey.flatMap { Data(base64Encoded: $0) }.flatMap { try? P256.Signing.PublicKey(derRepresentation: $0) } != nil
+                    && !(masque.ipv4 ?? masque.ipv6 ?? "").isEmpty
+                    && [nil, "quic", "h3", "h2"].contains(masque.network)
+            case .basicConnectIP:
+                return [nil, 1, 2, 3].contains(masque.httpVersion)
+                    && (masque.httpVersion != nil && masque.httpVersion != 3 || tls)
+                    && !(username ?? "").contains(":")
+            }
+        }
+        guard !server.isEmpty, (1...65535).contains(port),
+              !server.contains(where: { $0.isWhitespace || ",/\\@?#=".contains($0) }),
+              !usesReality, shadowTLS == nil, portHopping == nil,
+              [nil, "", "tcp", "quic"].contains(transport),
+              (username ?? "").contains(":") == false else { return false }
+        return [username, password, sni, alpn].compactMap { $0 }.allSatisfy {
+            !$0.contains(where: { $0.isNewline || $0 == "\0" || $0 == "," })
+        }
+    }
+
     private var supportsUDP: Bool {
-        switch kind {
-        case .http, .unknown: false
+        if shadowTLS != nil { return udpRelayEnabled == true }
+        if masque?.mode == .keyConnectIP { return udpRelayEnabled == true }
+        return switch kind {
+        // SSH has no datagram channel.
+        case .http, .ssh, .unknown: false
+        // TrustTunnel relays UDP only where the client says so (mihomo `udp`).
+        case .trustTunnel: udpRelayEnabled == true
         // Snell only carries UDP from version 3 onwards.
         case .snell: (version ?? 4) >= 3
         default: true
@@ -1089,6 +1269,7 @@ enum ClientTarget: String, CaseIterable, Identifiable, Codable {
     case hiddify
     case egern
     case v2box
+    case anywhere
     case clashApple = "clash-apple"
     case singBox = "sing-box"
     case clashMi = "clash-mi"
@@ -1115,6 +1296,7 @@ enum ClientTarget: String, CaseIterable, Identifiable, Codable {
         case .quanx: "QuanX"
         case .hiddify: "Hiddify"
         case .egern: "Egern"
+        case .anywhere: "Anywhere"
         case .v2box: "V2Box"
         case .singBox: "sing-box MT"
         case .clashMi: "Clash Mi"
@@ -1132,6 +1314,7 @@ enum ClientTarget: String, CaseIterable, Identifiable, Codable {
         case .quanx: "Quantumult X"
         case .hiddify: String(localized: "sing-box 内核")
         case .egern: "Egern YAML"
+        case .anywhere: String(localized: "节点链接")
         case .v2box: "V2Ray / Xray"
         case .singBox: "sing-box JSON"
         case .clashMi: "Mihomo YAML"
@@ -1149,6 +1332,7 @@ enum ClientTarget: String, CaseIterable, Identifiable, Codable {
         case .quanx: "q.circle.fill"
         case .hiddify: "eye.slash.circle.fill"
         case .egern: "e.circle.fill"
+        case .anywhere: "globe"
         case .v2box: "shippingbox.circle.fill"
         case .singBox: "shippingbox.fill"
         case .clashMi: "cat.circle.fill"
@@ -1173,10 +1357,21 @@ enum ClientTarget: String, CaseIterable, Identifiable, Codable {
         case .quanx: "ClientQuantumultX"
         case .hiddify: "ClientHiddify"
         case .egern: "ClientEgern"
+        case .anywhere: "ClientAnywhere"
         case .v2box: "ClientV2Box"
         case .singBox: "ClientSingBox"
         case .clashMi: "ClientClashMi"
         case .karing: "ClientKaring"
+        }
+    }
+
+    /// How far to enlarge the artwork so it fills a rounded tile. The macOS
+    /// icons follow the Mac grid: the shape is 144 of 180 points, inside a
+    /// transparent margin that read as a white ring on Tower's tile.
+    var appIconFillScale: CGFloat {
+        switch self {
+        case .surgeMac, .clashVerge, .clashMac, .mihomoParty: 180.0 / 144.0
+        default: 1
         }
     }
 
@@ -1190,6 +1385,7 @@ enum ClientTarget: String, CaseIterable, Identifiable, Codable {
         case .quanx: "q.circle.fill"
         case .hiddify: "shield.lefthalf.filled"
         case .egern: "e.circle.fill"
+        case .anywhere: "globe"
         case .v2box: "shippingbox.fill"
         case .singBox: "shippingbox.fill"
         case .clashMi: "cat.fill"
@@ -1207,6 +1403,7 @@ enum ClientTarget: String, CaseIterable, Identifiable, Codable {
         case .quanx: "14A69A"
         case .hiddify: "6047D9"
         case .egern: "F08A2B"
+        case .anywhere: "286BF5"
         case .v2box: "246BFD"
         case .singBox: "334854"
         case .clashMi: "224D7A"
@@ -1244,7 +1441,7 @@ enum ClientTarget: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .clash, .clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi, .karing, .surge, .surgeMac, .loon, .quanx, .egern:
             true
-        case .shadowrocket, .hiddify, .v2box, .singBox:
+        case .shadowrocket, .hiddify, .v2box, .singBox, .anywhere:
             false
         }
     }
@@ -1253,7 +1450,7 @@ enum ClientTarget: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .clash, .clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi, .karing, .egern: "yaml"
         case .hiddify, .singBox: "json"
-        case .v2box: "txt"
+        case .v2box, .anywhere: "txt"
         default: "conf"
         }
     }
@@ -1263,13 +1460,21 @@ enum ClientTarget: String, CaseIterable, Identifiable, Codable {
         // publishes only a node-subscription route, not a complete profile
         // schema with Tower's rules and policy groups.
         switch self {
-        case .quanx, .v2box, .clashMac: false
+        case .quanx, .v2box, .clashMac, .anywhere: false
         default: true
         }
     }
 
     var supportsNodesOnlyImport: Bool {
-        [.shadowrocket, .loon, .quanx, .hiddify, .v2box].contains(self)
+        [.shadowrocket, .loon, .quanx, .hiddify, .v2box, .anywhere].contains(self)
+    }
+
+    var supportsNodesOnlyExport: Bool {
+        supportsNodesOnlyImport || usesClashFormat || self == .surge || self == .surgeMac
+    }
+
+    func copiesAggregatedSubscription(mode: ExportContentMode) -> Bool {
+        mode == .nodesOnly && (usesClashFormat || self == .surge || self == .surgeMac)
     }
 
     func supportsDirectImport(mode: ExportContentMode) -> Bool {
@@ -1280,8 +1485,8 @@ enum ClientTarget: String, CaseIterable, Identifiable, Codable {
     }
 
     var supportedContentModes: [ExportContentMode] {
-        if self == .v2box { return [.nodesOnly] }
-        guard supportsNodesOnlyImport else { return [.fullConfiguration] }
+        if self == .v2box || self == .anywhere { return [.nodesOnly] }
+        guard supportsNodesOnlyExport else { return [.fullConfiguration] }
         return [.fullConfiguration, .nodesOnly]
     }
 
@@ -1296,19 +1501,27 @@ enum ClientTarget: String, CaseIterable, Identifiable, Codable {
     }
 
     func supports(_ kind: ProxyKind) -> Bool {
-        switch self {
+        // Other clients may implement a different MASQUE dialect.
+        if kind == .masque {
+            return [.surge, .surgeMac, .clashApple, .clashVerge, .clashMac,
+                    .flClash, .mihomoParty, .clashMi, .shadowrocket, .singBox].contains(self)
+        }
+        return switch self {
         case .clash, .clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi:
             kind != .unknown
         case .karing:
             // Karing documents these protocols for imported Clash profiles.
             // Snell is deliberately omitted: neither its current client guide
             // nor its bundled sing-box-derived core claims support for it.
+            // Its table lists SSH but not TrustTunnel.
             [.shadowsocks, .shadowsocksR, .vmess, .vless, .trojan, .hysteria,
-             .hysteria2, .tuic, .wireguard, .anytls, .socks5, .http].contains(kind)
+             .hysteria2, .tuic, .wireguard, .anytls, .socks5, .http, .ssh].contains(kind)
         case .surge, .surgeMac:
             // TUIC but no Hysteria 1: Surge writes `tuic-v5` and has never
             // shipped a Hysteria 1 server type.
-            [.shadowsocks, .vmess, .trojan, .hysteria2, .tuic, .wireguard, .anytls, .snell, .socks5, .http].contains(kind)
+            // SSH and Trust Tunnel are documented policy types in the manual.
+            [.shadowsocks, .vmess, .trojan, .hysteria2, .tuic, .wireguard, .anytls, .snell, .socks5, .http,
+             .ssh, .trustTunnel].contains(kind)
         case .shadowrocket:
             kind != .unknown
         case .loon:
@@ -1325,14 +1538,20 @@ enum ClientTarget: String, CaseIterable, Identifiable, Codable {
         case .hiddify:
             // Hiddify's shipped core rejects Snell and removed ShadowsocksR.
             // Skip and count them rather than creating unusable outbounds.
-            kind != .unknown && kind != .snell && kind != .shadowsocksR
+            // TrustTunnel exists only in an unreleased Hiddify core fork.
+            kind != .unknown && kind != .snell && kind != .shadowsocksR && kind != .trustTunnel
         case .singBox:
             // Official sing-box supports Snell but has no ShadowsocksR
             // outbound. Snell version validation is applied by the generator.
-            kind != .unknown && kind != .shadowsocksR
+            // Official sing-box has no TrustTunnel outbound.
+            kind != .unknown && kind != .shadowsocksR && kind != .trustTunnel
         case .egern:
             // Egern's own producer lists tuic but no hysteria 1.
-            [.shadowsocks, .vmess, .vless, .trojan, .hysteria2, .tuic, .wireguard, .anytls, .snell, .socks5, .http].contains(kind)
+            // SSH arrived in Egern 2.20; TrustTunnel is not a proxy type there.
+            [.shadowsocks, .vmess, .vless, .trojan, .hysteria2, .tuic, .wireguard, .anytls, .snell, .socks5, .http,
+             .ssh].contains(kind)
+        case .anywhere:
+            [.vless, .hysteria2, .trojan, .anytls, .shadowsocks, .socks5].contains(kind)
         case .v2box:
             // V2Box's native protocol picker also exposes WireGuard,
             // Hysteria 2 and HTTP. Tower can preserve each of those as a
@@ -1472,7 +1691,7 @@ enum ClientPlatform {
     static var current: Self { TowerPlatform.isMac ? .mac : .phone }
 
     var defaultOrder: [ClientTarget] {
-        let front: [ClientTarget] = self == .mac ? [.shadowrocket, .surgeMac, .clashVerge, .clashMac, .flClash, .mihomoParty, .singBox, .clashApple] : []
+        let front: [ClientTarget] = self == .mac ? [.shadowrocket, .surgeMac, .clashVerge, .clashMac, .flClash, .mihomoParty, .singBox, .clashApple, .anywhere] : []
         return front + ClientTargetOrder.defaultOrder.filter { !front.contains($0) }
     }
 
@@ -1499,6 +1718,7 @@ enum ClientTargetOrder {
         .loon,
         .quanx,
         .clashApple,
+        .anywhere,
         .v2box,
         .singBox,
         .hiddify,
@@ -1567,13 +1787,19 @@ enum ClientTargetOrder {
             result.insert(.clashApple, at: min(defaultClashIndex, result.endIndex))
         }
 
+        let needsAnywhereInsertion = seen.insert(.anywhere).inserted
         let needsSingBoxInsertion = seen.insert(.singBox).inserted
-        for target in defaultOrder where target != .singBox && seen.insert(target).inserted {
+        for target in defaultOrder where target != .singBox && target != .anywhere && seen.insert(target).inserted {
             result.append(target)
         }
         if needsSingBoxInsertion {
             let defaultSingBoxIndex = defaultOrder.firstIndex(of: .singBox) ?? result.endIndex
             result.insert(.singBox, at: min(defaultSingBoxIndex, result.endIndex))
+        }
+
+        if needsAnywhereInsertion {
+            let index = result.firstIndex(of: .clashApple).map { $0 + 1 } ?? result.endIndex
+            result.insert(.anywhere, at: index)
         }
 
         // Builds that first introduced sing-box preserved an explicit stored
@@ -1627,6 +1853,9 @@ struct AppSnapshot: Codable {
     /// Nodes explicitly excluded from generated configurations. Optional keeps
     /// snapshots written before per-node selection backward compatible.
     var excludedNodeIDs: [UUID]?
+    /// Saved name condition shared by every export destination. Missing means
+    /// all names are eligible, preserving older snapshots.
+    var nodeExportNameFilter: NodeExportNameFilter?
     /// User-authored rules live outside downloaded schemes so upstream refresh
     /// can never overwrite them.
     var customRuleFlows: [CustomRuleFlow]?
@@ -1678,11 +1907,9 @@ struct AppSnapshot: Codable {
     /// Missing means disabled so existing users never disclose a URL merely by
     /// updating Tower.
     var embedRemoteSubscriptionLinks: Bool?
-    /// When this snapshot was written, used to decide which of two devices'
-    /// copies wins. Optional so every snapshot written before iCloud sync
-    /// existed still decodes; a missing value loses to any dated one, which is
-    /// the right way round — a snapshot from before sync cannot have been the
-    /// more recent edit on another device.
+    /// Last local edit, retained for display and legacy decoding. Sync uses a
+    /// shared baseline and immutable history rather than choosing a whole
+    /// snapshot by this timestamp.
     var updatedAt: Date?
     /// Per-client import mode. New or unsupported clients fall back to full.
     var exportContentModes: [String: String]?
@@ -1696,6 +1923,9 @@ struct AppSnapshot: Codable {
     var resolvedHostCountryCodes: [String: String]?
     var resolvedHostCountryCodeUpdatedAt: [String: Date]?
     var resolvedHostCountryDatabaseVersion: String?
+    /// Tailnets reachable from exported profiles. Auth keys are not part of
+    /// the snapshot; they stay in this device's Keychain.
+    var tailnets: [TailnetConnection]?
 
     init(
         subscriptions: [SubscriptionSource],
@@ -1707,6 +1937,7 @@ struct AppSnapshot: Codable {
         ruleSchemeCustomizations: [String: RuleSchemeCustomization]? = nil,
         ruleGroupEmojisEnabled: [String: Bool]? = nil,
         excludedNodeIDs: [UUID]? = nil,
+        nodeExportNameFilter: NodeExportNameFilter? = nil,
         customRuleFlows: [CustomRuleFlow]? = nil,
         localRuleSets: [LocalRuleSet]? = nil,
         excludedKinds: [String: [String]]? = nil,
@@ -1729,9 +1960,11 @@ struct AppSnapshot: Codable {
         resolvedHostCountryCodeUpdatedAt: [String: Date]? = nil,
         resolvedHostCountryDatabaseVersion: String? = nil,
         updatedAt: Date? = nil,
-        macClientPreferences: ClientPlatformPreferences? = nil
+        macClientPreferences: ClientPlatformPreferences? = nil,
+        tailnets: [TailnetConnection]? = nil
     ) {
         self.macClientPreferences = macClientPreferences
+        self.tailnets = tailnets
         self.subscriptions = subscriptions
         self.nodes = nodes
         self.selectedPresetID = selectedPresetID
@@ -1741,6 +1974,7 @@ struct AppSnapshot: Codable {
         self.ruleSchemeCustomizations = ruleSchemeCustomizations
         self.ruleGroupEmojisEnabled = ruleGroupEmojisEnabled
         self.excludedNodeIDs = excludedNodeIDs
+        self.nodeExportNameFilter = nodeExportNameFilter
         self.customRuleFlows = customRuleFlows
         self.localRuleSets = localRuleSets
         self.excludedKinds = excludedKinds
@@ -1827,22 +2061,30 @@ struct ConfigurationNameDraft: Equatable {
             }
         }
     }
-    private var hasLoadedPersistedName = false
     /// SwiftUI can publish one transient empty string when a focused text
     /// field is dismissed from a parent toolbar. Keep the last value the user
     /// actually entered so that teardown event cannot reset a valid name.
     private var lastValidText: String?
+    /// The saved name this draft was loaded from or last followed. Closing
+    /// Settings commits the draft, so an untouched draft must not keep a name
+    /// that a restore or an iCloud pull has since replaced.
+    private var savedName: String
 
     init(text: String = "") {
         self.text = text
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         self.lastValidText = trimmed.isEmpty ? nil : text
+        self.savedName = ExportFilePresentation.profileName(text)
     }
 
-    mutating func loadPersistedNameIfNeeded(_ name: String) {
-        guard !hasLoadedPersistedName else { return }
-        text = name
-        hasLoadedPersistedName = true
+    /// Whether the user has typed a name that differs from the saved one.
+    var isEdited: Bool { committedName != savedName }
+
+    /// Follows a saved name that changed while Settings was open. A name the
+    /// user is typing wins; otherwise the draft takes the new saved name.
+    mutating func followSavedName(_ name: String) {
+        if !isEdited { text = name }
+        savedName = ExportFilePresentation.profileName(name)
     }
 
     var committedName: String {
@@ -1876,6 +2118,12 @@ enum ExportFilePresentation {
     }
 }
 
+struct SkippedExportNode {
+    let name: String
+    let kind: ProxyKind
+    let reason: String
+}
+
 struct GeneratedConfiguration {
     let diagnostics: [String]
     let hasInvalidPolicyReferences: Bool
@@ -1883,6 +2131,7 @@ struct GeneratedConfiguration {
     let content: String
     let supportedNodeCount: Int
     let skippedNodeCount: Int
+    let skippedNodes: [SkippedExportNode]
     /// Remote node counts are unknown until the target client refreshes.
     let remoteSourceCount: Int
     var hasExportableProxies: Bool { !hasInvalidPolicyReferences && (supportedNodeCount > 0 || remoteSourceCount > 0) }
@@ -1902,13 +2151,15 @@ struct GeneratedConfiguration {
         fileExtensionOverride: String? = nil,
         remoteSourceCount: Int = 0,
         diagnostics: [String] = [],
-        hasInvalidPolicyReferences: Bool = false
+        hasInvalidPolicyReferences: Bool = false,
+        skippedNodes: [SkippedExportNode] = []
     ) {
         self.diagnostics = diagnostics
         self.hasInvalidPolicyReferences = hasInvalidPolicyReferences
         self.target = target
         self.content = content
         self.supportedNodeCount = supportedNodeCount
+        self.skippedNodes = skippedNodes
         self.skippedNodeCount = skippedNodeCount
         self.remoteSourceCount = remoteSourceCount
         self.ruleCount = ruleCount
@@ -1935,7 +2186,8 @@ struct GeneratedConfiguration {
             fileExtensionOverride: fileExtensionOverride,
             remoteSourceCount: remoteSourceCount,
             diagnostics: diagnostics,
-            hasInvalidPolicyReferences: hasInvalidPolicyReferences
+            hasInvalidPolicyReferences: hasInvalidPolicyReferences,
+            skippedNodes: skippedNodes
         )
     }
 }

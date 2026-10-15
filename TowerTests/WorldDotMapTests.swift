@@ -5,6 +5,56 @@ import SwiftUI
 /// The home map is a flat dot grid rather than a MapKit globe. The grid ships
 /// as a text bitmap, so the parse and the projection onto it are what can break.
 final class WorldDotMapTests: XCTestCase {
+    func testPanReversesImmediatelyAfterOvershootingEveryEdge() {
+        let size = CGSize(width: 320, height: 180)
+        for sign: CGFloat in [-1, 1] {
+            let start = WorldDotMapView.Viewport(scale: 2)
+            let overshoot = CGSize(width: sign * 900, height: sign * 900)
+            let edge = start.translated(by: overshoot, in: size)
+            let reversal = CGSize(width: overshoot.width - sign * 5, height: overshoot.height - sign * 7)
+            let moved = edge.translated(by: WorldDotMapView.PanMotion.delta(from: overshoot, to: reversal), in: size)
+            XCTAssertEqual(moved.offset.width, edge.offset.width - sign * 5, accuracy: 0.001)
+            XCTAssertEqual(moved.offset.height, edge.offset.height - sign * 7, accuracy: 0.001)
+        }
+    }
+
+    func testMapTransformRecordsInterpolatedViewportForGestureHandoff() {
+        let size = CGSize(width: 320, height: 180)
+        let recorder = WorldDotMapView.ViewportPresentation()
+        let target = WorldDotMapView.Viewport(scale: 3, offset: CGSize(width: 100, height: -40))
+        var effect = WorldDotMapView.TrackedViewportTransform(viewport: target,
+            baseSize: size, recorder: recorder)
+        // Mimic SwiftUI's presentation value halfway through a zoom/recenter.
+        effect.animatableData = AnimatablePair(2, AnimatablePair(40, -15))
+        let transform = effect.effectValue(size: size)
+        let visible = recorder.value
+        XCTAssertEqual(visible.scale, 2)
+        XCTAssertEqual(visible.offset, CGSize(width: 40, height: -15))
+        XCTAssertNotEqual(visible, target)
+        let point = CGPoint(x: 70, y: 45)
+        let expected = visible.transform(point, in: size)
+        XCTAssertEqual(point.x * transform.m11 + transform.m31, expected.x, accuracy: 0.001)
+        XCTAssertEqual(point.y * transform.m22 + transform.m32, expected.y, accuracy: 0.001)
+        let continued = visible.translated(by: CGSize(width: 3, height: 4), in: size)
+        XCTAssertEqual(continued.offset, CGSize(width: 43, height: -11))
+    }
+
+    func testTargetDensityRasterNormalizesBeforePresentationZoom() {
+        let size = CGSize(width: 320, height: 180)
+        let point = CGPoint(x: 60, y: 120)
+        let visible = WorldDotMapView.Viewport(scale: 2, offset: CGSize(width: 22, height: -33))
+        let effect = WorldDotMapView.TrackedViewportTransform(viewport: visible,
+            baseSize: size, recorder: .init())
+        let transform = effect.effectValue(size: size)
+        for rasterScale: CGFloat in [1, 1.8, 2.8, 4.2] {
+            // Both raster paths normalize to the same base map coordinates.
+            let normalized = CGPoint(x: point.x * rasterScale / rasterScale, y: point.y * rasterScale / rasterScale)
+            let expected = visible.transform(point, in: size)
+            XCTAssertEqual(normalized.x * transform.m11 + transform.m31, expected.x, accuracy: 0.001)
+            XCTAssertEqual(normalized.y * transform.m22 + transform.m32, expected.y, accuracy: 0.001)
+        }
+    }
+
     func testCountryLatencyUsesMedianAndWaitsBeforeDeclaringFailure() {
         let nodes = (0..<3).map { ProxyNode(kind: .trojan, name: "US \($0)", server: "example.com", port: 443, rawURI: "") }
         var results: [UUID: NodeLatencyMeasurement] = [:]
@@ -687,8 +737,11 @@ final class WorldDotMapTests: XCTestCase {
             .appendingPathComponent("Tower/Features/Subscriptions/WorldDotMapView.swift")
         let source = try String(contentsOf: sourceURL, encoding: .utf8)
 
-        XCTAssertTrue(source.contains("WorldDotCanvas"))
+        XCTAssertTrue(source.contains("WorldDotDetailCanvas"))
         XCTAssertTrue(source.contains(".equatable()"))
+        // One raster for every gesture: no renderer swap at touch-down/release.
+        XCTAssertFalse(source.contains("usesDetailCanvas"))
+        XCTAssertFalse(source.contains("struct WorldDotCanvas"))
     }
 
     func testDenseAsiaKeepsAtLeastTheHighestPriorityLabels() throws {
@@ -732,26 +785,45 @@ final class WorldDotMapTests: XCTestCase {
         XCTAssertTrue(source.contains("DragGesture(minimumDistance: 1)"))
     }
 
-    func testPanKeepsOnlyASmallPartOfProjectedMomentum() {
-        let settled = WorldDotMapView.PanMotion.settled(
-            translation: CGSize(width: 100, height: 50),
-            predictedEndTranslation: CGSize(width: 400, height: 200),
-            reduceMotion: false
+    func testPanGlideProjectsReleaseVelocityWithFastDeceleration() {
+        let size = CGSize(width: 360, height: 240)
+        // 500 pt/s × 0.99 / 0.01 / 1000 = 49.5 pt, inside the 96 pt cap.
+        let glide = WorldDotMapView.PanMotion.glide(
+            velocity: CGSize(width: 400, height: -300), in: size, reduceMotion: false
         )
-
-        XCTAssertEqual(settled.width, 112, accuracy: 0.001)
-        XCTAssertEqual(settled.height, 56, accuracy: 0.001)
+        XCTAssertEqual(glide.width, 39.6, accuracy: 0.01)
+        XCTAssertEqual(glide.height, -29.7, accuracy: 0.01)
     }
 
-    func testReducedMotionPanDoesNotUseProjectedMomentum() {
-        let settled = WorldDotMapView.PanMotion.settled(
-            translation: CGSize(width: 100, height: 50),
-            predictedEndTranslation: CGSize(width: 400, height: 200),
-            reduceMotion: true
+    func testPanGlideIsCappedAndKeepsDirection() {
+        let size = CGSize(width: 360, height: 240)
+        let glide = WorldDotMapView.PanMotion.glide(
+            velocity: CGSize(width: 6000, height: 8000), in: size, reduceMotion: false
         )
+        XCTAssertEqual(hypot(glide.width, glide.height), 240 * 0.4, accuracy: 0.01)
+        XCTAssertEqual(glide.width / glide.height, 0.75, accuracy: 0.001)
+    }
 
-        XCTAssertEqual(settled.width, 100, accuracy: 0.001)
-        XCTAssertEqual(settled.height, 50, accuracy: 0.001)
+    func testSlowReleaseAndReducedMotionDoNotGlide() {
+        let size = CGSize(width: 360, height: 240)
+        XCTAssertEqual(WorldDotMapView.PanMotion.glide(
+            velocity: CGSize(width: 40, height: 50), in: size, reduceMotion: false), .zero)
+        XCTAssertEqual(WorldDotMapView.PanMotion.glide(
+            velocity: CGSize(width: 900, height: 0), in: size, reduceMotion: true), .zero)
+    }
+
+    func testGlideStartsAtFingerSpeedWithoutOvershoot() {
+        // Uncapped: the spring leaves at exactly the release speed.
+        let distance = CGSize(width: 49.5, height: 0)
+        XCTAssertEqual(WorldDotMapView.PanMotion.relativeVelocity(
+            CGSize(width: 500, height: 0), toward: distance), 500 / 49.5, accuracy: 0.001)
+        // Capped or clamped at an edge: stay below the natural frequency so a
+        // critically damped spring never overshoots past the map's bounds.
+        let limit = 2 * Double.pi / WorldDotMapView.PanMotion.glideDuration * 0.9
+        XCTAssertEqual(WorldDotMapView.PanMotion.relativeVelocity(
+            CGSize(width: 6000, height: 0), toward: CGSize(width: 20, height: 0)), limit, accuracy: 0.001)
+        XCTAssertEqual(WorldDotMapView.PanMotion.relativeVelocity(
+            CGSize(width: 500, height: 0), toward: .zero), 0)
     }
 
     func testViewportUsesThreeInformationLevels() {
@@ -865,12 +937,10 @@ final class WorldDotMapTests: XCTestCase {
         }
     }
 
-    func testSelectionKeepsCrispRendererAtBothZoomLevels() {
-        for level in [WorldDotMapView.DetailLevel.countries, .detail] {
-            for recentring in [true, false] {
-                XCTAssertTrue(WorldDotMapView.RenderPlanner.usesDetailCanvas(detailLevel: level, isManipulatingViewport: false, isRecenteringSelection: recentring))
-                XCTAssertFalse(WorldDotMapView.RenderPlanner.usesDetailCanvas(detailLevel: level, isManipulatingViewport: true, isRecenteringSelection: recentring))
-            }
+    func testRasterKeepsItsDensityWhileTheMapMoves() {
+        for scale in [CGFloat(1), 1.8, 4.2] {
+            XCTAssertEqual(WorldDotMapView.RenderPlanner.rasterScale(current: 1.8, viewportScale: scale, isMoving: true), 1.8)
+            XCTAssertEqual(WorldDotMapView.RenderPlanner.rasterScale(current: 1.8, viewportScale: scale, isMoving: false), scale)
         }
         let size = CGSize(width: 390, height: 280)
         let point = CGPoint(x: 240, y: 90)
@@ -882,6 +952,56 @@ final class WorldDotMapTests: XCTestCase {
                 XCTAssertEqual(point.y * scale + origin.height, expected.y, accuracy: 0.001)
             }
         }
+    }
+
+    func testSelectionLayerBoundsCoverEverySelectedDot() throws {
+        let grid = WorldDotGrid.shared
+        try XCTSkipIf(grid.isEmpty)
+        let markers = [
+            WorldDotMarker(id: "JP", title: "日本", latitude: 36, longitude: 138, weight: 3, isSelected: true),
+            WorldDotMarker(id: "SG", title: "新加坡", latitude: 1.35, longitude: 103.8, weight: 2, isSelected: false)
+        ]
+        let paint = WorldDotPaint(grid: grid, markers: markers)
+        XCTAssertFalse(paint.selectedCells.isEmpty)
+        XCTAssertTrue(paint.selectedCells.isSubset(of: paint.coveredCells))
+        let layout = WorldDotMapView.Layout(size: CGSize(width: 390, height: 260), grid: grid)
+        let bounds = try XCTUnwrap(paint.selectionBounds(in: layout))
+        for index in paint.selectedCells {
+            let center = layout.center(column: index % grid.columns, row: index / grid.columns)
+            let dot = CGRect(x: center.x - layout.cell * 0.45, y: center.y - layout.cell * 0.45,
+                             width: layout.cell * 0.9, height: layout.cell * 0.9)
+            XCTAssertTrue(bounds.insetBy(dx: -0.001, dy: -0.001).contains(dot))
+        }
+        XCTAssertNil(WorldDotPaint(grid: grid, markers: [markers[1]]).selectionBounds(in: layout))
+    }
+
+    func testBitmapRasterMatchesMapSizeAtItsDensity() throws {
+        let grid = WorldDotGrid.shared
+        try XCTSkipIf(grid.isEmpty)
+        let request = WorldDotRasterizer.Request(
+            size: CGSize(width: 360, height: 240), scale: 1.8, displayScale: 3,
+            coveredCells: [], latencyBands: [:], dark: false
+        )
+        let image = try XCTUnwrap(WorldDotRasterizer.render(request, grid: grid))
+        XCTAssertEqual(image.width, 1_944)
+        XCTAssertEqual(image.height, 1_296)
+        // Too large for a texture: refuse rather than allocate.
+        XCTAssertNil(WorldDotRasterizer.render(WorldDotRasterizer.Request(
+            size: CGSize(width: 4_000, height: 3_000), scale: 4.2, displayScale: 3,
+            coveredCells: [], latencyBands: [:], dark: false
+        ), grid: grid))
+    }
+
+    func testBitmapColoursMatchCanvasPaint() {
+        XCTAssertTrue(WorldDotPaint.rgba(forKey: -1, dark: false) == (0, 0, 0, 0.17))
+        XCTAssertTrue(WorldDotPaint.rgba(forKey: -1, dark: true) == (1, 1, 1, 0.22))
+        let key = WorldDotPaint.key(band: .fast, selected: false)
+        let rgb = MapLatencyBand.fast.rgb(selected: false, dark: false)
+        let rgba = WorldDotPaint.rgba(forKey: key, dark: false)
+        XCTAssertEqual(Double(rgba.0), rgb.0, accuracy: 0.0001)
+        XCTAssertEqual(Double(rgba.1), rgb.1, accuracy: 0.0001)
+        XCTAssertEqual(Double(rgba.2), rgb.2, accuracy: 0.0001)
+        XCTAssertEqual(rgba.3, 1)
     }
 
     func testTestingProgressDoesNotResizeCountryLabels() {

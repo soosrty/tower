@@ -59,9 +59,11 @@ final class SingBoxGenerationTests: XCTestCase {
             XCTAssertFalse(result.content.contains("Native SS TLS"))
             XCTAssertTrue(result.content.contains("Plain SS"))
         }
-        for target: ClientTarget in [.shadowrocket, .karing] {
+        // Only Shadowrocket and Quantumult X can say "native TLS" for SS.
+        for target: ClientTarget in [.shadowrocket, .quanx] {
             XCTAssertEqual(generator.generate(nodes: [secure], preset: preset, target: target).supportedNodeCount, 1)
         }
+        XCTAssertEqual(generator.generate(nodes: [secure], preset: preset, target: .karing).supportedNodeCount, 0)
     }
 
     func testShadowsocksWebSocketUsesOnlySIP003Transport() throws {
@@ -421,13 +423,17 @@ final class SingBoxGenerationTests: XCTestCase {
         XCTAssertEqual(ClientTarget.allCases.filter(\.usesSingBoxFormat), [.hiddify, .singBox])
     }
 
-    func testHiddifyAndSingBoxMTGenerateTheSameSharedDialect() {
+    func testHiddifyAndSingBoxMTKeepSharedNodeDialectWithIndependentDNSModes() throws {
         let nodes = [node(.shadowsocks), node(.vless, name: "VLESS", transport: "grpc")]
-
-        XCTAssertEqual(
-            generator.generate(nodes: nodes, preset: preset, target: .hiddify).content,
-            generator.generate(nodes: nodes, preset: preset, target: .singBox).content
-        )
+        let hiddify = try json(.hiddify, nodes: nodes)
+        let singBox = try json(.singBox, nodes: nodes)
+        for kind in ["shadowsocks", "vless"] {
+            let left = try XCTUnwrap((hiddify["outbounds"] as? [[String: Any]])?.first { $0["type"] as? String == kind })
+            let right = try XCTUnwrap((singBox["outbounds"] as? [[String: Any]])?.first { $0["type"] as? String == kind })
+            XCTAssertEqual(left as NSDictionary, right as NSDictionary)
+        }
+        XCTAssertNil((hiddify["experimental"] as? [String: Any])?["clash_api"])
+        XCTAssertNotNil((singBox["experimental"] as? [String: Any])?["clash_api"])
     }
 
     func testRejectIsARuleActionNotABlockOutbound() throws {

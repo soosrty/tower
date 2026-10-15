@@ -53,7 +53,11 @@ struct RuleSchemeRepository {
     /// Rule lines for one ruleset, comments and blank lines already removed.
     func lines(for resource: RuleSchemeRuleset.Resource) -> [String] {
         if let url = resource.domainSetURL {
-            return lines(for: .remote(url)).compactMap { raw in
+            // The source list is cached; its conversion was not, and a domain
+            // set can hold tens of thousands of lines rebuilt on every read.
+            let source = lines(for: .remote(url))
+            if let cached = DomainSetLineCache.shared.lines(for: url, source: source) { return cached }
+            let converted = source.compactMap { raw -> String? in
                 let domain = raw.trimmingCharacters(in: .whitespacesAndNewlines)
                     .trimmingCharacters(in: CharacterSet(charactersIn: "\u{FEFF}"))
                 let suffix = domain.hasPrefix(".")
@@ -62,6 +66,8 @@ struct RuleSchemeRepository {
                       !value.contains(where: { $0.isWhitespace || ",/\"#;".contains($0) }) else { return nil }
                 return "\(suffix ? "DOMAIN-SUFFIX" : "DOMAIN"),\(value)"
             }
+            DomainSetLineCache.shared.store(converted, for: url, source: source)
+            return converted
         }
         switch resource {
         case .inline(let rule):
@@ -73,6 +79,22 @@ struct RuleSchemeRepository {
                 in: bundle
             )
         }
+    }
+
+    /// Uses the same downloaded-or-bundled lookup as rule generation, including
+    /// saved copies whose scheme itself is no longer marked as bundled.
+    func hasLocalRules(for url: URL) -> Bool {
+        downloadStore?.hasCachedRules(for: url) == true
+            || bundledResourceURL(named: Self.bundledResourceName(for: url)) != nil
+    }
+
+    /// Whether the lines behind a rule-list reference are on this device.
+    /// Downloads are local and a scheme can arrive through iCloud without
+    /// them; exporting then would silently leave the whole list out.
+    func hasRuleListContent(_ resource: RuleSchemeRuleset.Resource) -> Bool {
+        guard case .remote(let url) = resource else { return true }
+        return downloadStore?.hasCachedRules(for: url) == true
+            || bundledContent(named: Self.bundledResourceName(for: url)) != nil
     }
 
     func hasDomainSetContent(_ resource: RuleSchemeRuleset.Resource) -> Bool {
@@ -95,7 +117,7 @@ struct RuleSchemeRepository {
         return content.components(separatedBy: .newlines).contains { rawLine in
             rawLine
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "\u{FEFF}")) == "payload:"
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\u{FEFF}")) .hasPrefix("payload:")
         }
     }
 
@@ -138,11 +160,15 @@ struct RuleSchemeRepository {
     }
 
     private func bundledContent(named name: String) -> String? {
+        guard let url = bundledResourceURL(named: name) else { return nil }
+        return try? String(contentsOf: url, encoding: .utf8)
+    }
+
+    private func bundledResourceURL(named name: String) -> URL? {
         let base = (name as NSString).deletingPathExtension
         let ext = (name as NSString).pathExtension
-        guard let url = bundle.url(forResource: base, withExtension: ext, subdirectory: "ACL4SSR")
-            ?? bundle.url(forResource: base, withExtension: ext) else { return nil }
-        return try? String(contentsOf: url, encoding: .utf8)
+        return bundle.url(forResource: base, withExtension: ext, subdirectory: "ACL4SSR")
+            ?? bundle.url(forResource: base, withExtension: ext)
     }
 
     /// Mirrors `local_name()` in the update script so a pinned URL resolves to
@@ -159,7 +185,7 @@ struct RuleSchemeRepository {
     static func sanitizedLines(from content: String) -> [String] {
         let rawLines = content.components(separatedBy: .newlines)
         let isClashProvider = rawLines.contains {
-            $0.trimmingCharacters(in: .whitespacesAndNewlines) == "payload:"
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("payload:")
         }
         guard isClashProvider else {
             return rawLines
@@ -167,22 +193,10 @@ struct RuleSchemeRepository {
                 .filter { !$0.isEmpty && !$0.hasPrefix("#") && !$0.hasPrefix(";") && !$0.hasPrefix("//") }
         }
 
-        var inPayload = false
-        return rawLines.compactMap { rawLine in
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line == "payload:" {
-                inPayload = true
-                return nil
-            }
-            guard inPayload, line.hasPrefix("- ") else { return nil }
-            let value = String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
-            guard value.count >= 2,
-                  let first = value.first,
-                  let last = value.last,
-                  (first == "\"" || first == "'"),
-                  first == last else { return value }
-            return String(value.dropFirst().dropLast())
-        }
+        var reader = SchemeYAMLReader(content)
+        if let object = try? reader.read() as? [String: Any], let payload = object["payload"] as? [String] { return payload }
+        return rawLines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+
     }
 }
 
@@ -713,5 +727,38 @@ private struct BundledClassicalRuleAnalysis {
                 bytes[index] &= UInt8(truncatingIfNeeded: 0xFF << (8 - remaining))
             }
         }
+    }
+}
+
+/// Converted domain-set lines, reused while their source list is the same
+/// cached array (same storage and length).
+final class DomainSetLineCache: @unchecked Sendable {
+    static let shared = DomainSetLineCache()
+
+    private struct SourceKey: Equatable {
+        let address: UnsafeRawPointer?
+        let count: Int
+
+        init(_ lines: [String]) {
+            address = lines.withUnsafeBufferPointer { UnsafeRawPointer($0.baseAddress) }
+            count = lines.count
+        }
+    }
+
+    private let lock = NSLock()
+    private var entries: [URL: (source: SourceKey, lines: [String])] = [:]
+
+    func lines(for url: URL, source: [String]) -> [String]? {
+        let key = SourceKey(source)
+        lock.lock(); defer { lock.unlock() }
+        guard let entry = entries[url], entry.source == key else { return nil }
+        return entry.lines
+    }
+
+    func store(_ lines: [String], for url: URL, source: [String]) {
+        let key = SourceKey(source)
+        lock.lock(); defer { lock.unlock() }
+        if entries.count > 256 { entries.removeAll(keepingCapacity: true) }
+        entries[url] = (key, lines)
     }
 }

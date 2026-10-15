@@ -1,14 +1,19 @@
 # TestFlight 发布流程
 
+
+公证的 `xcodebuild -exportArchive` 返回上传成功后，还须在正式发布机使用同一归档执行 `xcodebuild -exportNotarizedApp -archivePath <归档路径> -exportPath <公证版导出目录>`。仅有公证提交成功不代表该目录已包含应用；取回后再验证 `stapler validate`、严格签名与 Gatekeeper，通过后制作 DMG。
+
+Mac 分发启动验收必须使用公开回下载的包，保留正常下载隔离标记，安装后从 Finder 打开并确认主界面可交互；退出后再次打开复核。`spctl` / `stapler` / 严格签名通过以及可执行进程短暂存在，都不能代替这一步。遇到拦截时保存系统日志并核对实际安装实例，不要删除隔离标记或关闭 Gatekeeper 来取得通过结果。
+
 ## Mac Homebrew 分发
 
 独立 tap 仓库为 https://github.com/pengchujin/homebrew-tap ，安装命令为 `brew install --cask pengchujin/tap/tower`。
 
-新的 Mac DMG 完成 Developer ID 签名、公证并公开到 GitHub Releases 后，先将主仓库 README 的 Mac 下载按钮链接更新为新版 DMG 的直接下载地址，再同步更新 tap 中 `Casks/tower.rb` 的版本、构建号与该文件的 SHA-256。执行 `brew style --cask pengchujin/tap/tower`、`brew audit --cask pengchujin/tap/tower` 并验证安装后推送；仅发布 GitHub Release 不会自动更新 cask。用户运行 `brew update` 和 `brew upgrade --cask pengchujin/tap/tower` 获取新包。
+新的 Mac DMG 完成 Developer ID 签名、公证并公开到 GitHub Releases 后，先将主仓库 README 的 Mac 下载按钮链接更新为新版 DMG 的直接下载地址，再同步更新 tap 中 `Casks/tower.rb` 的版本、构建号与该文件的 SHA-256。执行 `brew style --cask pengchujin/tap/tower`、`brew audit --cask pengchujin/tap/tower` 并验证安装后推送；仅发布 GitHub Release 不会自动更新 cask。 后续更新只改版本、构建号和 SHA-256，保留当前 cask 语法：URL 不加已弃用的 `verified:`，最低系统按 Homebrew 主版本处理：7 及以上使用 `:sonoma`，旧版使用 `">= :sonoma"`，确保均表示 macOS 14 及以上；不要从旧模板恢复弃用写法。cask 的 homepage 保持官方 GitHub 仓库，与下载域名一致，兼容仍要求跨域 verified 的旧版 Homebrew。用户运行 `brew update` 和 `brew upgrade --cask pengchujin/tap/tower` 获取新包。
 
 Cask 将应用安装为「塔台.app」，区分同名 Tower Git 客户端；不删除用户订阅、设置或 iCloud 数据。
 
-塔台有两条正式版 Xcode 发布路径：出门使用的 MacBook Air M2 可以在当前 Aqua 会话中直接完成自动签名、归档和 App Store Connect / TestFlight 上传；家中 Mac mini M2 是固定发布机，也可从头完成归档和上传。家中 Mac mini M4 的 Xcode Beta 只用于开发调试，不参与正式发布。
+自 2026-09-18 起，家中 Mac mini M4 已升级正式版 macOS，优先使用本机 `/Applications/Xcode.app/Contents/Developer` 完成自动签名、归档、Mac 公证和 TestFlight 上传。MacBook Air M2 出门时也可本机发布；Mac mini M2 保留为远程备用发布机。首次切换须核对实际 Xcode 版本、账号和签名，并分别验证归档、上传与 Apple 处理状态。
 
 最近已上传版本见 [HANDOFF](HANDOFF.md)。版本已获批、预发布通道关闭后必须递增 MARKETING_VERSION，不能只递增 build。
 
@@ -19,8 +24,8 @@ Cask 将应用安装为「塔台.app」，区分同名 Tower Git 客户端；不
 - 本地仓库工作区必须干净，并且 `HEAD` 与 `origin/main` 完全一致。
 - 随 App 打包的 ACL4SSR 快照必须对应上游最新提交；发布脚本会联网检查并在过期时中止。
 - 工程中的 `MARKETING_VERSION` 和 `CURRENT_PROJECT_VERSION` 必须已经更新并推送。
-- Air 本机归档不需要 `TOWER_RELEASE_HOST`、远端仓库或 Ghostty；它必须处于 Aqua 会话，并使用 `/Applications/Xcode.app/Contents/Developer`。本机已登录开发账号，存在可用证书和匹配 `com.jzb.tower` 的描述文件。
-- Air 本机上传前必须在 Xcode **Settings ▸ Accounts** 确认 Apple Account 已登录且能看到对应团队；账号还需具有 App Store Connect 访问权限，或提供单独的 App Store Connect API Key。只有开发证书和描述文件不能证明账号已登录或具备上传能力。
+- M4 / Air 本机归档不需要 `TOWER_RELEASE_HOST`、远端仓库或 Ghostty；它必须处于 Aqua 会话，并使用 `/Applications/Xcode.app/Contents/Developer`。本机已登录开发账号，存在可用证书和匹配 `com.jzb.tower` 的描述文件。
+- M4 / Air 本机上传前必须在 Xcode **Settings ▸ Accounts** 确认 Apple Account 已登录且能看到对应团队；账号还需具有 App Store Connect 访问权限，或提供单独的 App Store Connect API Key。只有开发证书和描述文件不能证明账号已登录或具备上传能力。
 - Mac mini M2 发布机必须安装 `/Applications/Xcode.app`，其登录钥匙串中需要存在可用的 Apple Development 或 Apple Distribution 签名身份，并由具有 App Store Connect 权限的账号完成上传。
 - 远程备用流程的开发机和 Mac mini M2 各自需要 `Config/release.local.sh` 中与自身职责对应的私有值（见下一节）；开发机还需安装 Ghostty。SSH 优先使用现有公钥，没有公钥时由 SSH 自己交互询问密码。
 - 三台 Mac 都不要依赖或切换全局 `xcode-select`。运行命令前显式设置 `DEVELOPER_DIR` 并用 `xcodebuild -version` 复核。
@@ -39,9 +44,9 @@ python3 Scripts/update_acl4ssr_rules.py --verify-published
 ```sh
 python3 Scripts/update_acl4ssr_rules.py --latest \
   --mihomo <Mihomo 可执行文件路径> \
-  --mihomo-version v1.19.30 \
+  --mihomo-version 1.19.31 \
   --sing-box <sing-box 可执行文件路径> \
-  --sing-box-version 1.14.0
+  --sing-box-version 1.14.2
 ```
 
 更新器会先解析上游最新提交号，再下载三份 ACL4SSR 配置及其引用的全部规则集，把 URL 固定到该提交，并重新生成 `Tower/Resources/ACL4SSR/ACL4SSR_manifest.json` 中的来源、规则数量和 SHA-256。同时它只把没有额外参数的 `DOMAIN` / `DOMAIN-SUFFIX` 转成 domain 行为的 MRS；`IP-CIDR` / `IP-CIDR6` / `IP6-CIDR` 只有在该列表的每一行都恰好带一个 `no-resolve` 时才转成 ipcidr MRS，并在清单中写入 `noResolve: true`。任一同类行无法无损转换时，整类规则都保留给生成器内联。
@@ -60,9 +65,9 @@ MRS 与 SRS 最后都放到 `Rulesets/ACL4SSR/<提交号>/`，不随 App 打包�
    python3 Scripts/update_acl4ssr_rules.py --revision <ACL4SSR 完整提交号> \
      --artifact-commit <ARTIFACT_COMMIT> \
      --mihomo <Mihomo 可执行文件路径> \
-     --mihomo-version v1.19.30 \
+     --mihomo-version 1.19.31 \
      --sing-box <sing-box 可执行文件路径> \
-     --sing-box-version 1.14.0
+     --sing-box-version 1.14.2
    ```
 
    生成后 `ACL4SSR_manifest.json` 必须包含 `artifactCommit`】【，】【所有 MRS/SRS URL 都必须含该完整 SHA，不能再含 `/main/`。
@@ -80,9 +85,9 @@ MRS 与 SRS 最后都放到 `Rulesets/ACL4SSR/<提交号>/`，不随 App 打包�
 ```sh
 python3 Scripts/update_acl4ssr_rules.py --revision <完整提交号> \
   --mihomo <Mihomo 可执行文件路径> \
-  --mihomo-version v1.19.30 \
+  --mihomo-version 1.19.31 \
   --sing-box <sing-box 可执行文件路径> \
-  --sing-box-version 1.14.0
+  --sing-box-version 1.14.2
 ```
 
 ## 本地配置
@@ -98,7 +103,7 @@ TOWER_RELEASE_REPO="${TOWER_RELEASE_REPO:-/构建机上的仓库路径}"
 TOWER_DEVELOPMENT_TEAM="${TOWER_DEVELOPMENT_TEAM:-你的团队 ID}"
 ```
 
-Air 本机归档不需要 `TOWER_RELEASE_HOST`、`TOWER_RELEASE_REPO` 或 Ghostty。工程故意没有把 `DEVELOPMENT_TEAM` 写进项目文件，所以命令行归档仍必须在进程环境或构建参数中提供团队。若 Air 没有本地配置，可从与 `com.jzb.tower` 匹配且未过期的描述文件中确认唯一的 `TeamIdentifier`，只保存在当前 Shell 变量中；找不到或出现多个不同团队时停止，不要猜，也不要把结果打印到日志或写进仓库。看到 `Signing for Tower requires a development team` 只说明命令没有传这个参数，不代表 Xcode 没登录。
+M4 / Air 本机归档不需要 `TOWER_RELEASE_HOST`、`TOWER_RELEASE_REPO` 或 Ghostty。工程故意没有把 `DEVELOPMENT_TEAM` 写进项目文件，所以命令行归档仍必须在进程环境或构建参数中提供团队。若本机没有本地配置，可从与 `com.jzb.tower` 匹配且未过期的描述文件中确认唯一的 `TeamIdentifier`，只保存在当前 Shell 变量中；找不到或出现多个不同团队时停止，不要猜，也不要把结果打印到日志或写进仓库。看到 `Signing for Tower requires a development team` 只说明命令没有传这个参数，不代表 Xcode 没登录。
 
 用 `${VAR:-…}` 写法是为了让环境变量优先，这样临时换一台机器发布不需要改文件：
 
@@ -120,6 +125,27 @@ TOWER_RELEASE_HOST=用户名@另一台 Scripts/release_testflight.sh
 4. 不擅自退出其他 Xcode、撤销证书或切换全局 xcode-select。
 
 本机终端应处于 Aqua 会话；签名和上传用正式版 Xcode。普通真机安装另见 [DEVELOPMENT](DEVELOPMENT.md)。
+
+## M4 / Air 本机发布
+
+从当前已授权访问仓库的本机终端运行，不使用 SSH，也不切换全局 Xcode。避免通过新建 LaunchAgent 读取 Documents 下的仓库：独立后台进程可能没有该目录的隐私授权。签名失败时先检查当前用户会话和 Xcode 账号，不修改钥匙串访问控制。
+
+在私有配置中设置本机团队后，可复用归档脚本的本机入口：
+
+```sh
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+xcodebuild -version
+source Config/release.local.sh
+export TOWER_DEVELOPMENT_TEAM
+git fetch origin main
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+# 版本与构建号替换为本次发布值；目录使用新的绝对路径。
+bash Scripts/release_testflight_remote.sh --aqua \
+  --version 1.0.21 --build 59 --commit "$(git rev-parse HEAD)" \
+  --release-dir "$HOME/Builds/Tower-TestFlight-1.0.21-59"
+```
+
+`--aqua` 直接执行当前机器上的归档和上传，不发起远程连接。上传成功后在 App Store Connect 核对构建处理状态、测试说明和群组可用性，不把上传成功当作外部测试审核通过。
 
 ## Mac mini M2 备用发布：一条命令
 

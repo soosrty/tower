@@ -1110,8 +1110,10 @@ final class RuleCustomizationTests: XCTestCase {
         XCTAssertEqual(scheme.groupEditorMode(for: nodeSelector), .routingTargets)
     }
 
+    /// Issue #40: dragging groups used to apply the whole display order to
+    /// the rules, so a broad list could jump ahead of specific ones.
     @MainActor
-    func testUserReorderChangesRulePriorityInEditorExportAndReload() throws {
+    func testGroupReorderChangesDisplayButNotRulePriority() throws {
         let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: fileURL) }
         let store = PersistenceStore(fileURL: fileURL)
@@ -1120,25 +1122,62 @@ final class RuleCustomizationTests: XCTestCase {
         // One overlapping suffix makes the rule order observable as routing priority.
         scheme.rulesets.insert(.init(groupName: "海外媒体", resource: .inline("DOMAIN-SUFFIX,openai.com")), at: 1)
         scheme.rawConfigurationText = RuleSchemeTextEditorService().editableText(for: scheme)
-        model.setRuleGroupOrder(["漏网之鱼", "海外媒体", "AI 服务", "节点选择", "自动选择"], for: scheme)
+        let order = ["漏网之鱼", "海外媒体", "AI 服务", "节点选择", "自动选择"]
+        model.setRuleGroupOrder(order, for: scheme)
         for current in [model, AppModel(persistence: store, arguments: [])] {
+            XCTAssertEqual(current.customizableRuleGroups(for: scheme).map(\.name), order)
             let effective = current.customizableScheme(for: scheme)
-            XCTAssertEqual(effective.rulesets.map(\.groupName), ["海外媒体", "海外媒体", "AI 服务", "漏网之鱼"])
-            let editor = RuleSchemeTextEditorService()
-            let text = editor.editableText(for: current.manualConfigurationEditingScheme(for: scheme))
-            let reparsed = try editor.validatedScheme(from: text, replacing: scheme)
-            XCTAssertEqual(reparsed.rulesets, effective.rulesets)
+            XCTAssertEqual(effective.rulesets, scheme.rulesets)
             for target in ClientTarget.allCases where target.supportsFullConfigurationExport {
                 let generated = ConfigurationGenerator().generate(nodes: nodes, scheme: effective, target: target, preferRuleSets: false).content
-                // Both domains are present; the second occurrence of openai follows netflix
-                // only when the two overseas rules remain together ahead of AI.
+                // openai.com still reaches AI 服务 before the overlapping media rule.
+                let firstOpenAI = try XCTUnwrap(generated.range(of: "openai.com"), "\(target)")
                 let netflix = try XCTUnwrap(generated.range(of: "netflix.com"), "\(target)")
-                let lastOpenAI = try XCTUnwrap(generated.range(of: "openai.com", options: .backwards), "\(target)")
-                XCTAssertLessThan(netflix.lowerBound, lastOpenAI.lowerBound, "\(target)")
+                XCTAssertLessThan(firstOpenAI.lowerBound, netflix.lowerBound, "\(target)")
             }
         }
-        try model.renameRuleGroup(named: "海外媒体", to: "视频", for: scheme)
-        XCTAssertEqual(model.customizableScheme(for: scheme).rulesets.first?.groupName, "视频")
+    }
+
+    @MainActor
+    func testACL4SSRFullKeepsSourcePriorityAfterAnyDrag() throws {
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let model = AppModel(persistence: PersistenceStore(fileURL: fileURL), arguments: [])
+        let scheme = try XCTUnwrap(RuleSchemeRepository().bundledSchemes().first { $0.id == "acl4ssr-full" })
+        let before = model.customizableScheme(for: scheme).rulesets
+        var names = model.customizableRuleGroups(for: scheme).map(\.name)
+        let hongKong = try XCTUnwrap(names.firstIndex(of: "🇭🇰 香港节点"))
+        let japan = try XCTUnwrap(names.firstIndex(of: "🇯🇵 日本节点"))
+        names.swapAt(hongKong, japan)
+        model.setRuleGroupOrder(names, for: scheme)
+        XCTAssertEqual(model.customizableScheme(for: scheme).rulesets, before)
+        XCTAssertEqual(before.first?.groupName, "🎯 全球直连")
+    }
+
+    /// Priority saved by 1.0.6–1.0.21 is dropped on load, with one notice.
+    @MainActor
+    func testSavedRulePriorityIsClearedOnLoadWithOneNotice() throws {
+        let key = AppModel.rulePriorityResetNoticeKey
+        UserDefaults.standard.removeObject(forKey: key)
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PersistenceStore(fileURL: fileURL)
+        let scheme = makeScheme()
+        let seed = AppModel(persistence: store, arguments: [])
+        seed.importedSchemes = [scheme]
+        seed.setRuleGroupOrder(["海外媒体", "AI 服务"], for: scheme)
+        // What an older build wrote alongside the display order.
+        var snapshot = try XCTUnwrap(try store.load())
+        snapshot.ruleSchemeCustomizations?[scheme.id]?.rulePriorityOrder = ["海外媒体", "AI 服务"]
+        try store.save(snapshot)
+
+        let reloaded = AppModel(persistence: store, arguments: [])
+        XCTAssertNil(reloaded.ruleSchemeCustomizations[scheme.id]?.rulePriorityOrder)
+        XCTAssertEqual(reloaded.ruleSchemeCustomizations[scheme.id]?.groupOrder, ["海外媒体", "AI 服务"])
+        XCTAssertEqual(reloaded.customizableScheme(for: scheme).rulesets, scheme.rulesets)
+        XCTAssertEqual(reloaded.toast?.text, String(localized: "规则匹配顺序已恢复为方案原始顺序。"))
+        XCTAssertNil(AppModel(persistence: store, arguments: []).toast, "只提示一次")
     }
 
     func testLegacyDisplayOrderKeepsRulePriorityUntilUserReorders() throws {
@@ -1164,11 +1203,15 @@ final class RuleCustomizationTests: XCTestCase {
             ))
         }
         let names = model.customizableRuleGroups(for: scheme).map(\.name)
-        model.setRuleGroupOrder(["Second", "First"] + names.filter { !["First", "Second"].contains($0) }, for: scheme)
+        // The newest added rule set matches first. Dragging the other way
+        // round only changes the display (issue #40).
+        model.setRuleGroupOrder(["First", "Second"] + names.filter { !["First", "Second"].contains($0) }, for: scheme)
+        XCTAssertEqual(Array(model.customizableRuleGroups(for: scheme).map(\.name).prefix(2)), ["First", "Second"])
         let editor = RuleSchemeTextEditorService()
         let text = editor.editableText(for: model.manualConfigurationEditingScheme(for: scheme))
         let saved = try model.saveManualRuleSchemeConfiguration(text, for: scheme)
-        XCTAssertEqual(Array(saved.rulesets.prefix(2)).map(\.groupName), ["Second", "First"])
+        // Neither overlaps a source rule, so both sit just before FINAL.
+        XCTAssertEqual(Array(saved.rulesets.dropLast().suffix(2)).map(\.groupName), ["Second", "First"])
         XCTAssertEqual(saved.rulesets.last?.resource, .inline("FINAL"))
         let reloaded = AppModel(persistence: PersistenceStore(fileURL: fileURL), arguments: [])
         let result = reloaded.customizableScheme(for: saved)
@@ -1608,8 +1651,12 @@ final class RuleCustomizationTests: XCTestCase {
         )
         model.importedSchemes = [first, second]
 
+        model.selectScheme(first)
+        XCTAssertEqual(model.selectedPresetID, first.id)
+
         model.deleteScheme(first)
 
+        XCTAssertEqual(model.selectedPresetID, AppModel.defaultRuleSchemeID)
         XCTAssertEqual(model.importedSchemes.map(\.id), [second.id])
         XCTAssertTrue(downloadStore.hasCachedRules(for: sharedURL))
 

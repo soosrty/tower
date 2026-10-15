@@ -67,9 +67,11 @@ struct AddSourceSheet: View {
         _manualDraft = State(initialValue: editingNode.map { ManualNodeDraft(node: $0) } ?? ManualNodeDraft())
     }
 
-    private var detectedKind: SourceInputKind {
-        detector.detect(sourceValue)
-    }
+    /// Detection parses every node of a pasted batch. It runs once per edit
+    /// of `sourceValue`, not on every render that reads the result.
+    @State private var detectedKind: SourceInputKind = .unknown
+    /// The input `detectedKind` describes; saving waits until they agree.
+    @State private var detectedValue = ""
 
     var body: some View {
         NavigationStack {
@@ -119,9 +121,15 @@ struct AddSourceSheet: View {
                     .disabled(isSaveDisabled)
                     .accessibilityIdentifier("save-source")
                 }
+                // Only manual entry needs a way out of the keyboard: its port
+                // and similar fields use a number pad, which has no return
+                // key. Pasting and scanning dismiss with a scroll, as the
+                // page already allows, without a control floating over it.
                 ToolbarItemGroup(placement: .keyboard) {
-                    Spacer()
-                    Button("完成") { focusedField = nil }
+                    if entryMode == .manual {
+                        Spacer()
+                        KeyboardDismissButton(title: "完成") { focusedField = nil }
+                    }
                 }
             }
             .confirmDiscardChanges(hasChanges: hasChanges, isBusy: isSaving, requested: $requestsDiscard) { saveTask?.cancel() }
@@ -133,11 +141,24 @@ struct AddSourceSheet: View {
                 saveTask?.cancel()
                 cancelClipboardRead()
             }
-            .onChange(of: sourceValue) { _ in
+            .towerOnChange(of: sourceValue) { _ in
                 cancelClipboardRead()
                 errorMessage = nil
             }
-            .onChange(of: entryMode) { _ in
+            .task(id: sourceValue) {
+                let value = sourceValue
+                let kind: SourceInputKind
+                if value.utf8.count > 4_096 {
+                    let worker = Task.detached(priority: .userInitiated) { SourceInputDetector().detect(value) }
+                    kind = await withTaskCancellationHandler { await worker.value } onCancel: { worker.cancel() }
+                } else {
+                    kind = detector.detect(value)
+                }
+                guard !Task.isCancelled else { return }
+                detectedKind = kind
+                detectedValue = value
+            }
+            .towerOnChange(of: entryMode) { _ in
                 cancelClipboardRead()
                 focusedField = nil
                 errorMessage = nil
@@ -145,32 +166,39 @@ struct AddSourceSheet: View {
         }
     }
 
+    /// A segmented control with icons: one quiet track and a raised segment,
+    /// instead of three tiles where the selected one is a solid accent block.
     private var sourceModePicker: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 4) {
             ForEach(EntryMode.allCases) { mode in
                 Button {
                     focusedField = nil
                     entryMode = mode
                 } label: {
-                    VStack(spacing: 6) {
+                    HStack(spacing: 6) {
                         Image(systemName: mode.symbol)
-                            .font(.headline.weight(.semibold))
                         Text(mode.title)
-                            .font(.caption.weight(.semibold))
                             .lineLimit(1)
+                            .minimumScaleFactor(0.75)
                     }
-                    .foregroundStyle(entryMode == mode ? Color.white : Color.primary)
-                    .frame(maxWidth: .infinity, minHeight: 62)
-                    .background(
-                        entryMode == mode ? Color.accentColor : Color.primary.opacity(0.055),
-                        in: RoundedRectangle(cornerRadius: 15, style: .continuous)
-                    )
-                    .contentShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(entryMode == mode ? Color.accentColor : Color.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 40)
+                    .background {
+                        if entryMode == mode {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+                                .shadow(color: .black.opacity(0.08), radius: 3, y: 1)
+                        }
+                    }
+                    .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                 }
                 .buttonStyle(ResponsivePressButtonStyle())
                 .accessibilityAddTraits(entryMode == mode ? .isSelected : [])
             }
         }
+        .padding(4)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
         .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
         .listRowBackground(Color.clear)
     }
@@ -186,15 +214,28 @@ struct AddSourceSheet: View {
                 .focused($focusedField, equals: .source)
                 .accessibilityIdentifier("source-value-field")
 
-            Button {
-                pasteFromClipboard()
-            } label: {
-                Label("从剪贴板重新粘贴", systemImage: "doc.on.clipboard")
+            // One quiet row under the field: what was recognised on the
+            // left, paste again on the right. The page title already says
+            // what goes in the field, so the section has no header.
+            HStack(spacing: 12) {
+                detectionLabel
+                    .font(.subheadline)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button {
+                    pasteFromClipboard()
+                } label: {
+                    Image(systemName: "doc.on.clipboard")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .frame(width: 36, height: 36)
+                        .background(Color.accentColor.opacity(0.12), in: Circle())
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(ResponsivePressButtonStyle())
+                .accessibilityLabel(Text("从剪贴板重新粘贴"))
             }
-
-            detectionLabel
-        } header: {
-            Text("订阅或节点")
+            .padding(.vertical, -4)
         } footer: {
             Text("可一次粘贴多条链接，每行一条。支持 HTTP 和 HTTPS 订阅，以及 SS、SSR、VMess、VLESS、Trojan、Hysteria 2、AnyTLS、SOCKS5、HTTP(S) 节点。HTTP 订阅会明文传输订阅地址和节点内容。")
         }
@@ -249,6 +290,7 @@ struct AddSourceSheet: View {
                         .lineLimit(3)
                         .textSelection(.enabled)
                     detectionLabel
+                        .font(.subheadline)
                 }
             }
         } footer: {
@@ -269,7 +311,7 @@ struct AddSourceSheet: View {
                     .tag(kind)
                 }
             }
-            .onChange(of: manualDraft.kind) { selectedKind in
+            .towerOnChange(of: manualDraft.kind) { selectedKind in
                 manualDraft.applyDefaults(for: selectedKind)
             }
         }
@@ -302,8 +344,14 @@ struct AddSourceSheet: View {
                     Text("ChaCha20-Poly1305").tag("chacha20-poly1305")
                 }
             }
-            if [.socks5, .http].contains(manualDraft.kind) {
+            if [.socks5, .http, .masque].contains(manualDraft.kind) {
                 TextField("用户名（可选）", text: $manualDraft.username)
+                    .focused($focusedField, equals: .manual("username"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+            if [.ssh, .trustTunnel].contains(manualDraft.kind) {
+                TextField("用户名", text: $manualDraft.username)
                     .focused($focusedField, equals: .manual("username"))
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -497,6 +545,33 @@ struct AddSourceSheet: View {
             }
         }
 
+        if manualDraft.kind == .ssh {
+            Section {
+                TextField("私钥（OpenSSH 格式，可选）", text: $manualDraft.sshPrivateKey, axis: .vertical)
+                    .focused($focusedField, equals: .manual("sshPrivateKey"))
+                    .lineLimit(3...8)
+                    .font(.footnote.monospaced())
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                TextField("服务器公钥（可选）", text: $manualDraft.sshHostKey)
+                    .focused($focusedField, equals: .manual("sshHostKey"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            } header: {
+                Text(verbatim: "SSH")
+            } footer: {
+                Text("填写服务器公钥后会校验服务器身份。Surge 不支持私钥登录，Stash 不支持校验服务器公钥。")
+            }
+        }
+
+        if manualDraft.kind == .trustTunnel {
+            Section {
+                Toggle("使用 HTTP/3（QUIC）", isOn: $manualDraft.trustTunnelQUIC)
+            } header: {
+                Text(verbatim: "TrustTunnel")
+            }
+        }
+
         if manualDraft.kind == .anytls {
             Section {
                 TextField("检查间隔（秒）", text: $manualDraft.idleSessionCheckInterval)
@@ -561,6 +636,12 @@ struct AddSourceSheet: View {
                         .focused($focusedField, equals: .manual("alpn"))
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                    if manualDraft.security != "reality" {
+                        TextField("证书 SHA-256 指纹（可选）", text: $manualDraft.certificateFingerprint)
+                            .focused($focusedField, equals: .manual("certificateFingerprint"))
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
                     Toggle("允许不安全证书", isOn: $manualDraft.skipCertificateVerification)
                 }
 
@@ -612,7 +693,7 @@ struct AddSourceSheet: View {
     }
 
     private var usesMandatoryTLS: Bool {
-        [.trojan, .hysteria, .hysteria2, .tuic, .anytls].contains(manualDraft.kind)
+        [.trojan, .hysteria, .hysteria2, .tuic, .masque, .anytls, .trustTunnel].contains(manualDraft.kind)
     }
 
     private var usesTLSSettings: Bool {
@@ -639,7 +720,9 @@ struct AddSourceSheet: View {
             Label("已识别 \(count) 个节点", systemImage: "square.stack.3d.up.fill")
                 .foregroundStyle(.green)
         case .unknown:
-            Label("等待有效的订阅链接或节点协议", systemImage: "questionmark.circle")
+            // A quiet hint, not a row that looks as tappable as the paste
+            // action above it.
+            Text("等待有效的订阅链接或节点协议")
                 .foregroundStyle(.secondary)
         }
     }
@@ -660,8 +743,9 @@ struct AddSourceSheet: View {
 
     private var isSaveDisabled: Bool {
         if isSaving { return true }
-        if entryMode == .paste { return !detectedKind.isSupported }
-        if entryMode == .scan { return !detectedKind.isSupported }
+        if entryMode == .paste || entryMode == .scan {
+            return detectedValue != sourceValue || !detectedKind.isSupported
+        }
         return manualDraft.server.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || (Int(manualDraft.port).map { !(1 ... 65535).contains($0) } ?? true)
             || isMissingRequiredCredential
@@ -681,6 +765,13 @@ struct AddSourceSheet: View {
             .hysteria, .hysteria2, .tuic, .anytls, .snell
         ]
         if needsSecret.contains(manualDraft.kind), blank(manualDraft.secret) { return true }
+        if manualDraft.kind == .ssh,
+           blank(manualDraft.username) || (blank(manualDraft.secret) && blank(manualDraft.sshPrivateKey)) {
+            return true
+        }
+        if manualDraft.kind == .trustTunnel, blank(manualDraft.username) || blank(manualDraft.secret) {
+            return true
+        }
         if manualDraft.kind == .tuic, blank(manualDraft.password) { return true }
         if [.shadowsocks, .shadowsocksR].contains(manualDraft.kind), blank(manualDraft.cipher) {
             return true
@@ -711,7 +802,8 @@ struct AddSourceSheet: View {
         case .trojan, .hysteria2, .anytls, .snell: String(localized: "密码或 PSK")
         case .hysteria: String(localized: "认证密码")
         case .wireguard: String(localized: "WireGuard 密钥")
-        case .socks5, .http: String(localized: "密码（可选）")
+        case .socks5, .http, .masque, .ssh: String(localized: "密码（可选）")
+        case .trustTunnel: String(localized: "密码")
         default: String(localized: "认证信息")
         }
     }
@@ -719,8 +811,17 @@ struct AddSourceSheet: View {
     private func requestClipboardContent() {
         guard !didReadPasteboard else { return }
         didReadPasteboard = true
-        focusedField = .source
+        // Focus only once the clipboard has answered. A supported link fills
+        // the field with the keyboard down; focusing first raised it and then
+        // dismissed it again on the most common path.
         readClipboard(automatically: true)
+    }
+
+    /// The automatic read found nothing to fill: hand the field to typing,
+    /// unless the user has already chosen a field themselves.
+    private func focusSourceAfterEmptyClipboard() {
+        guard focusedField == nil else { return }
+        focusedField = .source
     }
 
     private func pasteFromClipboard() {
@@ -742,7 +843,8 @@ struct AddSourceSheet: View {
         guard let provider = UIPasteboard.general.itemProviders.first(where: {
             $0.canLoadObject(ofClass: NSString.self) || $0.canLoadObject(ofClass: NSURL.self)
         }) else {
-            if !automatically { errorMessage = String(localized: "等待有效的订阅链接或节点协议") }
+            if automatically { focusSourceAfterEmptyClipboard() }
+            else { errorMessage = String(localized: "等待有效的订阅链接或节点协议") }
             return
         }
         let completion: @Sendable (NSItemProviderReading?, Error?) -> Void = { object, _ in
@@ -755,10 +857,14 @@ struct AddSourceSheet: View {
                       sourceValue == originalValue else { return }
                 clipboardProgress = nil
                 guard !value.isEmpty else {
-                    if !automatically { errorMessage = String(localized: "等待有效的订阅链接或节点协议") }
+                    if automatically { focusSourceAfterEmptyClipboard() }
+                    else { errorMessage = String(localized: "等待有效的订阅链接或节点协议") }
                     return
                 }
-                guard !automatically || detector.detect(value).isSupported else { return }
+                guard !automatically || detector.detect(value).isSupported else {
+                    focusSourceAfterEmptyClipboard()
+                    return
+                }
                 sourceValue = value
                 if automatically { initialSourceValue = value }
                 focusedField = nil

@@ -9,8 +9,11 @@ def physical_devices(devices, inventory):
         if item.get('simulator') is False and item.get('available') is True
         and item.get('platform') == 'com.apple.platform.iphoneos'
     }
+    # iPads share the iphoneos platform; a paired iPad on the network must
+    # not make an attached iPhone ambiguous.
     return [device for device in devices
-            if device.get('hardwareProperties', {}).get('udid') in physical_ids]
+            if device.get('hardwareProperties', {}).get('udid') in physical_ids
+            and device.get('hardwareProperties', {}).get('deviceType') == 'iPhone']
 
 
 if __name__ == '__main__':

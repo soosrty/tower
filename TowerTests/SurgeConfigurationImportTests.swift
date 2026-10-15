@@ -34,6 +34,17 @@ final class SurgeConfigurationImportTests: XCTestCase {
         try parser.parse(text: conf, id: "surge", name: "Surge 配置", summary: "测试")
     }
 
+    /// Importing downloads every RULE-SET first; export refuses to leave a
+    /// list out, so generation needs the same local copies.
+    private func downloadedLists() throws -> RuleSchemeRepository {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: folder) }
+        let store = RuleDownloadStore(folderURL: folder)
+        try store.store("DOMAIN-SUFFIX,youtube.com", for: URL(string: "https://rules.example.com/YouTube.list")!)
+        try store.store("DOMAIN-SUFFIX,example.cn", for: URL(string: "https://rules.example.com/Direct.list")!)
+        return RuleSchemeRepository(downloadStore: store)
+    }
+
     // MARK: - Groups
 
     func testReadsProxyGroupsFromSurgeConfiguration() throws {
@@ -120,18 +131,24 @@ final class SurgeConfigurationImportTests: XCTestCase {
         XCTAssertTrue(inline.contains { $0 == ("FINAL", "Proxies") })
     }
 
-    func testLogicalRulesAreRejectedInsteadOfSilentlySkipped() {
-        let unsupported = conf.replacingOccurrences(of: "FINAL,Proxies", with:
+    func testLogicalRulesPreserveEveryConditionAndRejectPolicy() throws {
+        let input = conf.replacingOccurrences(of: "FINAL,Proxies", with:
             "AND,((PROTOCOL,UDP),(DEST-PORT,443)),REJECT\nFINAL,Proxies")
-        XCTAssertThrowsError(try parser.parse(text: unsupported, id: "logical", name: "Logical", summary: "")) { error in
-            XCTAssertEqual(error as? RuleSchemeParseError, .unsupportedSyntax)
-        }
+        let scheme = try parser.parse(text: input, id: "logical", name: "Logical", summary: "")
+        XCTAssertTrue(scheme.rulesets.contains {
+            guard case .inline(let body) = $0.resource else { return false }
+            return $0.groupName == "REJECT" && body == "AND,((PROTOCOL,UDP),(DEST-PORT,443))"
+        })
+        XCTAssertEqual(RoutingRuleCapabilities.render(
+            "AND,((PROTOCOL,UDP),(DEST-PORT,443))", policy: "REJECT", target: .clashMi),
+            "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT")
     }
 
     // MARK: - Round trip
 
     func testGeneratesForEveryTargetWithTheImportedGroups() throws {
         let scheme = try parse()
+        let repository = try downloadedLists()
         let node = ProxyNode(
             kind: .shadowsocks,
             name: "HK 01",
@@ -146,7 +163,8 @@ final class SurgeConfigurationImportTests: XCTestCase {
             let content = ConfigurationGenerator().generate(
                 nodes: [node],
                 scheme: scheme,
-                target: target
+                target: target,
+                schemes: repository
             ).content
 
             for group in scheme.groups {
@@ -165,7 +183,8 @@ final class SurgeConfigurationImportTests: XCTestCase {
         let content = ConfigurationGenerator().generate(
             nodes: nodes,
             scheme: scheme,
-            target: .surge
+            target: .surge,
+            schemes: try downloadedLists()
         ).content
         let line = try XCTUnwrap(
             content.components(separatedBy: .newlines).first { $0.hasPrefix("HK = ") }

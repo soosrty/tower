@@ -556,6 +556,53 @@ enum ConfigurationTextViewFactory {
     }
 }
 
+/// Keep UIKit's styled paragraph enumeration out of accessibility snapshots.
+/// The full plain text remains readable (including character/word navigation),
+/// while the underlying TextKit 2 view still handles visual selection and copy.
+@MainActor
+final class AccessibleConfigurationPreview: UIView {
+    let textView: UITextView
+
+    init(isScrollEnabled: Bool) {
+        textView = ConfigurationTextViewFactory.make(isScrollEnabled: isScrollEnabled)
+        super.init(frame: .zero)
+        isAccessibilityElement = true
+        accessibilityTraits = .staticText
+        accessibilityIdentifier = "configuration-preview-text"
+        textView.accessibilityElementsHidden = true
+        textView.isAccessibilityElement = false
+        addSubview(textView)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        textView.frame = bounds
+    }
+
+    func render(_ text: String, spans: [ConfigurationSyntaxHighlighter.Span]?) {
+        ConfigurationTextViewFactory.render(text, spans: spans, in: textView)
+        accessibilityLabel = text
+    }
+
+    override func accessibilityScroll(_ direction: UIAccessibilityScrollDirection) -> Bool {
+        guard textView.isScrollEnabled else { return false }
+        let delta: CGFloat
+        switch direction {
+        case .down: delta = bounds.height * 0.8
+        case .up: delta = -bounds.height * 0.8
+        default: return false
+        }
+        let maximum = max(0, textView.contentSize.height - textView.bounds.height)
+        let next = min(maximum, max(0, textView.contentOffset.y + delta))
+        guard next != textView.contentOffset.y else { return false }
+        textView.setContentOffset(CGPoint(x: 0, y: next), animated: false)
+        UIAccessibility.post(notification: .pageScrolled, argument: nil)
+        return true
+    }
+}
+
 struct ConfigurationTextView: UIViewRepresentable {
     let text: String
     /// Spans the caller already computed off the main thread. Nil means this
@@ -572,15 +619,17 @@ struct ConfigurationTextView: UIViewRepresentable {
         Coordinator()
     }
 
-    func makeUIView(context: Context) -> UITextView {
-        let textView = ConfigurationTextViewFactory.make(isScrollEnabled: isScrollEnabled)
-        ConfigurationTextViewFactory.render(text, spans: spans, in: textView)
+    func makeUIView(context: Context) -> AccessibleConfigurationPreview {
+        let preview = AccessibleConfigurationPreview(isScrollEnabled: isScrollEnabled)
+        let textView = preview.textView
+        preview.render(text, spans: spans)
         context.coordinator.renderedText = text
         context.coordinator.contentSizeCategory = textView.traitCollection.preferredContentSizeCategory
-        return textView
+        return preview
     }
 
-    func updateUIView(_ textView: UITextView, context: Context) {
+    func updateUIView(_ preview: AccessibleConfigurationPreview, context: Context) {
+        let textView = preview.textView
         textView.isScrollEnabled = isScrollEnabled
         textView.alwaysBounceVertical = isScrollEnabled
         let contentSizeCategory = textView.traitCollection.preferredContentSizeCategory
@@ -591,7 +640,7 @@ struct ConfigurationTextView: UIViewRepresentable {
 
         let selection = textView.selectedRange
         let contentOffset = textView.contentOffset
-        ConfigurationTextViewFactory.render(text, spans: spans, in: textView)
+        preview.render(text, spans: spans)
         context.coordinator.renderedText = text
         context.coordinator.contentSizeCategory = contentSizeCategory
 

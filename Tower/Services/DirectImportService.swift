@@ -46,7 +46,8 @@ struct ClientImportURLBuilder {
         configurationURL: URL,
         displayName: String = TowerBrand.localizedName,
         contentMode: ExportContentMode = .fullConfiguration,
-        importRevision: String = UUID().uuidString
+        importRevision: String = UUID().uuidString,
+        importDate: Date = .now
     ) throws -> URL {
         let encodedURL = encode(configurationURL.absoluteString)
         let encodedName = encode(displayName)
@@ -54,8 +55,10 @@ struct ClientImportURLBuilder {
 
         switch target {
         case .surge:
+            guard contentMode == .fullConfiguration else { throw DirectImportError.unsupportedTarget(target) }
             value = "surge:///install-config?url=\(encodedURL)"
         case .surgeMac:
+            guard contentMode == .fullConfiguration else { throw DirectImportError.unsupportedTarget(target) }
             // Mac 6.7+ registers this alias; it does not collide with Surge iOS.
             value = "surgeconfig:///install-config?url=\(encodedURL)"
         case .clash:
@@ -77,8 +80,23 @@ struct ClientImportURLBuilder {
             value = "clashmi://install-config?url=\(encodedURL)&name=\(encodedName)"
         case .karing:
             // Karing's published integration route accepts a complete Clash
-            // configuration URL and an optional display name.
-            value = "karing://install-config?url=\(encodedURL)&name=\(encodedName)"
+            // configuration URL and an optional display name. It silently
+            // skips a URL it already has ("already exists, skip add" in its
+            // scheme_handler.dart) instead of updating that profile, so the
+            // stable Tower URL only worked after deleting the old profile.
+            var components = URLComponents(url: configurationURL, resolvingAgainstBaseURL: false)
+            let existingItems = components?.queryItems ?? []
+            components?.queryItems = existingItems + [
+                URLQueryItem(name: "tower-import", value: importRevision)
+            ]
+            let uniqueURL = components?.url ?? configurationURL
+            // Its profile names must be unique too ("备注已存在"), so each
+            // import is labelled with the moment it was exported.
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "MM-dd HH:mm:ss"
+            let uniqueName = "\(displayName) \(formatter.string(from: importDate))"
+            value = "karing://install-config?url=\(encode(uniqueURL.absoluteString))&name=\(encode(uniqueName))"
         case .shadowrocket:
             value = contentMode == .nodesOnly
                 ? "shadowrocket://add/\(configurationURL.absoluteString)#\(displayName)"
@@ -112,6 +130,10 @@ struct ClientImportURLBuilder {
             // Official sing-box clients document remote-profile import using
             // the URL as a query item and the display name as a fragment.
             value = "sing-box://import-remote-profile?url=\(encodedURL)#\(encodedName)"
+        case .anywhere:
+            guard contentMode == .nodesOnly else { throw DirectImportError.unsupportedTarget(target) }
+            // Anywhere extracts the whole suffix, then percent-decodes it once.
+            value = "anywhere://add-proxy?link=\(encodedURL)"
         case .v2box:
             guard contentMode == .nodesOnly else {
                 throw DirectImportError.unsupportedTarget(target)
@@ -164,28 +186,10 @@ final class DirectImportService {
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
     func prepare(_ configuration: GeneratedConfiguration) async throws -> URL {
-        let previousServer = server
-        server = nil
-        stop()
-        await previousServer?.stopAndWait()
         guard configuration.target.supportsDirectImport(mode: configuration.contentMode) else {
             throw DirectImportError.unsupportedTarget(configuration.target)
         }
-
-        let server = LocalConfigurationServer(configuration: configuration)
-        let localURL = try await server.start()
-        self.server = server
-        beginBackgroundExecution()
-
-        expirationTask = Task { [weak self] in
-            do {
-                try await Task.sleep(for: .seconds(45))
-            } catch {
-                return
-            }
-            self?.stop()
-        }
-
+        let localURL = try await prepareLocalResource(configuration)
         do {
             return try ClientImportURLBuilder.make(
                 target: configuration.target,
@@ -197,6 +201,37 @@ final class DirectImportService {
             stop()
             throw error
         }
+    }
+
+    /// Manual node subscription import uses the same bounded loopback handoff as a scheme
+    /// import. Unlike LAN sharing, this exposes only a loopback resource.
+    func prepareNodeSubscriptionURL(_ configuration: GeneratedConfiguration) async throws -> URL {
+        guard configuration.target.copiesAggregatedSubscription(mode: configuration.contentMode) else {
+            throw DirectImportError.unsupportedTarget(configuration.target)
+        }
+        return try await prepareLocalResource(configuration)
+    }
+
+    private func prepareLocalResource(_ configuration: GeneratedConfiguration) async throws -> URL {
+        let previousServer = server
+        server = nil
+        stop()
+        await previousServer?.stopAndWait()
+
+        let server = LocalConfigurationServer(configuration: configuration)
+        let localURL = try await server.start()
+        self.server = server
+        beginBackgroundExecution()
+
+        expirationTask = Task { [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(180))
+            } catch {
+                return
+            }
+            self?.stop()
+        }
+        return localURL
     }
 
     func stop() {
@@ -232,19 +267,25 @@ final class LocalConfigurationServer: @unchecked Sendable {
     private let contentType: String
     private let profileName: String
     private let profileTitle: String
+    private let nodeSubscriptionTarget: ClientTarget?
     private let token: String
 
     /// Exposed for tests: the name and type the client will see.
     var servedFileName: String { fileName }
     var servedContentType: String { contentType }
     /// A stable, app-private endpoint lets clients recognize the next import as
-    /// the same Tower profile. The listener still exists for only 45 seconds.
+    /// the same Tower profile. The listener still exists for only 3 minutes.
     var configurationURL: URL {
-        URL(string: "http://127.0.0.1:\(Self.fixedLoopbackPort)/\(token)")!
+        var base = URL(string: "http://127.0.0.1:\(Self.fixedLoopbackPort)/\(token)")!
             .deletingLastPathComponent()
             .appendingPathComponent(profileName, isDirectory: true)
             .appendingPathComponent(token, isDirectory: true)
-            .appendingPathComponent(fileName, isDirectory: false)
+        // A later Loon / Shadowrocket .txt import must not serve a different
+        // dialect from a previously copied Surge resource URL.
+        if let nodeSubscriptionTarget {
+            base.appendPathComponent("nodes-\(nodeSubscriptionTarget.rawValue)", isDirectory: true)
+        }
+        return base.appendingPathComponent(fileName, isDirectory: false)
     }
     private var listener: NWListener?
     private var didResumeStart = false
@@ -254,6 +295,8 @@ final class LocalConfigurationServer: @unchecked Sendable {
         token: String = DirectImportAccessTokenStore.loadOrCreate()
     ) {
         body = Data(configuration.content.utf8)
+        nodeSubscriptionTarget = configuration.target.copiesAggregatedSubscription(mode: configuration.contentMode)
+            ? configuration.target : nil
         self.token = token
         // Share sheets and URL-scheme clients receive exactly the same stable,
         // localized profile name instead of creating timestamped duplicates.

@@ -21,10 +21,10 @@ jobs:
       - name: Select Xcode
         run: |
           set -euxo pipefail
-          XCODE_PATH="$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1)"
+          XCODE_PATH="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
           test -n "$XCODE_PATH"
-          sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
-          xcodebuild -version
+          echo "DEVELOPER_DIR=$XCODE_PATH/Contents/Developer" >> "$GITHUB_ENV"
+          DEVELOPER_DIR="$XCODE_PATH/Contents/Developer" xcodebuild -version
 
       - name: Build unsigned app
         run: |

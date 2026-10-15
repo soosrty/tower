@@ -156,7 +156,7 @@ final class PolicyGroupGeneratorTests: XCTestCase {
         XCTAssertTrue(remotePolicy.contains("Airport A"), remotePolicy)
         XCTAssertFalse(remotePolicy.contains("Airport B"), remotePolicy)
         let missing = ConfigurationGenerator().generate(nodes: nodes, scheme: scheme, target: .quanx)
-        XCTAssertTrue(missing.content.contains("static=Choice, reject"), missing.diagnostics.joined())
+        XCTAssertTrue(missing.content.contains("static=Choice, direct"), missing.diagnostics.joined())
         XCTAssertFalse(missing.diagnostics.isEmpty)
     }
 
@@ -247,7 +247,7 @@ final class PolicyGroupGeneratorTests: XCTestCase {
             let source = "[policy]\nstatic=Choice,resource-tag-regex=Missing\n" + remoteSection + "[filter_local]\nfinal,Choice"
             let scheme = try RuleSchemeParser().parse(text: source, id: "missing-resource", name: "Missing", summary: "")
             let output = ConfigurationGenerator().generate(nodes: nodes, scheme: scheme, target: .quanx)
-            XCTAssertTrue(output.content.contains("static=Choice, reject"), output.diagnostics.joined())
+            XCTAssertTrue(output.content.contains("static=Choice, direct"), output.diagnostics.joined())
             XCTAssertFalse(output.content.contains("static=Choice, A"))
             XCTAssertFalse(output.diagnostics.isEmpty)
         }
@@ -263,8 +263,10 @@ final class PolicyGroupGeneratorTests: XCTestCase {
         """
         let scheme = try RuleSchemeParser().parse(text: source, id: "missing-provider", name: "Missing", summary: "")
         let output = ConfigurationGenerator().generate(nodes: nodes, scheme: scheme, target: .clashMi)
-        let groups = try XCTUnwrap(output.content.components(separatedBy: "proxy-groups:").last)
-        XCTAssertTrue(groups.contains("REJECT"), groups)
+        // Only the source's own group: the hidden DNS group lists every node.
+        let groups = try XCTUnwrap(output.content.components(separatedBy: "proxy-groups:").last?
+            .components(separatedBy: "  - name: \"DNS 自动选择\"").first)
+        XCTAssertTrue(groups.contains("DIRECT"), groups)
         XCTAssertFalse(groups.contains("- \"A\""), groups)
         XCTAssertFalse(output.diagnostics.isEmpty)
     }
@@ -285,9 +287,10 @@ final class PolicyGroupGeneratorTests: XCTestCase {
             let scheme = RuleScheme(id: "case", name: "Case", summary: "", groups: [group],
                         rulesets: [.init(groupName: "Choice", resource: .inline("FINAL"))], isBundled: false)
             let output = ConfigurationGenerator().generate(nodes: nodes, scheme: scheme, target: .clashMi)
-            let groups = output.content.components(separatedBy: "proxy-groups:").last ?? ""
+            let groups = (output.content.components(separatedBy: "proxy-groups:").last ?? "")
+                .components(separatedBy: "  - name: \"DNS 自动选择\"").first ?? ""
             XCTAssertEqual(groups.contains("- \"A\""), shouldMatch, groups)
-            XCTAssertEqual(groups.contains("REJECT"), !shouldMatch, groups)
+            XCTAssertEqual(groups.contains("DIRECT"), !shouldMatch, groups)
         }
     }
 
@@ -338,7 +341,7 @@ final class PolicyGroupGeneratorTests: XCTestCase {
 
 extension PolicyGroupGeneratorTests {
     func testUnsupportedPoliciesDowngradeAcrossConfigurationTargets() {
-        for target in ClientTarget.allCases where target != .v2box {
+        for target in ClientTarget.allCases where target.supportsFullConfigurationExport {
             for kind in [RuleSchemeGroup.Kind.fallback, .loadBalance, .relay, .unsupported] {
                 let output = result(kind, target: target, algorithm: "unknown-algorithm",
                                     parameters: ["unknown-option": "true"])

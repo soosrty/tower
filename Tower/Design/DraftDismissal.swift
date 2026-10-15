@@ -25,7 +25,7 @@ private struct DraftDismissal: ViewModifier {
     func body(content: Content) -> some View {
         content
             .interactiveDismissDisabled(hasChanges || isBusy)
-            .onChange(of: requested) { value in
+            .towerOnChange(of: requested) { value in
                 guard value else { return }
                 requested = false
                 if hasChanges && !isBusy { showsConfirmation = true }

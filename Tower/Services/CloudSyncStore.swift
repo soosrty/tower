@@ -5,32 +5,39 @@ protocol CloudSnapshotSyncing: Sendable {
     func download() async throws -> AppSnapshot?
     func upload(_ snapshot: AppSnapshot) async throws
     func removeRemoteSnapshot() async throws
+    func commit(_ snapshot: AppSnapshot, replacing expected: AppSnapshot?) async throws
+    func compact() async throws
+    func recoveryCopies() async throws -> [CloudRecoveryCopy]
+    func resolveConflict(with snapshot: AppSnapshot) async throws
+}
+
+extension CloudSnapshotSyncing {
+    /// Trims old versions without writing a new one.
+    func compact() async throws {}
+    func recoveryCopies() async throws -> [CloudRecoveryCopy] { [] }
+    func resolveConflict(with snapshot: AppSnapshot) async throws { try await upload(snapshot) }
 }
 
 enum CloudSyncError: LocalizedError, Equatable {
     case unavailable
     case noRemoteSnapshot
+    case downloading
+    case conflict
 
     var errorDescription: String? {
         switch self {
         case .unavailable: String(localized: "iCloud 不可用，请检查系统设置里的 iCloud 云盘是否开启")
+        case .downloading:
+            String(localized: "iCloud 配置尚未下载完成，请稍后重试")
+        case .conflict:
+            String(localized: "同步冲突，已保留双方配置。请从备份中选择要恢复的版本。")
         case .noRemoteSnapshot: String(localized: "iCloud 上还没有配置")
         }
     }
 }
 
-/// The user's own iCloud, holding one snapshot file.
-///
-/// Tower's state is a single document rather than a set of records, so the
-/// ubiquity container matches it exactly and CloudKit would only add machinery.
-/// The cost is that merging is per-file: two devices that both edited produce
-/// one winner, decided by `AppSnapshot.updatedAt`. That is the right shape for
-/// this data — a configuration is one thing a person edits from whichever phone
-/// is in hand, not a document two people write at once.
-///
-/// Everything here is deliberately explicit rather than automatic. Sync is off
-/// until the user turns it on, and turning it on is the moment their
-/// subscription URLs and node passwords first leave the device.
+/// The legacy document is read for migration only. New writes are immutable
+/// journal commits, so simultaneous devices cannot destroy each other's version.
 actor CloudSyncStore: CloudSnapshotSyncing {
     static let containerIdentifier = "iCloud.com.jzb.tower"
     private static let fileName = "state.json"
@@ -41,8 +48,8 @@ actor CloudSyncStore: CloudSnapshotSyncing {
     private nonisolated let accountAvailableOverride: Bool?
 
     init(containerIdentifier: String? = CloudSyncStore.containerIdentifier) {
-        self.containerID = containerIdentifier
-        self.fileURLOverride = nil
+        self.containerID = TowerTestIsolation.isEnabled ? nil : containerIdentifier
+        self.fileURLOverride = TowerTestIsolation.isEnabled ? TowerTestIsolation.directory.appendingPathComponent("cloud.json") : nil
         self.removeItem = { try FileManager.default.removeItem(at: $0) }
         self.accountAvailableOverride = nil
     }
@@ -85,45 +92,76 @@ actor CloudSyncStore: CloudSnapshotSyncing {
         return try documentsURL().appendingPathComponent(Self.fileName, isDirectory: false)
     }
 
-    func upload(_ snapshot: AppSnapshot) throws {
-        try Task.checkCancellation()
+    private func journal() throws -> CloudSnapshotJournal {
         let url = try fileURL()
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
-        let data = try encoder.encode(snapshot)
-        try Task.checkCancellation()
+        return CloudSnapshotJournal(directory: url.deletingLastPathComponent().appendingPathComponent(url.deletingPathExtension().lastPathComponent + "-versions-v2", isDirectory: true))
+    }
 
-        var coordinationError: NSError?
-        var writeError: Error?
-        // Coordinated so a sync that lands mid-write cannot read a half file.
-        NSFileCoordinator().coordinate(writingItemAt: url, options: .forReplacing, error: &coordinationError) { target in
-            do {
-                // Same protection class as `state.json`: this snapshot carries
-                // subscription URLs and node credentials, and the copy in the
-                // ubiquity container is a local file like any other. Tower only
-                // syncs in the foreground, so requiring an unlocked device to
-                // read it costs nothing here.
-                try data.write(to: target, options: [.atomic, .completeFileProtection])
-            } catch {
-                writeError = error
-            }
+    func upload(_ snapshot: AppSnapshot) async throws {
+        let current = try download()
+        try await commit(snapshot, replacing: current)
+    }
+
+    func compact() async throws {
+        try Task.checkCancellation()
+        let journal = try journal()
+        guard !(try journal.commits()).isEmpty else { return }
+        try journal.prune()
+    }
+
+    func commit(_ snapshot: AppSnapshot, replacing expected: AppSnapshot?) async throws {
+        try Task.checkCancellation()
+        let journal = try journal()
+        let records = try journal.commits()
+        let current = try records.isEmpty ? legacyDownload() : journal.snapshot(records)
+        guard CloudSnapshotMerge.equal(current, expected) else { throw CloudSyncError.conflict }
+        if !records.isEmpty, journal.heads(records).count == 1, CloudSnapshotMerge.equal(snapshot, current) { try journal.prune(); return }
+        var parents = journal.heads(records)
+        if records.isEmpty, let current {
+            try journal.append(current, parents: [])
+            parents = journal.heads(try journal.commits())
         }
-        if let coordinationError { throw coordinationError }
-        if let writeError { throw writeError }
+        // Other devices can append concurrently; both branches remain available.
+        try journal.append(snapshot, parents: parents)
+        try journal.prune()
+    }
+
+    func recoveryCopies() async throws -> [CloudRecoveryCopy] {
+        let history = try journal()
+        try history.prune()
+        let records = try history.commits()
+        var copies = records.values.compactMap { record in record.snapshot.map { CloudRecoveryCopy(id: record.id, snapshot: $0) } }
+        if records.isEmpty, let legacy = try legacyDownload() { copies.append(CloudRecoveryCopy(id: "legacy", snapshot: legacy)) }
+        return copies.sorted { ($0.snapshot.updatedAt ?? .distantPast) > ($1.snapshot.updatedAt ?? .distantPast) }
+    }
+
+    func resolveConflict(with snapshot: AppSnapshot) async throws {
+        let journal = try journal()
+        try journal.append(snapshot, parents: journal.heads(try journal.commits()))
+        try journal.prune()
+    }
+
+    func download() throws -> AppSnapshot? {
+        let records = try journal().commits()
+        return try records.isEmpty ? legacyDownload() : journal().snapshot(records)
     }
 
     /// The snapshot stored in iCloud, or nil when there is none yet.
-    func download() throws -> AppSnapshot? {
+    private func legacyDownload() throws -> AppSnapshot? {
         let url = try fileURL()
 
         // A file that exists in the container may not be on this device yet;
         // asking for it starts the transfer.
         if !FileManager.default.fileExists(atPath: url.path) {
-            try? FileManager.default.startDownloadingUbiquitousItem(at: url)
+            let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
+            if FileManager.default.fileExists(atPath: placeholder.path) {
+                try FileManager.default.startDownloadingUbiquitousItem(at: url)
+                throw CloudSyncError.downloading
+            }
             return nil
         }
 
+        try CloudSnapshotJournal.requireDownloaded(url)
         var coordinationError: NSError?
         var result: Result<AppSnapshot?, Error> = .success(nil)
         NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { target in
@@ -142,6 +180,8 @@ actor CloudSyncStore: CloudSnapshotSyncing {
 
     func removeRemoteSnapshot() throws {
         let url = try fileURL()
+        let history = try journal().directory
+        if FileManager.default.fileExists(atPath: history.path) { try removeItem(history) }
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         var coordinationError: NSError?
         var removalError: Error?

@@ -5,9 +5,8 @@
 ## 工具链
 
 ```sh
-# MacBook Air M2 / 发布用 Mac mini M2
+# Mac mini M4 / MacBook Air M2 / 备用 Mac mini M2
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
-# 开发用 Mac mini M4 改为 /Applications/Xcode-beta.app/Contents/Developer
 xcodebuild -version
 xcrun simctl list devices available
 ```
@@ -35,6 +34,30 @@ python3 Scripts/tests/update_acl4ssr_rules_test.py
 - 新文案必须覆盖 15 种语言。按检查脚本给出的 Xcode 提取目录运行本地化生成器，人工核对短标签和无障碍文本。不要删除 catalog 中的 stale 方案名。
 - 凭据文件保护与网络权限有平台差异；模拟器跳过项不能视为真机通过。
 
+## Tailscale 导出给本机内核联调
+
+`TailnetTests/testWritesProfilesForLocalCores` 默认跳过。设置输出目录后，它会把塔台实际生成的完整配置写成文件，用来交给本机的 mihomo、sing-box，或者传到手机上的客户端实测。环境变量要加 `TEST_RUNNER_` 前缀，才能传进测试进程：
+
+```sh
+TEST_RUNNER_TOWER_TAILNET_OUT="$PWD/.artifacts/tailnet" \
+TEST_RUNNER_TOWER_TAILNET_KEY="<Auth Key>" \
+TEST_RUNNER_TOWER_TAILNET_SUFFIX="<tailXXXX.ts.net>" \
+xcodebuild -project Tower.xcodeproj -scheme Tower -configuration Debug \
+  -destination 'platform=iOS Simulator,name=iPhone 17' \
+  -derivedDataPath .derived-data-sim \
+  -only-testing:TowerTests/TailnetTests/testWritesProfilesForLocalCores test
+```
+
+- `TOWER_TAILNET_OUT`（必填）：输出目录，需要事先建好。
+  - 会写出 `mihomo.yaml`、`stash.yaml`、`sing-box.json`、`surge.conf`、`surge-mac.conf`、`shadowrocket.yaml`。
+  - 每份另有一个 `.notes.txt`，内容是导出页「兼容性提示」里会显示的文字。
+- `TOWER_TAILNET_KEY`：Auth Key。不填时就是「没有 Key」的导出，Surge 永远不会写入 Key。
+- `TOWER_TAILNET_CONTROL`：控制服务器，例如自建 Headscale 的 HTTPS 地址。不填为官方。
+- `TOWER_TAILNET_SUBNET`：家里子网，默认 `192.168.1.0/24`。
+- `TOWER_TAILNET_SUFFIX`：MagicDNS 后缀。
+- `TOWER_TAILNET_NODES`：一份订阅内容文件的路径。不填时用测试里的假节点。要让手机上的客户端先连上控制服务器，需要填真实可用的节点。
+- 输出文件里有明文 Auth Key 和节点凭据：只能放在 `.artifacts/` 或私密目录，用完删除，不要提交。
+
 ## 真机增量安装
 
 连接并解锁一台已配对、开启开发者模式的 iPhone，然后：
@@ -58,10 +81,26 @@ zsh Scripts/install_device.zsh
 - 布局：小屏、辅助功能大字号、长语言、VoiceOver、减少动态效果；检查手柄与删除按钮完整显示。
 - 数据：刷新中编辑/删除来源、切换 iCloud、取消勾选后刷新、地图改名与分享；不得恢复旧凭据或丢失排除状态。
 - 导出方式：文件、二维码、剪贴板、各客户端一键导入；代理集合分别测试仅远端与混合本地节点。
-- 网络：本机服务 45 秒失效；局域网密钥轮换、关闭/切后台、权限拒绝；ICMP/DNS 及无网场景。
+- 网络：本机服务 3 分钟失效；局域网密钥轮换、关闭/切后台、权限拒绝；ICMP/DNS 及无网场景。
 - 性能：使用 1,000 / 5,000 节点检查地图、切换目标和滚动；记录设备、数据规模和 Instruments 证据，不把模拟器耗时当成手机帧率。
 
 发布另见 [RELEASING.md](RELEASING.md)。只有用户要求发布时才递增版本、推送、归档或上传。
+
+## App Store 截图
+
+截图用 Debug 专用的展示数据：`--demo --showcase` 载入 3 个订阅、28 个节点和测速结果，并把设置页显示成已配置（Tailscale、iCloud 同步、提醒）。服务器都是 `example.com`，iCloud 换成不联网的假实现；`--demo` 原有的小数据集不变，UI 测试依赖它。
+
+iPhone 和 iPad 截图由 UI 测试按固定顺序拍摄（首页地图、规则定制、导出、配置预览、设置），平时自动跳过：
+
+```sh
+TEST_RUNNER_TOWER_SCREENSHOTS=1 xcodebuild -project Tower.xcodeproj -scheme TowerInteraction \
+  -configuration Debug -destination 'platform=iOS Simulator,name=iPhone 17 Pro Max' \
+  -derivedDataPath .derived-data-sim -resultBundlePath .artifacts/screenshots.xcresult \
+  -only-testing:TowerUITests/AppStoreScreenshotTests test
+xcrun xcresulttool export attachments --path .artifacts/screenshots.xcresult --output-path .artifacts/screenshots
+```
+
+Mac 截图手动拍：Debug 构建加 `--window-size=960x1140` 把窗口固定成竖向（Catalyst 缩放后为 740×878），再用 `screencapture -l<窗口号>` 截取带阴影的窗口。不要点“局域网共享”来滚动客户端列表，它会直接开启局域网服务。
 
 ## Mac Catalyst
 

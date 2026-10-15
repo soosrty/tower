@@ -470,6 +470,16 @@ struct SubscriptionParser {
             text = decoded
         }
 
+        if let parsed = parseMASQUEJSON(text, sourceID: sourceID) { return parsed }
+
+        if text.hasPrefix("{") || text.hasPrefix("[") && !containsSurgeProxySection(text) {
+            if let records = shadowrocketJSONRecords(text) {
+                let nodes = records.compactMap { shadowrocketJSONNode($0, sourceID: sourceID) }
+                let marked = restoringAmbiguousRegionalNames(nodes).map(markingSubscriptionMetadata)
+                return .init(nodes: deduplicated(marked), rejectedLineCount: records.count - nodes.count)
+            }
+        }
+
         if containsSurgeProxySection(text) {
             let parsed = parseSurgeProxyConfiguration(text, sourceID: sourceID)
             let marked = restoringAmbiguousRegionalNames(parsed.nodes)
@@ -534,6 +544,73 @@ struct SubscriptionParser {
         )
     }
 
+    /// Shadowrocket copies either a JSON array or adjacent JSON objects.
+    /// Track JSON string escapes so braces in names and header values never
+    /// split a record. Unknown/malformed documents are not treated as nodes.
+    private func shadowrocketJSONRecords(_ text: String) -> [Any]? {
+        if let value = try? JSONSerialization.jsonObject(with: Data(text.utf8)) {
+            if let array = value as? [Any] { return array }
+            if value is [String: Any] { return [value] }
+            return nil
+        }
+        var records: [Any] = []
+        var depth = 0
+        var quoted = false
+        var escaped = false
+        var buffer = ""
+        for character in text {
+            if depth == 0 {
+                if character.isWhitespace { continue }
+                guard character == "{" else { return nil }
+            }
+            buffer.append(character)
+            if quoted {
+                if escaped { escaped = false }
+                else if character == "\\" { escaped = true }
+                else if character == "\"" { quoted = false }
+                continue
+            }
+            if character == "\"" { quoted = true }
+            else if character == "{" { depth += 1 }
+            else if character == "}" {
+                depth -= 1
+                if depth == 0 {
+                    guard let value = try? JSONSerialization.jsonObject(with: Data(buffer.utf8)) else { return nil }
+                    records.append(value)
+                    buffer = ""
+                }
+            }
+        }
+        return depth == 0 && !records.isEmpty ? records : nil
+    }
+
+    private func shadowrocketJSONNode(_ value: Any, sourceID: UUID?) -> ProxyNode? {
+        guard let json = value as? [String: Any],
+              stringValue(json["type"])?.lowercased() == "vmess",
+              let server = stringValue(json["host"]), !server.isEmpty,
+              let port = intValue(json["port"]), (1...65535).contains(port),
+              let credential = stringValue(json["password"]), !credential.isEmpty else { return nil }
+        // These settings cannot be represented by the current node model.
+        // Never silently turn a pinned/chained/custom-TLS node into a plain one.
+        for key in ["cert", "hpkp", "chain", "plugin", "ech", "tlsProfile", "privateKey", "publicKey"] {
+            if let field = stringValue(json[key]), !field.isEmpty { return nil }
+        }
+        let transport = normalizedVMessTransport(stringValue(json["obfs"])) ?? "tcp"
+        let rawHost = stringValue(json["obfsParam"])
+        let host = transport == "ws" ? webSocketHost(from: rawHost) : rawHost
+        if transport == "ws", let rawHost, !rawHost.isEmpty, host == nil { return nil }
+        return ProxyNode(
+            sourceID: sourceID, kind: .vmess,
+            name: normalizedName(stringValue(json["title"]), fallback: server),
+            server: normalizedHost(server), port: port,
+            cipher: stringValue(json["method"]) ?? "auto", uuid: credential,
+            transport: transport, tls: boolValue(json["tls"]),
+            sni: stringValue(json["peer"]), hostHeader: host,
+            path: stringValue(json["path"])?.replacingOccurrences(of: "\\/", with: "/"), alpn: stringValue(json["alpn"]),
+            alterID: intValue(json["alterId"]), udpRelayEnabled: boolValue(json["udp"]), rawURI: ""
+        )
+    }
+
     private func containsSurgeProxySection(_ text: String) -> Bool {
         text.components(separatedBy: .newlines).contains { line in
             line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -565,7 +642,7 @@ struct SubscriptionParser {
             }
             guard insideProxySection else { continue }
 
-            if let node = parseSurgeShadowsocksLine(line, sourceID: sourceID) {
+            if let node = parseMASQUELine(line, sourceID: sourceID) ?? parseSurgeShadowsocksLine(line, sourceID: sourceID) {
                 nodes.append(node)
             } else {
                 rejected += 1
@@ -576,6 +653,41 @@ struct SubscriptionParser {
             nodes: nodes,
             rejectedLineCount: nodes.isEmpty ? max(rejected, 1) : rejected
         )
+    }
+
+    /// Only the documented HTTP Basic variant. Unknown semantic parameters
+    /// must not be dropped (in particular CONNECT-IP keys and proxy chains).
+    private func parseMASQUELine(_ raw: String, sourceID: UUID?) -> ProxyNode? {
+        guard let separator = raw.firstIndex(of: "="), !raw.contains(where: \.isNewline) else { return nil }
+        let name = String(raw[..<separator]).trimmingCharacters(in: .whitespaces)
+        let fields = surgeProxyFields(String(raw[raw.index(after: separator)...]))
+        guard !name.isEmpty, fields.count >= 3, fields[0].lowercased() == "masque",
+              let port = Int(fields[2]), (1...65535).contains(port) else { return nil }
+        let host = normalizedHost(fields[1])
+        guard !host.isEmpty, !host.contains(where: { $0.isWhitespace || ",/\\@?#=".contains($0) }) else { return nil }
+        let allowed: Set<String> = ["username", "password", "sni", "alpn", "skip-cert-verify", "server-cert-fingerprint-sha256"]
+        var options: [String: String] = [:]
+        for field in fields.dropFirst(3) {
+            guard let equals = field.firstIndex(of: "=") else { return nil }
+            let key = String(field[..<equals]).trimmingCharacters(in: .whitespaces).lowercased()
+            let value = surgeProxyScalar(String(field[field.index(after: equals)...]), decodePercent: false)
+            guard allowed.contains(key), options[key] == nil,
+                  !value.contains(where: { $0.isNewline || $0 == "\0" || $0 == "," }) else { return nil }
+            options[key] = value
+        }
+        if let sni = options["sni"], sni.contains(where: { $0.isWhitespace || ",/%\\@?#=".contains($0) }) { return nil }
+        if let value = options["skip-cert-verify"], !["true", "false", "1", "0", "yes", "no"].contains(value.lowercased()) { return nil }
+        if let pin = options["server-cert-fingerprint-sha256"] {
+            let compact = pin.replacingOccurrences(of: ":", with: "").replacingOccurrences(of: "-", with: "")
+            guard compact.count == 64, compact.allSatisfy({ $0.isASCII && $0.isHexDigit }) else { return nil }
+        }
+        let node = ProxyNode(sourceID: sourceID, kind: .masque, name: name, server: host, port: port,
+                         password: options["password"], username: options["username"], tls: true,
+                         sni: options["sni"], alpn: options["alpn"],
+                         certificateFingerprint: options["server-cert-fingerprint-sha256"],
+                         skipCertificateVerification: boolString(options["skip-cert-verify"]),
+                         rawURI: raw)
+        return node.hasSupportedMASQUEFields ? node : nil
     }
 
     private func parseSurgeShadowsocksLine(
@@ -606,6 +718,16 @@ struct SubscriptionParser {
               let password = options["password"],
               !password.isEmpty else { return nil }
 
+        var shadowTLS: ShadowTLSOptions?
+        if options.keys.contains(where: { $0.hasPrefix("shadow-tls-") }) {
+            let keys = Set(options.keys.filter { $0.hasPrefix("shadow-tls-") })
+            guard keys.isSubset(of: ["shadow-tls-version", "shadow-tls-sni", "shadow-tls-password"]) else { return nil }
+            let fields = ["version": options["shadow-tls-version"] ?? "2",
+                          "host": options["shadow-tls-sni"] ?? "",
+                          "password": options["shadow-tls-password"] ?? ""]
+            guard let parsed = shadowTLSOptions(fields) else { return nil }
+            shadowTLS = parsed
+        }
         return ProxyNode(
             sourceID: sourceID,
             kind: .shadowsocks,
@@ -614,8 +736,11 @@ struct SubscriptionParser {
             port: port,
             cipher: cipher,
             password: password,
+            plugin: shadowTLS == nil ? nil : "shadow-tls",
+            shadowTLS: shadowTLS,
             obfs: options["obfs"],
             obfsParam: options["obfs-host"],
+            udpRelayEnabled: boolString(options["udp-relay"] ?? options["udp"]),
             rawURI: raw
         )
     }
@@ -631,17 +756,17 @@ struct SubscriptionParser {
                 else if quote == nil { quote = character }
                 current.append(character)
             } else if character == ",", quote == nil {
-                fields.append(surgeProxyScalar(current))
+                fields.append(surgeProxyScalar(current, decodePercent: false))
                 current = ""
             } else {
                 current.append(character)
             }
         }
-        fields.append(surgeProxyScalar(current))
+        fields.append(surgeProxyScalar(current, decodePercent: false))
         return fields
     }
 
-    private func surgeProxyScalar(_ value: String) -> String {
+    private func surgeProxyScalar(_ value: String, decodePercent: Bool = true) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         let unquoted: String
         if trimmed.count >= 2,
@@ -653,7 +778,7 @@ struct SubscriptionParser {
         } else {
             unquoted = trimmed
         }
-        return unquoted.removingPercentEncoding ?? unquoted
+        return decodePercent ? (unquoted.removingPercentEncoding ?? unquoted) : unquoted
     }
 
     func parseURI(_ rawValue: String, sourceID: UUID? = nil) -> ProxyNode? {
@@ -661,6 +786,7 @@ struct SubscriptionParser {
         let lowercased = value.lowercased()
         // Snell has no URI form at all. It is shared as the Surge proxy line it
         // is written as, so that line is what Tower accepts.
+        if let masque = parseMASQUELine(value, sourceID: sourceID) { return masque }
         if let snell = parseSnellLine(value, sourceID: sourceID) { return snell }
         if lowercased.hasPrefix("ss://") { return parseShadowsocks(value, sourceID: sourceID) }
         if lowercased.hasPrefix("ssr://") { return parseShadowsocksR(value, sourceID: sourceID) }
@@ -708,6 +834,8 @@ struct SubscriptionParser {
         let query = Dictionary((components.queryItems ?? []).map {
             ($0.name.lowercased(), $0.value ?? "")
         }) { _, new in new }
+        // An AmneziaWG link cannot be expressed as plain WireGuard.
+        guard !query.keys.contains(where: Self.isAmneziaWireGuardKey) else { return nil }
         let addresses = csvValues(query["address"] ?? query["addresses"] ?? "")
         let ipv4 = addresses.first { !$0.contains(":") }
         let ipv6 = addresses.first { $0.contains(":") }
@@ -718,7 +846,7 @@ struct SubscriptionParser {
             name: normalizedName(components.fragment?.removingPercentEncoding, fallback: "WireGuard · \(server)"),
             server: server,
             port: components.port ?? 51_820,
-            wireGuardPrivateKey: components.user?.removingPercentEncoding,
+            wireGuardPrivateKey: components.user,
             wireGuardPublicKey: query["publickey"] ?? query["public-key"],
             wireGuardPreSharedKey: query["presharedkey"] ?? query["pre-shared-key"] ?? query["preshared-key"],
             wireGuardIPv4: ipv4,
@@ -745,15 +873,24 @@ struct SubscriptionParser {
         var pluginPath: String?
         var pluginTLS = false
         var pluginMux: Bool?
+        var shadowTLS: ShadowTLSOptions?
+        var shadowTLSFingerprint: String?
+        var udpRelayEnabled: Bool?
         if let queryIndex = payload.firstIndex(of: "?") {
             let query = String(payload[payload.index(after: queryIndex)...])
-            // A SIP003 plugin changes how the node is dialled. simple-obfs is
-            // carried over because every target format can express it; any
-            // other plugin would import as a node that looks healthy and never
-            // connects, so it is rejected and counted instead.
+            let parameters = queryDictionary(query)
+            udpRelayEnabled = (parameters["udp-relay"] ?? parameters["udp"]).map { boolString($0) }
+            // Plugins change the wire protocol. Parse only modelled options;
+            // unknown plugins must never turn into an ordinary SS node.
             if let plugin = queryDictionary(query)["plugin"]?.removingPercentEncoding,
                !plugin.isEmpty {
-                if let options = simpleObfsOptions(from: plugin) {
+                if plugin.lowercased().hasPrefix("shadow-tls;") {
+                    guard !boolString(parameters["udp-over-tcp"]),
+                          let options = shadowTLSPluginOptions(plugin) else { return nil }
+                    shadowTLS = options
+                    shadowTLSFingerprint = parameters["client-fingerprint"]?.removingPercentEncoding
+                    sip003Plugin = "shadow-tls"
+                } else if let options = simpleObfsOptions(from: plugin) {
                     obfsMode = options.mode
                     obfsHost = options.host
                 } else if let options = v2rayPluginOptions(from: plugin) {
@@ -799,22 +936,64 @@ struct SubscriptionParser {
             transport: pluginTransport,
             plugin: sip003Plugin,
             pluginMux: pluginMux,
+            shadowTLS: shadowTLS,
             tls: pluginTLS,
             hostHeader: obfsHost,
             path: pluginPath,
+            fingerprint: shadowTLSFingerprint,
             obfs: obfsMode,
             obfsParam: sip003Plugin == nil ? obfsHost : nil,
+            udpRelayEnabled: udpRelayEnabled,
             rawURI: raw
         )
+    }
+
+    private func shadowTLSOptions(_ options: [String: String]) -> ShadowTLSOptions? {
+        let known: Set<String> = ["version", "host", "password", "skip-cert-verify"]
+        guard Set(options.keys).isSubset(of: known),
+              let version = Int(options["version"] ?? ""),
+              let host = options["host"] else { return nil }
+        let result = ShadowTLSOptions(version: version, host: host,
+                                      password: options["password"] ?? "",
+                                      skipCertificateVerification: boolString(options["skip-cert-verify"]))
+        return result.isValid ? result : nil
+    }
+
+    /// SIP003 escapes semicolons and backslashes inside option values, so a
+    /// WebSocket path written as `path=/foo\;bar` is one field, not two.
+    private func sip003Fields(_ plugin: String) -> [String]? {
+        var parts = [String]()
+        var part = ""
+        var escaped = false
+        for character in plugin {
+            if escaped { part.append(character); escaped = false }
+            else if character == "\\" { escaped = true }
+            else if character == ";" { parts.append(part); part = "" }
+            else { part.append(character) }
+        }
+        guard !escaped else { return nil }
+        parts.append(part)
+        return parts
+    }
+
+    private func shadowTLSPluginOptions(_ plugin: String) -> ShadowTLSOptions? {
+        guard let parts = sip003Fields(plugin) else { return nil }
+        var options = [String: String]()
+        for field in parts.dropFirst() {
+            guard let equals = field.firstIndex(of: "=") else { return nil }
+            let key = String(field[..<equals]).lowercased()
+            guard options[key] == nil else { return nil }
+            options[key] = String(field[field.index(after: equals)...])
+        }
+        return shadowTLSOptions(options)
     }
 
     /// Reads a SIP003 plugin string such as
     /// `obfs-local;obfs=http;obfs-host=www.example.com`.
     /// Returns nil for plugins Tower cannot reproduce faithfully.
     private func simpleObfsOptions(from plugin: String) -> (mode: String, host: String?)? {
-        let parts = plugin.split(separator: ";").map {
-            $0.trimmingCharacters(in: .whitespaces)
-        }
+        guard let fields = sip003Fields(plugin) else { return nil }
+        let parts = fields.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         guard let name = parts.first?.lowercased(),
               ["obfs", "obfs-local", "simple-obfs"].contains(name) else { return nil }
 
@@ -837,10 +1016,8 @@ struct SubscriptionParser {
     private func v2rayPluginOptions(
         from plugin: String
     ) -> (transport: String, host: String?, path: String?, tls: Bool, mux: Bool?)? {
-        let parts = plugin.split(separator: ";", omittingEmptySubsequences: false).map {
-            $0.trimmingCharacters(in: .whitespaces)
-        }
-        guard parts.first?.lowercased() == "v2ray-plugin" else { return nil }
+        guard let parts = sip003Fields(plugin)?.map({ $0.trimmingCharacters(in: .whitespaces) }),
+              parts.first?.lowercased() == "v2ray-plugin" else { return nil }
         var mode = "websocket"
         var host: String?
         var path: String?
@@ -871,7 +1048,11 @@ struct SubscriptionParser {
         let encoded = String(raw.dropFirst("ssr://".count))
         guard let decoded = decodeBase64String(encoded) else { return nil }
         let sections = decoded.components(separatedBy: "/?")
-        let main = sections[0].split(separator: ":", maxSplits: 5, omittingEmptySubsequences: false).map(String.init)
+        // SSR has five colon-delimited fields after the host. Split from the
+        // right so a bare or bracketed IPv6 address remains a single field.
+        let main = String(sections[0].reversed())
+            .split(separator: ":", maxSplits: 5, omittingEmptySubsequences: false)
+            .reversed().map { String($0.reversed()) }
         guard main.count == 6, let port = Int(main[1]), let password = decodeBase64String(main[5]) else { return nil }
 
         let query = sections.count > 1 ? queryDictionary(sections[1]) : [:]
@@ -880,7 +1061,7 @@ struct SubscriptionParser {
             sourceID: sourceID,
             kind: .shadowsocksR,
             name: normalizedName(remarks, fallback: main[0]),
-            server: main[0],
+            server: normalizedHost(main[0]),
             port: port,
             cipher: main[3],
             password: password,
@@ -906,9 +1087,16 @@ struct SubscriptionParser {
         }
 
         let tlsValue = stringValue(json["tls"])?.lowercased()
-        let rawTransport = stringValue(json["net"])
-            ?? stringValue(json["network"])
-            ?? stringValue(json["type"])
+        let network = stringValue(json["net"]) ?? stringValue(json["network"])
+        let headerType = stringValue(json["type"])
+        let transport: String? = switch (network?.lowercased(), headerType?.lowercased()) {
+        // v2rayN's HTTP/1.1 header obfuscation is `net: tcp` plus `type: http`;
+        // reading only `net` imported it as plain TCP, which never connects.
+        case (nil, "http"), ("tcp", "http"), ("raw", "http"): "http"
+        // Xray names its HTTP/2 transport `http`; `h2` is the other spelling.
+        case ("http", _): "h2"
+        default: normalizedVMessTransport(network ?? headerType)
+        }
         return ProxyNode(
             sourceID: sourceID,
             kind: .vmess,
@@ -917,7 +1105,7 @@ struct SubscriptionParser {
             port: port,
             cipher: stringValue(json["scy"]) ?? "auto",
             uuid: uuid,
-            transport: normalizedVMessTransport(rawTransport) ?? "tcp",
+            transport: transport ?? "tcp",
             tls: tlsValue == "tls" || tlsValue == "true",
             sni: stringValue(json["sni"]),
             hostHeader: stringValue(json["host"]),
@@ -1025,8 +1213,9 @@ struct SubscriptionParser {
             transport: transport,
             tls: ["1", "true", "tls"].contains(query["tls"]?.lowercased() ?? ""),
             sni: query["peer"]?.removingPercentEncoding ?? query["sni"]?.removingPercentEncoding,
-            hostHeader: query["obfsparam"]?.removingPercentEncoding
-                ?? query["host"]?.removingPercentEncoding,
+            hostHeader: transport == "ws"
+                ? webSocketHost(from: query["obfsparam"] ?? query["host"])
+                : (query["obfsparam"]?.removingPercentEncoding ?? query["host"]?.removingPercentEncoding),
             path: query["path"]?.removingPercentEncoding,
             skipCertificateVerification: ["1", "true"].contains(
                 query["allowinsecure"]?.lowercased() ?? query["tls-verification"]?.lowercased() ?? ""
@@ -1049,6 +1238,23 @@ struct SubscriptionParser {
         case "none": nil
         default: value
         }
+    }
+
+    /// The transport a VLESS or Trojan share link names. The Xray link
+    /// standard gives `type=http` to its HTTP/2 transport, and spells HTTP/1.1
+    /// header obfuscation as `type=tcp` with `headerType=http`. Reading
+    /// `http` as HTTP/1.1 and ignoring `headerType` turned both into a
+    /// different wire protocol.
+    private func standardLinkTransport(
+        _ transport: String?,
+        type: String?,
+        headerType: String?,
+        kind: ProxyKind
+    ) -> String? {
+        guard [.vless, .trojan].contains(kind) else { return transport }
+        if type?.lowercased() == "http" { return "h2" }
+        if transport == nil, headerType?.lowercased() == "http" { return "http" }
+        return transport
     }
 
     private func normalizedTransport(_ value: String?) -> String? {
@@ -1203,8 +1409,8 @@ struct SubscriptionParser {
             name: normalizedName(name, fallback: "HTTP · \(server)"),
             server: server,
             port: port,
-            password: components.password?.removingPercentEncoding,
-            username: components.user?.removingPercentEncoding,
+            password: components.password,
+            username: components.user,
             tls: scheme == "https",
             rawURI: raw
         )
@@ -1218,6 +1424,14 @@ struct SubscriptionParser {
             normalized = "hysteria://" + normalized.dropFirst("hy://".count)
         } else if normalized.lowercased().hasPrefix("socks://") {
             normalized = "socks5://" + normalized.dropFirst("socks://".count)
+        }
+        // Hysteria 2's own URI format writes port hopping into the port:
+        // `host:443,5000-6000`. URLComponents rejects that, so the whole link
+        // was dropped as unrecognised.
+        var authorityPortHopping: String?
+        if kind == .hysteria2, let split = splitMultiPortAuthority(normalized) {
+            normalized = split.link
+            authorityPortHopping = split.ports
         }
         guard let components = URLComponents(string: normalized),
               let rawHost = components.host else { return nil }
@@ -1237,11 +1451,16 @@ struct SubscriptionParser {
         let trojanPlugin = kind == .trojan
             ? query["plugin"].flatMap(shadowrocketTrojanWebSocketOptions)
             : nil
-        let transport = normalizedTransport(
-            trojanPlugin?.transport
-                ?? query["type"]
-                ?? query["network"]
-                ?? (query["obfs"]?.contains("ws") == true ? "ws" : nil)
+        let transport = standardLinkTransport(
+            normalizedTransport(
+                trojanPlugin?.transport
+                    ?? query["type"]
+                    ?? query["network"]
+                    ?? (query["obfs"]?.contains("ws") == true ? "ws" : nil)
+            ),
+            type: trojanPlugin == nil ? query["type"] : nil,
+            headerType: query["headertype"],
+            kind: kind
         )
         let security = (query["security"] ?? query["tls"] ?? "").lowercased()
         // Shadowrocket has two VLESS URL dialects. Its Base64-authority form
@@ -1254,15 +1473,18 @@ struct SubscriptionParser {
             || (kind == .vless && !((realityPublicKey ?? "").isEmpty))
         let flow = query["flow"]
             ?? (kind == .vless && query["xtls"] == "2" ? "xtls-rprx-vision" : nil)
-        let credential = components.user?.removingPercentEncoding
+        // URLComponents and its queryItems have already percent-decoded the
+        // userinfo and query values. Decoding again turns a literal `%41` in a
+        // secret into `A` and drops a secret ending in a bare `%` (issue #41).
+        let credential = components.user
         // Most TUIC v5 links use `uuid:password@host`, but Shadowrocket-style
         // subscriptions also exist with a bare authority and both credentials
         // in the query. Keep the standard form authoritative and fall back to
         // the query dialect so these nodes do not import with empty secrets.
-        let tuicUUID = [credential, query["uuid"]?.removingPercentEncoding]
+        let tuicUUID = [credential, query["uuid"]]
             .compactMap { $0 }
             .first { !$0.isEmpty }
-        let tuicPassword = [components.password?.removingPercentEncoding, query["password"]?.removingPercentEncoding]
+        let tuicPassword = [components.password, query["password"]]
             .compactMap { $0 }
             .first { !$0.isEmpty }
         // Some producers serialize an ALPN array as `alpn[0]=h3` rather than
@@ -1300,7 +1522,7 @@ struct SubscriptionParser {
                     ? (credential ?? query["auth"] ?? query["auth_str"] ?? query["authstr"])
                     : ([.trojan, .hysteria2, .anytls].contains(kind)
                         ? credential
-                        : components.password?.removingPercentEncoding)),
+                        : components.password)),
             uuid: kind == .tuic
                 ? tuicUUID
                 : ([.vmess, .vless].contains(kind) ? credential : nil),
@@ -1363,14 +1585,43 @@ struct SubscriptionParser {
                 ? query["congestion_control"] ?? query["congestion-controller"]
                 : nil,
             udpRelayMode: kind == .tuic ? query["udp_relay_mode"] ?? query["udp-relay-mode"] : nil,
-            portHopping: query["mport"]
+            portHopping: authorityPortHopping
+                ?? query["mport"]
                 ?? query["ports"]
                 ?? query["server-ports"]
                 ?? query["port-hopping"],
             upMbps: kind == .hysteria ? mbps(query["upmbps"] ?? query["up"]) : nil,
             downMbps: kind == .hysteria ? mbps(query["downmbps"] ?? query["down"]) : nil,
-            rawURI: raw
+            rawURI: raw,
+            vlessEncryption: kind == .vless ? vlessEncryption(query["encryption"]?.removingPercentEncoding) : nil
         )
+    }
+
+    /// VLESS encryption other than `none`. Dropping it produced a node that
+    /// looked complete and could never handshake.
+    private func vlessEncryption(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty, value.lowercased() != "none" else { return nil }
+        return value
+    }
+
+    /// `scheme://auth@host:443,5000-6000/?…` → the link with its first port,
+    /// plus the full port list. Nil when the port is an ordinary number.
+    private func splitMultiPortAuthority(_ link: String) -> (link: String, ports: String)? {
+        guard let schemeEnd = link.range(of: "://") else { return nil }
+        let rest = link[schemeEnd.upperBound...]
+        let authorityEnd = rest.firstIndex(where: { "/?#".contains($0) }) ?? rest.endIndex
+        let authority = rest[..<authorityEnd]
+        let hostStart = authority.lastIndex(of: "@").map(authority.index(after:)) ?? authority.startIndex
+        let hostPort = authority[hostStart...]
+        let searchFrom = hostPort.lastIndex(of: "]") ?? hostPort.startIndex
+        guard let colon = hostPort[searchFrom...].lastIndex(of: ":") else { return nil }
+        let ports = String(hostPort[hostPort.index(after: colon)...])
+        guard ports.contains(where: { $0 == "," || $0 == "-" }),
+              ports.allSatisfy({ $0.isNumber || $0 == "," || $0 == "-" }),
+              let first = ports.split(whereSeparator: { $0 == "," || $0 == "-" }).first else { return nil }
+        let rebuilt = link[..<hostPort.index(after: colon)] + first + link[authorityEnd...]
+        return (String(rebuilt), ports)
     }
 
     /// Shadowrocket serializes Trojan WebSocket as a SIP003-looking plugin:
@@ -1406,6 +1657,90 @@ struct SubscriptionParser {
         return ("ws", host, path)
     }
 
+    /// A deliberately bounded CONNECT-IP subset. Unknown fields reject the
+    /// node instead of silently discarding authentication or routing settings.
+    private func parseMASQUEClash(_ fields: [String: String], sourceID: UUID?) -> ProxyNode? {
+        let allowed: Set<String> = ["name", "type", "server", "port", "private-key", "public-key",
+                                    "ip", "ipv6", "network", "mtu", "dns", "remote-dns-resolve", "udp", "sni"]
+        guard Set(fields.keys).isSubset(of: allowed),
+              let server = fields["server"], let port = Int(fields["port"] ?? "") else { return nil }
+        if let value = fields["udp"], !["true", "false"].contains(value.lowercased()) { return nil }
+        if let value = fields["remote-dns-resolve"], !["true", "false"].contains(value.lowercased()) { return nil }
+        if let mtu = fields["mtu"], Int(mtu) == nil { return nil }
+        func validAddress(_ value: String, ipv6: Bool) -> Bool {
+            let parts = value.split(separator: "/", omittingEmptySubsequences: false)
+            guard parts.count <= 2 else { return false }
+            if parts.count == 2, !(Int(parts[1]).map { (0...(ipv6 ? 128 : 32)).contains($0) } ?? false) { return false }
+            return ipv6 ? IPv6Address(String(parts[0])) != nil : IPv4Address(String(parts[0])) != nil
+        }
+        if let ip = fields["ip"], !validAddress(ip, ipv6: false) { return nil }
+        if let ip = fields["ipv6"], !validAddress(ip, ipv6: true) { return nil }
+        let dns = fields["dns"].map { csvValues($0) }
+        if let dns, dns.contains(where: { IPv4Address($0) == nil && IPv6Address($0) == nil }) { return nil }
+        let options = MASQUEOptions(mode: .keyConnectIP, privateKey: fields["private-key"],
+            publicKey: fields["public-key"], ipv4: fields["ip"], ipv6: fields["ipv6"],
+            network: fields["network"], mtu: fields["mtu"].flatMap(Int.init), dns: dns,
+            remoteDNSResolve: fields["remote-dns-resolve"].map { $0.lowercased() == "true" })
+        let node = ProxyNode(sourceID: sourceID, kind: .masque, name: fields["name"] ?? server,
+            server: server, port: port, masque: options, tls: true, sni: fields["sni"],
+            udpRelayEnabled: fields["udp"].map { $0.lowercased() == "true" }, rawURI: "")
+        return node.hasSupportedMASQUEFields ? node : nil
+    }
+
+    private func parseMASQUEJSON(_ text: String, sourceID: UUID?) -> ParsedContent? {
+        guard let data = text.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        let records: [Any]
+        if let root = object as? [String: Any], let endpoints = root["endpoints"] as? [Any] {
+            // Count unhandled real outbounds too; never claim a full profile
+            // was imported when only its CONNECT-IP endpoints were retained.
+            records = endpoints + ((root["outbounds"] as? [[String: Any]]) ?? []).filter {
+                !["direct", "block", "dns", "selector", "urltest"].contains($0["type"] as? String ?? "")
+            }
+        } else if let root = object as? [String: Any], root["type"] as? String == "masque-client" {
+            records = [root]
+        } else if let array = object as? [[String: Any]], array.contains(where: { $0["type"] as? String == "masque-client" }) {
+            records = array
+        } else { return nil }
+        let nodes = records.compactMap { ($0 as? [String: Any]).flatMap { parseMASQUEEndpoint($0, sourceID: sourceID) } }
+        return .init(nodes: deduplicated(nodes), rejectedLineCount: records.count - nodes.count)
+    }
+
+    private func parseMASQUEEndpoint(_ fields: [String: Any], sourceID: UUID?) -> ProxyNode? {
+        let allowed: Set<String> = ["type", "tag", "server", "server_port", "username", "password", "path",
+                                   "headers", "version", "disable_version_fallback", "tls", "system", "mtu"]
+        guard fields["type"] as? String == "masque-client", Set(fields.keys).isSubset(of: allowed),
+              let server = fields["server"] as? String, let port = fields["server_port"] as? Int,
+              fields["system"] == nil || fields["system"] as? Bool == false else { return nil }
+        for key in ["tag", "username", "password", "path"] {
+            if fields[key] != nil && !(fields[key] is String) { return nil }
+        }
+        for key in ["version", "mtu"] {
+            if fields[key] != nil && !(fields[key] is Int) { return nil }
+        }
+        if fields["headers"] != nil && !(fields["headers"] is [String: String]) { return nil }
+        if fields["disable_version_fallback"] != nil && !(fields["disable_version_fallback"] is Bool) { return nil }
+        let tls = fields["tls"] as? [String: Any] ?? [:]
+        if fields["tls"] != nil && !(fields["tls"] is [String: Any]) { return nil }
+        guard Set(tls.keys).isSubset(of: ["enabled", "server_name", "insecure", "alpn", "certificate"]) else { return nil }
+        for key in ["enabled", "insecure"] { if tls[key] != nil && !(tls[key] is Bool) { return nil } }
+        if tls["server_name"] != nil && !(tls["server_name"] is String) { return nil }
+        func strings(_ value: Any?) -> [String]? {
+            if let string = value as? String { return [string] }
+            return value as? [String]
+        }
+        for key in ["alpn", "certificate"] { if tls[key] != nil && strings(tls[key]) == nil { return nil } }
+        let options = MASQUEOptions(mode: .basicConnectIP, mtu: fields["mtu"] as? Int,
+            httpVersion: fields["version"] as? Int, disableVersionFallback: fields["disable_version_fallback"] as? Bool,
+            headers: fields["headers"] as? [String: String], certificate: strings(tls["certificate"]))
+        let node = ProxyNode(sourceID: sourceID, kind: .masque, name: fields["tag"] as? String ?? server,
+            server: server, port: port, password: fields["password"] as? String, username: fields["username"] as? String,
+            masque: options, tls: tls["enabled"] as? Bool ?? false, sni: tls["server_name"] as? String,
+            path: fields["path"] as? String, alpn: strings(tls["alpn"])?.joined(separator: ","),
+            skipCertificateVerification: tls["insecure"] as? Bool ?? false, rawURI: "")
+        return node.hasSupportedMASQUEFields ? node : nil
+    }
+
     private func parseClashYAML(_ text: String, sourceID: UUID?) -> ParsedContent {
         let lines = text.components(separatedBy: .newlines)
         guard let start = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "proxies:" }) else {
@@ -1424,17 +1759,50 @@ struct SubscriptionParser {
         var itemIndentation: Int?
         // The key a bare sequence element belongs to, for the same reason.
         var pendingSequenceKey: String?
+        var pluginIndentation: Int?
+        // A `key: |` block scalar — SSH private keys arrive this way. Without
+        // it the key's `-----BEGIN` line read as a list item and the node was
+        // torn apart.
+        var block: (key: String, keyIndentation: Int, folded: Bool, keepsNewline: Bool)?
+        var blockLines: [String] = []
+        var blockContentIndentation: Int?
+        func flushBlock() {
+            guard let open = block else { return }
+            var value = blockLines.joined(separator: open.folded ? " " : "\n")
+            if open.keepsNewline, !value.isEmpty { value += "\n" }
+            current[open.key] = value
+            block = nil
+            blockLines = []
+            blockContentIndentation = nil
+        }
+        func openBlock(_ key: String, _ value: String, keyIndentation: Int) -> Bool {
+            guard ["|", "|-", "|+", ">", ">-", ">+"].contains(value) else { return false }
+            block = (key, keyIndentation, value.hasPrefix(">"), !value.hasSuffix("-"))
+            return true
+        }
 
         for rawLine in lines.dropFirst(start + 1) {
             let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
             let indentation = rawLine.prefix { $0 == " " }.count
+            if block != nil {
+                if !trimmed.isEmpty, indentation > block!.keyIndentation {
+                    let contentIndentation = blockContentIndentation ?? indentation
+                    blockContentIndentation = contentIndentation
+                    blockLines.append(String(rawLine.dropFirst(min(contentIndentation, indentation)))
+                        .trimmingCharacters(in: CharacterSet(charactersIn: "\r")))
+                    continue
+                }
+                if trimmed.isEmpty { continue }
+                flushBlock()
+            }
+            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
             if indentation == 0 && !trimmed.hasPrefix("-") { break }
 
             if trimmed.hasPrefix("-"), indentation <= (itemIndentation ?? indentation) {
                 itemIndentation = indentation
                 if !current.isEmpty { dictionaries.append(current) }
                 current = [:]
+                pluginIndentation = nil
                 inside = true
                 pendingSequenceKey = nil
                 let remainder = trimmed.dropFirst().trimmingCharacters(in: .whitespaces)
@@ -1442,7 +1810,11 @@ struct SubscriptionParser {
                     current.merge(parseInlineYAMLMap(String(remainder))) { _, new in new }
                 } else if let pair = parseYAMLPair(String(remainder)) {
                     current[pair.0] = pair.1
-                    if pair.1.isEmpty { pendingSequenceKey = pair.0 }
+                    if openBlock(pair.0, pair.1, keyIndentation: indentation + 2) { continue }
+                    if pair.1.isEmpty {
+                        pendingSequenceKey = pair.0
+                        if pair.0 == "plugin-opts" { pluginIndentation = indentation + 2 }
+                    }
                 }
             } else if inside, trimmed.hasPrefix("-") {
                 // A nested element. Collected comma-joined so a multi-value
@@ -1468,16 +1840,28 @@ struct SubscriptionParser {
                 let existing = current[key] ?? ""
                 current[key] = existing.isEmpty ? element : existing + "," + element
             } else if inside, let pair = parseYAMLPair(trimmed) {
+                if let parent = pluginIndentation, indentation > parent {
+                    current["plugin-opts." + pair.0] = pair.1
+                    continue
+                }
+                pluginIndentation = pair.0 == "plugin-opts" && pair.1.isEmpty ? indentation : nil
                 current[pair.0] = pair.1
                 pendingSequenceKey = pair.1.isEmpty ? pair.0 : nil
+                if openBlock(pair.0, pair.1, keyIndentation: indentation) { pendingSequenceKey = nil }
             }
         }
+        flushBlock()
         if !current.isEmpty { dictionaries.append(current) }
 
         var nodes: [ProxyNode] = []
         var rejected = 0
         for rawDictionary in dictionaries {
             let dictionary = flattenedClashProxy(rawDictionary)
+            if dictionary["type"]?.lowercased() == "masque" {
+                if let node = parseMASQUEClash(dictionary, sourceID: sourceID) { nodes.append(node) }
+                else { rejected += 1 }
+                continue
+            }
             guard let type = dictionary["type"]?.lowercased(),
                   let kind = clashKind(type),
                   let rawServer = dictionary["server"],
@@ -1494,17 +1878,39 @@ struct SubscriptionParser {
                 rejected += 1
                 continue
             }
+            // AmneziaWG changes the handshake; as plain WireGuard the node
+            // would import cleanly and never connect.
+            if kind == .wireguard, dictionary.keys.contains(where: Self.isAmneziaWireGuardKey) {
+                rejected += 1
+                continue
+            }
+            // SSH needs a login and a password or an inline key. Mihomo also
+            // accepts a key *file path*, which no other device can read.
+            if kind == .ssh {
+                let user = dictionary["username"] ?? dictionary["user"] ?? ""
+                let key = dictionary["private-key"] ?? ""
+                let keyIsInline = key.contains("PRIVATE KEY")
+                guard !user.isEmpty, (!(dictionary["password"] ?? "").isEmpty || keyIsInline),
+                      key.isEmpty || keyIsInline else {
+                    rejected += 1
+                    continue
+                }
+            }
+            if kind == .trustTunnel,
+               (dictionary["username"] ?? "").isEmpty || (dictionary["password"] ?? "").isEmpty {
+                rejected += 1
+                continue
+            }
 
-            // A SIP003 plugin changes how the node is dialled. simple-obfs is
-            // expressible in all five target formats and is carried over;
-            // anything else would import as a node that looks healthy and never
-            // connects, so it is rejected and counted instead.
+            // Keep the plugin and its independent credentials. Unsupported
+            // plugins are rejected instead of being flattened into plain SS.
             var obfsMode = dictionary["obfs"]
             var sip003Plugin: String?
             var pluginTransport: String?
             var pluginPath: String?
             var pluginTLS = false
             var pluginMux: Bool?
+            var shadowTLS: ShadowTLSOptions?
             // `obfs-param` is ShadowsocksR's key. Hysteria 2 spells the same
             // slot `obfs-password`, and reading only the SSR name left every
             // salamander node with a type and no password — which makes Mihomo
@@ -1512,14 +1918,34 @@ struct SubscriptionParser {
             var obfsHost = dictionary["obfs-param"]
                 ?? dictionary["obfs-password"]
                 ?? dictionary["obfs_password"]
+            // mihomo nests Snell obfuscation under `obfs-opts`; dropping it
+            // imported a node that looked fine and could not connect.
+            if kind == .snell {
+                var options = parseInlineYAMLMap(dictionary["obfs-opts"] ?? "")
+                for (key, value) in dictionary where key.hasPrefix("obfs-opts.") {
+                    options[String(key.dropFirst("obfs-opts.".count))] = value
+                }
+                if let mode = options["mode"], !mode.isEmpty {
+                    obfsMode = mode
+                    obfsHost = options["host"]
+                }
+            }
             if kind == .shadowsocks, let plugin = dictionary["plugin"]?.lowercased(), !plugin.isEmpty {
                 var options = parseInlineYAMLMap(dictionary["plugin-opts"] ?? "")
-                // The block YAML reader flattens nested scalar keys; inline
-                // plugin maps already have their own values and take priority.
-                for key in ["mode", "host", "path", "tls", "mux"] where options[key] == nil {
-                    options[key] = dictionary[key]
+                for (key, value) in dictionary where key.hasPrefix("plugin-opts.") {
+                    options[String(key.dropFirst("plugin-opts.".count))] = value
                 }
-                if plugin == "obfs" || plugin == "obfs-local" || plugin == "simple-obfs" {
+                if plugin == "shadow-tls" {
+                    // UDP-over-TCP is a separate server capability. Reject an
+                    // enabled, unmodelled mode rather than silently losing it.
+                    guard !boolString(dictionary["udp-over-tcp"]),
+                          let parsed = shadowTLSOptions(options) else {
+                        rejected += 1
+                        continue
+                    }
+                    sip003Plugin = "shadow-tls"
+                    shadowTLS = parsed
+                } else if plugin == "obfs" || plugin == "obfs-local" || plugin == "simple-obfs" {
                     obfsMode = options["mode"] ?? "http"
                     obfsHost = options["host"]
                 } else if plugin == "v2ray-plugin",
@@ -1557,19 +1983,21 @@ struct SubscriptionParser {
                     ?? dictionary["auth"]
                     ?? dictionary["psk"],
                 uuid: dictionary["uuid"],
-                username: dictionary["username"],
+                // Stash spells the SSH login `user`.
+                username: dictionary["username"] ?? (kind == .ssh ? dictionary["user"] : nil),
                 transport: pluginTransport ?? normalizedTransport(dictionary["network"]),
                 transportMode: normalizedTransport(dictionary["network"]) == "xhttp"
                     ? dictionary["mode"] : nil,
                 plugin: sip003Plugin,
                 pluginMux: pluginMux,
+                shadowTLS: shadowTLS,
                 // TLS is part of the Trojan protocol itself. Mihomo therefore
                 // omits the redundant `tls: true` field in valid Trojan nodes;
                 // treating that omission as plaintext breaks every strict
                 // target format derived from this shared model.
-                tls: kind == .trojan || pluginTLS || boolString(dictionary["tls"]),
+                tls: kind == .trojan || kind == .trustTunnel || pluginTLS || boolString(dictionary["tls"]),
                 sni: dictionary["servername"] ?? dictionary["sni"],
-                hostHeader: dictionary["authority"] ?? dictionary["host"],
+                hostHeader: sip003Plugin == "v2ray-plugin" ? obfsHost : dictionary["authority"] ?? dictionary["host"],
                 path: pluginPath
                     ?? (normalizedTransport(dictionary["network"]) == "grpc"
                         ? dictionary["grpc-service-name"] ?? dictionary["service-name"] ?? dictionary["path"]
@@ -1581,7 +2009,8 @@ struct SubscriptionParser {
                 realityShortID: hasRealityOptions
                     ? clashYAMLScalar(dictionary["short-id"] ?? dictionary["sid"])
                     : nil,
-                certificateFingerprint: dictionary["tls-fingerprint"]
+                certificateFingerprint: dictionary["server-cert-fingerprint"]
+                    ?? dictionary["tls-fingerprint"]
                     ?? dictionary["fingerprint"],
                 fingerprint: dictionary["client-fingerprint"]
                     ?? dictionary["fp"],
@@ -1596,6 +2025,7 @@ struct SubscriptionParser {
                 congestionControl: dictionary["congestion-controller"]
                     ?? dictionary["congestion_control"],
                 udpRelayMode: dictionary["udp-relay-mode"],
+                udpRelayEnabled: [.shadowsocks, .trustTunnel].contains(kind) ? dictionary["udp"].map { boolString($0) } : nil,
                 portHopping: dictionary["ports"]
                     ?? dictionary["mport"]
                     ?? dictionary["server-ports"]
@@ -1622,7 +2052,15 @@ struct SubscriptionParser {
                 wireGuardDNS: kind == .wireguard
                     ? csvValues(dictionary["dns"] ?? "").joined(separator: ",")
                     : nil,
-                rawURI: "clash://local/\(UUID().uuidString)"
+                rawURI: "clash://local/\(UUID().uuidString)",
+                vlessEncryption: kind == .vless ? vlessEncryption(dictionary["encryption"]) : nil,
+                ssh: kind == .ssh ? SSHOptions(
+                    privateKey: dictionary["private-key"].flatMap { $0.isEmpty ? nil : $0 },
+                    privateKeyPassphrase: dictionary["private-key-passphrase"].flatMap { $0.isEmpty ? nil : $0 },
+                    hostKeys: csvValues(dictionary["host-key"] ?? ""),
+                    hostKeyAlgorithms: csvValues(dictionary["host-key-algorithms"] ?? "")
+                ) : nil,
+                trustTunnel: kind == .trustTunnel ? TrustTunnelOptions(quic: boolString(dictionary["quic"])) : nil
             ))
         }
         return .init(
@@ -1861,6 +2299,14 @@ struct SubscriptionParser {
         return output
     }
 
+    /// Keys that only AmneziaWG carries: mihomo's `amnezia-wg-option` block
+    /// and its junk-packet / header parameters.
+    static func isAmneziaWireGuardKey(_ key: String) -> Bool {
+        let key = key.lowercased()
+        return key.hasPrefix("amnezia-wg-option")
+            || ["jc", "jmin", "jmax", "s1", "s2", "h1", "h2", "h3", "h4"].contains(key)
+    }
+
     private func clashKind(_ value: String) -> ProxyKind? {
         switch value {
         case "ss": .shadowsocks
@@ -1876,6 +2322,8 @@ struct SubscriptionParser {
         case "snell": .snell
         case "socks5", "socks": .socks5
         case "http", "https": .http
+        case "ssh": .ssh
+        case "trusttunnel", "trust-tunnel": .trustTunnel
         default: nil
         }
     }
@@ -1913,7 +2361,7 @@ struct SubscriptionParser {
         )
     }
 
-    /// Shadowrocket's endpoint-only VLESS dialect calls the WebSocket header
+    /// Shadowrocket's endpoint-only VLESS/VMess dialect calls the WebSocket header
     /// `obfsParam`. Most producers store a bare hostname there, while others
     /// percent-encode a JSON header map such as `{\"Host\":\"cdn.example\"}`.
     /// Decode both shapes without ever serialising the JSON object itself as a

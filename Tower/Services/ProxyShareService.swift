@@ -58,8 +58,11 @@ struct ProxyNodeShareLinkGenerator {
     /// original link is otherwise reusable. In particular, percent-encoding
     /// the fragment keeps flag emoji and non-ASCII names intact after a client
     /// decodes the outer base64 subscription.
-    func canonicalLink(for node: ProxyNode) -> String {
-        let original = node.rawURI.trimmingCharacters(in: .whitespacesAndNewlines)
+    func canonicalLink(for source: ProxyNode) -> String {
+        let original = source.rawURI.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Anywhere showed an IP-fronted node as insecure until the Host was
+        // written as SNI; clients reading these links differ on the fallback.
+        let node = source.withTransportHostAsSNI
 
         return switch node.kind {
         case .shadowsocks: shadowsocksLink(for: node) ?? original
@@ -69,7 +72,12 @@ struct ProxyNodeShareLinkGenerator {
             standardLink(for: node) ?? original
         case .wireguard: wireGuardLink(for: node) ?? original
         // Snell has no URI form, so share its portable Surge proxy line.
-        case .snell: original.isEmpty ? snellLine(for: node) : original
+        // A Clash-imported node only carries an internal placeholder.
+        case .snell: original.isEmpty || original.lowercased().hasPrefix("clash://local/")
+            ? ConfigurationGenerator().snellShareLine(node)
+            : original
+        case .masque: ConfigurationGenerator().masqueShareLine(node)
+        case .ssh, .trustTunnel: ConfigurationGenerator().clashShareSnippet(node)
         case .unknown: original
         }
     }
@@ -99,25 +107,46 @@ struct ProxyNodeShareLinkGenerator {
 
         // Dropping the plugin would hand out a link that looks fine and cannot
         // connect, which is exactly what the importer refuses to accept.
-        if node.plugin == "v2ray-plugin" {
+        if let shadowTLS = node.shadowTLS {
+            var plugin = "shadow-tls;host=\(escape(shadowTLS.host));password=\(escape(shadowTLS.password));version=\(shadowTLS.version)"
+            if shadowTLS.skipCertificateVerification { plugin += ";skip-cert-verify=true" }
+            let encoded = plugin.addingPercentEncoding(
+                withAllowedCharacters: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+            ) ?? plugin
+            link += "?plugin=\(encoded)"
+            if let fingerprint = node.fingerprint {
+                let encodedFingerprint = fingerprint.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? fingerprint
+                link += "&client-fingerprint=\(encodedFingerprint)"
+            }
+        } else if node.plugin == "v2ray-plugin" {
             var plugin = "v2ray-plugin;mode=websocket"
             if let mux = node.pluginMux { plugin += ";mux=\(mux ? "1" : "0")" }
             if node.tls { plugin += ";tls" }
-            if let host = node.hostHeader, !host.isEmpty { plugin += ";host=\(host)" }
-            if let path = node.exportablePath { plugin += ";path=\(path)" }
+            if let host = node.hostHeader, !host.isEmpty { plugin += ";host=\(escape(host))" }
+            if let path = node.exportablePath { plugin += ";path=\(escape(path))" }
             let encoded = plugin.addingPercentEncoding(
                 withAllowedCharacters: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
             ) ?? plugin
             link += "?plugin=\(encoded)"
         } else if let mode = node.obfs?.lowercased(), ["http", "tls"].contains(mode) {
             var plugin = "obfs-local;obfs=\(mode)"
-            if let host = node.obfsParam, !host.isEmpty { plugin += ";obfs-host=\(host)" }
+            if let host = node.obfsParam, !host.isEmpty { plugin += ";obfs-host=\(escape(host))" }
             let encoded = plugin.addingPercentEncoding(
                 withAllowedCharacters: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
             ) ?? plugin
             link += "?plugin=\(encoded)"
         }
+        if let enabled = node.udpRelayEnabled {
+            link += (link.contains("?") ? "&" : "?") + "udp-relay=\(enabled)"
+        }
         return link + "#\(fragment(node.name))"
+    }
+
+    /// SIP003 plugin options are `;`-separated, so separators inside a value
+    /// (a WebSocket path like `/foo;bar`) must be backslash-escaped.
+    private func escape(_ value: String) -> String {
+        value.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: ";", with: "\\;")
     }
 
     private func shadowsocksRLink(for node: ProxyNode) -> String? {
@@ -148,8 +177,10 @@ struct ProxyNodeShareLinkGenerator {
             "id": uuid,
             "aid": String(node.alterID ?? 0),
             "scy": node.cipher ?? "auto",
-            "net": node.transport ?? "tcp",
-            "type": "none",
+            // HTTP/1.1 header obfuscation is `net: tcp` plus `type: http` in
+            // v2rayN's format; `net: http` means Xray's HTTP/2 transport.
+            "net": node.transport == "http" ? "tcp" : (node.transport ?? "tcp"),
+            "type": node.transport == "http" ? "http" : "none",
             "tls": node.tls ? "tls" : ""
         ]
         if let sni = node.sni { object["sni"] = sni }
@@ -175,7 +206,7 @@ struct ProxyNodeShareLinkGenerator {
         case .http: node.tls ? "https" : "http"
         default: nil
         }
-        components.host = node.server
+        components.host = formattedHost(node.server)
         components.port = node.port
         components.fragment = node.name
 
@@ -196,8 +227,16 @@ struct ProxyNodeShareLinkGenerator {
         }
 
         var queryItems: [URLQueryItem] = []
-        if let transport = node.transport, !transport.isEmpty {
+        if node.transport == "http" {
+            // The link standard's `type=http` is HTTP/2; HTTP/1.1 header
+            // obfuscation is TCP with an HTTP header.
+            queryItems.append(URLQueryItem(name: "type", value: "tcp"))
+            queryItems.append(URLQueryItem(name: "headerType", value: "http"))
+        } else if let transport = node.transport, !transport.isEmpty {
             queryItems.append(URLQueryItem(name: "type", value: transport))
+        }
+        if node.kind == .vless, let encryption = node.vlessEncryption {
+            queryItems.append(URLQueryItem(name: "encryption", value: encryption))
         }
         if node.transport == "xhttp", let mode = node.transportMode, !mode.isEmpty {
             queryItems.append(URLQueryItem(name: "mode", value: mode))
@@ -258,10 +297,10 @@ struct ProxyNodeShareLinkGenerator {
            !ports.isEmpty {
             queryItems.append(URLQueryItem(name: "mport", value: ports))
         }
-        if node.kind == .hysteria2,
+        if [.hysteria2, .trojan].contains(node.kind),
            let fingerprint = node.certificateFingerprint,
            !fingerprint.isEmpty {
-            // Hysteria 2 URI producers use pinSHA256 for the certificate pin.
+            // Preserve pinSHA256 when rebuilding Hysteria 2 or Trojan subscriptions.
             queryItems.append(URLQueryItem(name: "pinSHA256", value: fingerprint))
         }
         if node.kind == .hysteria {
@@ -317,7 +356,7 @@ struct ProxyNodeShareLinkGenerator {
         var components = URLComponents()
         components.scheme = "wireguard"
         components.user = privateKey
-        components.host = node.server
+        components.host = formattedHost(node.server)
         components.port = node.port
         components.fragment = node.name
         var addresses: [String] = []
@@ -343,23 +382,6 @@ struct ProxyNodeShareLinkGenerator {
         }
         components.queryItems = items
         return components.string
-    }
-
-    private func snellLine(for node: ProxyNode) -> String {
-        var parts = [
-            "\(node.name) = snell",
-            node.server,
-            String(node.port),
-            "psk=\(node.password ?? "")",
-            "version=\(node.version ?? 4)"
-        ]
-        if let mode = node.obfs, !mode.isEmpty, mode.lowercased() != "none" {
-            parts.append("obfs=\(mode)")
-            if let host = node.obfsParam, !host.isEmpty {
-                parts.append("obfs-host=\(host)")
-            }
-        }
-        return parts.joined(separator: ", ")
     }
 
     private func formattedHost(_ host: String) -> String {

@@ -57,7 +57,10 @@ struct RuleScheme: Identifiable, Codable, Hashable {
     var remoteRulesetURLs: [URL] {
         var seen = Set<String>()
         return rulesets.compactMap { ruleset in
-            guard let url = ruleset.resource.downloadURL,
+            // A binary MRS list cannot be read here; mihomo clients fetch it
+            // themselves and the others are told it was left out.
+            guard !ruleset.isBinaryRuleSet,
+                  let url = ruleset.resource.downloadURL,
                   seen.insert(url.absoluteString).inserted else { return nil }
             return url
         }
@@ -127,7 +130,7 @@ struct RuleScheme: Identifiable, Codable, Hashable {
     /// which node names they contain. Mixing the two makes service rules appear
     /// as candidates for one another and can create cyclic configurations.
     func groupEditorMode(for group: RuleSchemeGroup) -> RuleSchemeGroupEditorMode {
-        if group.kind == .smart { return .nodePatternsOnly }
+        if group.kind == .smart || group.isCustomNodeFilter == true { return .nodePatternsOnly }
         if isPrimaryNodeSelector(group.name) {
             return .routingTargets
         }
@@ -170,7 +173,8 @@ struct RuleScheme: Identifiable, Codable, Hashable {
         let manualTargets = candidateGroups.contains { Self.isManualRoutingTarget($0.name) }
             || excludedName.map(Self.isManualRoutingTarget) == true
             ? [] : ["🚀 手动切换"]
-        return (declaredCore + manualTargets + regionalTargets + ["DIRECT", "REJECT"])
+        let customTargets = candidateGroups.filter { $0.isCustomNodeFilter == true && $0.name != excludedName }.map(\.name)
+        return (declaredCore + manualTargets + regionalTargets + customTargets + ["DIRECT", "REJECT"])
             .filter { seen.insert($0).inserted }
     }
 
@@ -183,9 +187,15 @@ struct RuleScheme: Identifiable, Codable, Hashable {
         groupCustomization: RuleSchemeCustomization? = nil,
         resolvedRuleLines: [URL: [String]] = [:]
     ) -> RuleScheme {
-        let candidateFlows = customRuleFlows.filter { $0.schemeID == id && $0.isEnabled }
+        let enabledFlows = customRuleFlows.filter { $0.schemeID == id && $0.isEnabled }
+        let supplementFlows = enabledFlows.filter { $0.isGroupSupplement == true }
+        let candidateFlows = enabledFlows.filter { $0.isGroupSupplement != true }
         var availableGroups = groups
-        var availableGroupNames = Set(groups.map(\.name))
+        for group in groupCustomization?.addedNodeGroups ?? [] {
+            availableGroups.removeAll { $0.name == group.name }
+            availableGroups.append(group)
+        }
+        var availableGroupNames = Set(availableGroups.map(\.name))
         var insertedGeneratedRuleSetIDs = Set<UUID>()
         for flow in candidateFlows {
             guard let group = flow.expansion.policyGroup,
@@ -194,10 +204,10 @@ struct RuleScheme: Identifiable, Codable, Hashable {
             insertedGeneratedRuleSetIDs.insert(flow.id)
         }
         availableGroups = groupCustomization?.applying(to: availableGroups) ?? availableGroups
-        availableGroups = Self.injectMissingRoutingGroups(into: availableGroups)
+        availableGroups = Self.injectMissingRoutingGroups(into: availableGroups, customization: groupCustomization)
 
         let groupNames = Set(availableGroups.map(\.name))
-        let validPolicies = groupNames.union(["DIRECT", "REJECT", "direct", "reject"])
+        let validPolicies = groupNames.union(RoutingBuiltinPolicies.names)
         let expansions = candidateFlows.map { flow in
             groupCustomization?.applying(to: flow.expansion) ?? flow.expansion
         }.filter {
@@ -211,12 +221,12 @@ struct RuleScheme: Identifiable, Codable, Hashable {
             let ruleset = RuleSchemeRuleset(
                 groupName: groupCustomization?.renamedGroupName(sourceRuleset.groupName)
                     ?? sourceRuleset.groupName,
-                resource: sourceRuleset.resource
+                resource: sourceRuleset.resource, options: sourceRuleset.options, provider: sourceRuleset.provider
             )
             guard !removedGroupNames.contains(ruleset.groupName) else { continue }
             if case .inline(let rule) = ruleset.resource, rule.uppercased() == "FINAL" {
                 finalRulesets.append(ruleset)
-            } else if enabledRuleGroupNames?.contains(ruleset.groupName) ?? true {
+            } else if RoutingBuiltinPolicies.names.contains(ruleset.groupName) || (enabledRuleGroupNames?.contains(ruleset.groupName) ?? true) {
                 ordinaryRulesets.append(ruleset)
             }
         }
@@ -235,9 +245,16 @@ struct RuleScheme: Identifiable, Codable, Hashable {
                     RuleSchemeRuleset(groupName: policyGroupName, resource: .remote(url))
                 )
             }
-            expansionRulesets.append(contentsOf: expansion.ruleSet.inlineRules.map {
-                RuleSchemeRuleset(groupName: policyGroupName, resource: .inline($0))
+            expansionRulesets.append(contentsOf: expansion.ruleSet.inlineRules.enumerated().map { index, body in
+                let explicitPolicy = expansion.ruleSet.inlinePolicies.indices.contains(index)
+                    ? expansion.ruleSet.inlinePolicies[index] : nil
+                return RuleSchemeRuleset(groupName: explicitPolicy ?? policyGroupName, resource: .inline(body))
             })
+            expansionRulesets = expansionRulesets.map {
+                var ruleset = $0
+                ruleset.origin = .added(expansion.ruleSet.name)
+                return ruleset
+            }
             let insertion = Self.customRulesetInsertionIndex(
                 for: expansion,
                 in: ordinaryRulesets,
@@ -264,6 +281,9 @@ struct RuleScheme: Identifiable, Codable, Hashable {
             mergedRulesets.append(ordinaryRulesets[index])
         }
         mergedRulesets.append(contentsOf: customRulesetsByInsertion[ordinaryRulesets.count])
+        if let order = groupCustomization?.matchingOrder, !order.isEmpty {
+            mergedRulesets = Self.reordering(mergedRulesets, by: order)
+        }
 
         for placement in generatedGroupPlacements {
             guard let currentIndex = availableGroups.firstIndex(where: {
@@ -282,25 +302,17 @@ struct RuleScheme: Identifiable, Codable, Hashable {
 
         var result = self
         result.groups = availableGroups
-        // Only a new explicit user reorder changes matching priority. Legacy
-        // groupOrder snapshots described display order and must not silently
-        // change routing on upgrade. Keep unlisted rules in their original slots.
-        if let priority = groupCustomization?.rulePriorityOrder {
-            var rank: [String: Int] = [:]
-            for name in priority where rank[name] == nil { rank[name] = rank.count }
-            let ordered = mergedRulesets.enumerated().filter { rank[$0.element.groupName] != nil }
-                .sorted {
-                    let lhs = rank[$0.element.groupName]!
-                    let rhs = rank[$1.element.groupName]!
-                    return lhs == rhs ? $0.offset < $1.offset : lhs < rhs
-                }.map(\.element)
-            var next = 0
-            for index in mergedRulesets.indices where rank[mergedRulesets[index].groupName] != nil {
-                mergedRulesets[index] = ordered[next]
-                next += 1
-            }
-        }
-        result.rulesets = mergedRulesets + finalRulesets
+        // Matching order is the source's, with added rules ahead of the first
+        // rule they overlap, and a dragged group moved as one block
+        // (`reordering`). `groupOrder` itself is never applied to the rules:
+        // doing that put 🚀 节点选择's GFW list ahead of AI, Netflix, direct
+        // and ad-block lists after any drag (issue #40). Conditions the user
+        // attached to a group come before all of it (issue #45).
+        result.rulesets = Self.supplementRulesets(
+            from: supplementFlows,
+            customization: groupCustomization,
+            validPolicies: validPolicies.subtracting(removedGroupNames)
+        ) + mergedRulesets + finalRulesets
         if groupCustomization?.overridesNetworkSettings == true {
             result.networkSettings = groupCustomization?.networkSettingsOverride
         }
@@ -324,6 +336,125 @@ struct RuleScheme: Identifiable, Codable, Hashable {
         }
         result.groups = availableGroups.filter { requiredNames.contains($0.name) }
         return result
+    }
+
+    /// Rule groups in the order a client first reaches them.
+    static func matchingGroupNames(of rulesets: [RuleSchemeRuleset]) -> [String] {
+        var seen = Set<String>()
+        return rulesets.compactMap { ruleset in
+            if case .inline(let rule) = ruleset.resource, rule.uppercased() == "FINAL" { return nil }
+            guard ruleset.origin != .supplement,
+                  !RoutingBuiltinPolicies.names.contains(ruleset.groupName),
+                  seen.insert(ruleset.groupName).inserted else { return nil }
+            return ruleset.groupName
+        }
+    }
+
+    /// Applies a dragged matching order while touching as little as
+    /// possible. Groups whose relative order the user kept (the longest
+    /// subsequence still in source order) stay exactly where the source put
+    /// each of their rules; only the groups that were moved are lifted out as
+    /// one block and placed right before the next unmoved group. A trailing
+    /// `GEOIP` fallback stays put, so moving 🎯 全球直连 does not make every
+    /// unmatched domain resolve early.
+    static func reordering(_ rulesets: [RuleSchemeRuleset], by order: [String]) -> [RuleSchemeRuleset] {
+        let sourceOrder = matchingGroupNames(of: rulesets)
+        let rank = Dictionary(uniqueKeysWithValues: sourceOrder.enumerated().map { ($1, $0) })
+        var seen = Set<String>()
+        let desired = order.filter { rank[$0] != nil && seen.insert($0).inserted }
+        guard desired.count > 1 else { return rulesets }
+
+        let kept = Set(longestIncreasingSubsequence(desired.map { rank[$0] ?? 0 }).map { desired[$0] })
+        let movedNames = Set(desired.filter { !kept.contains($0) })
+        guard !movedNames.isEmpty else { return rulesets }
+        func isAnchored(_ ruleset: RuleSchemeRuleset) -> Bool {
+            guard case .inline(let rule) = ruleset.resource else { return false }
+            return rule.uppercased().hasPrefix("GEOIP,")
+        }
+        func lifts(_ ruleset: RuleSchemeRuleset) -> Bool {
+            ruleset.origin != .supplement && movedNames.contains(ruleset.groupName) && !isAnchored(ruleset)
+        }
+
+        var blocks: [String: [RuleSchemeRuleset]] = [:]
+        for ruleset in rulesets where lifts(ruleset) {
+            blocks[ruleset.groupName, default: []].append(ruleset)
+        }
+        // Each moved group lands before the next group after it that stayed;
+        // one dragged past every kept group lands right after the last of
+        // them, still ahead of the trailing GEOIP fallback.
+        var pending: [String: [RuleSchemeRuleset]] = [:]
+        var trailing: [RuleSchemeRuleset] = []
+        for (index, name) in desired.enumerated() where movedNames.contains(name) {
+            let block = blocks[name] ?? []
+            if let anchor = desired[(index + 1)...].first(where: kept.contains) {
+                pending[anchor, default: []].append(contentsOf: block)
+            } else {
+                trailing.append(contentsOf: block)
+            }
+        }
+
+        var result: [RuleSchemeRuleset] = []
+        for ruleset in rulesets where !lifts(ruleset) {
+            if ruleset.origin != .supplement, let block = pending.removeValue(forKey: ruleset.groupName) {
+                result.append(contentsOf: block)
+            }
+            result.append(ruleset)
+        }
+        guard !trailing.isEmpty else { return result }
+        let lastKept = desired.last(where: kept.contains)
+        let insertion = result.lastIndex { !isAnchored($0) && $0.groupName == lastKept }
+            .map { $0 + 1 } ?? result.endIndex
+        result.insert(contentsOf: trailing, at: insertion)
+        return result
+    }
+
+    /// Indices of one longest strictly increasing subsequence.
+    private static func longestIncreasingSubsequence(_ values: [Int]) -> [Int] {
+        var tails: [Int] = []
+        var previous = Array(repeating: -1, count: values.count)
+        for (index, value) in values.enumerated() {
+            var low = 0, high = tails.count
+            while low < high {
+                let middle = (low + high) / 2
+                if values[tails[middle]] < value { low = middle + 1 } else { high = middle }
+            }
+            if low > 0 { previous[index] = tails[low - 1] }
+            if low == tails.count { tails.append(index) } else { tails[low] = index }
+        }
+        var result: [Int] = []
+        var cursor = tails.last ?? -1
+        while cursor >= 0 {
+            result.append(cursor)
+            cursor = previous[cursor]
+        }
+        return result.reversed()
+    }
+
+    /// Most specific first, then in the order they were added. A condition
+    /// already claimed by an earlier group is not emitted twice.
+    static func supplementRulesets(
+        from flows: [CustomRuleFlow],
+        customization: RuleSchemeCustomization?,
+        validPolicies: Set<String>
+    ) -> [RuleSchemeRuleset] {
+        let entries = flows.flatMap { flow -> [(rule: SupplementRule, policy: String)] in
+            let policy = customization?.renamedGroupName(flow.policyName) ?? flow.policyName
+            guard validPolicies.contains(policy) else { return [] }
+            return flow.supplementRules.map { ($0, policy) }
+        }
+        var seen = Set<String>()
+        return entries.enumerated().sorted { lhs, rhs in
+            if SupplementRule.matchingOrder(lhs.element.rule, rhs.element.rule) { return true }
+            if SupplementRule.matchingOrder(rhs.element.rule, lhs.element.rule) { return false }
+            return lhs.offset < rhs.offset
+        }.compactMap { entry in
+            guard seen.insert(entry.element.rule.line.lowercased()).inserted else { return nil }
+            return RuleSchemeRuleset(
+                groupName: entry.element.policy,
+                resource: .inline(entry.element.rule.line),
+                origin: .supplement
+            )
+        }
     }
 
     private static func customRulesetInsertionIndex(
@@ -401,7 +532,7 @@ struct RuleScheme: Identifiable, Codable, Hashable {
             )
         }
         result.rulesets = rulesets.map {
-            RuleSchemeRuleset(groupName: renamed($0.groupName), resource: $0.resource)
+            RuleSchemeRuleset(groupName: renamed($0.groupName), resource: $0.resource, options: $0.options, provider: $0.provider)
         }
         return result
     }
@@ -522,33 +653,44 @@ struct RuleScheme: Identifiable, Codable, Hashable {
     }
 
     private static func injectMissingRoutingGroups(
-        into groups: [RuleSchemeGroup]
+        into groups: [RuleSchemeGroup],
+        customization: RuleSchemeCustomization?
     ) -> [RuleSchemeGroup] {
         var result = groups
         var names = Set(groups.map(\.name))
-        let references = groups.flatMap(\.members).compactMap { member -> String? in
-            guard case .reference(let name) = member else { return nil }
-            return name
-        }
-        for reference in references {
-            guard !names.contains(reference) else { continue }
-            if isManualRoutingTarget(reference) {
-                names.insert(reference)
-                result.append(RuleSchemeGroup(name: reference, kind: .select, members: [.nodePattern(".*")]))
-                continue
+        var index = 0
+        while index < result.count {
+            let references = result[index].members.compactMap { member -> String? in
+                guard case .reference(let name) = member else { return nil }
+                return name
             }
-            guard let region = routingRegion(for: reference),
-                  names.insert(reference).inserted else { continue }
-            result.append(
-                RuleSchemeGroup(
-                    name: reference,
-                    kind: .urlTest,
-                    members: [.nodePattern(region.nodePattern)],
-                    testURLString: "http://www.gstatic.com/generate_204",
-                    interval: 300,
-                    tolerance: 50
-                )
-            )
+            index += 1
+            for reference in references {
+                guard !names.contains(reference) else { continue }
+                // Supplemental groups do not exist in the upstream array on
+                // which overrides were applied. Build their source definition,
+                // then apply saved edits once, just as for declared groups.
+                let sourceName = customization?.sourceGroupName(for: reference) ?? reference
+                let supplemental: RuleSchemeGroup
+                if isManualRoutingTarget(sourceName) {
+                    supplemental = RuleSchemeGroup(name: sourceName, kind: .select, members: [.nodePattern(".*")])
+                } else if let region = routingRegion(for: sourceName) {
+                    supplemental = RuleSchemeGroup(
+                        name: sourceName,
+                        kind: .urlTest,
+                        members: [.nodePattern(region.nodePattern)],
+                        testURLString: "http://www.gstatic.com/generate_204",
+                        interval: 300,
+                        tolerance: 50
+                    )
+                } else {
+                    continue
+                }
+                let edited = customization?.applying(to: [supplemental]) ?? [supplemental]
+                for group in edited where names.insert(group.name).inserted {
+                    result.append(group)
+                }
+            }
         }
         return result
     }
@@ -560,7 +702,12 @@ struct RuleScheme: Identifiable, Codable, Hashable {
 struct RuleSchemeNetworkSettings: Codable, Hashable {
     var ipv6Enabled: Bool?
     var dnsServers: [String]
+    /// Domestic resolvers, used directly for Chinese and direct traffic.
     var encryptedDNSServers: [String]
+    /// Resolvers reached only through the proxy, for everything else. Empty
+    /// in settings saved before 2026-09-29, which then fall back to
+    /// `towerDefault` rather than sending foreign names to the domestic list.
+    var remoteDNSServers: [String]
     var proxyTestURLString: String?
     var dnsProtectionMode: RuleSchemeDNSProtectionMode
 
@@ -568,12 +715,14 @@ struct RuleSchemeNetworkSettings: Codable, Hashable {
         ipv6Enabled: Bool? = nil,
         dnsServers: [String] = [],
         encryptedDNSServers: [String] = [],
+        remoteDNSServers: [String] = [],
         proxyTestURLString: String? = nil,
         dnsProtectionMode: RuleSchemeDNSProtectionMode = .standard
     ) {
         self.ipv6Enabled = ipv6Enabled
         self.dnsServers = dnsServers
         self.encryptedDNSServers = encryptedDNSServers
+        self.remoteDNSServers = remoteDNSServers
         self.proxyTestURLString = proxyTestURLString
         self.dnsProtectionMode = dnsProtectionMode
     }
@@ -582,6 +731,7 @@ struct RuleSchemeNetworkSettings: Codable, Hashable {
         ipv6Enabled == nil
             && dnsServers.isEmpty
             && encryptedDNSServers.isEmpty
+            && remoteDNSServers.isEmpty
             && proxyTestURLString == nil
             && dnsProtectionMode == .standard
     }
@@ -606,6 +756,7 @@ struct RuleSchemeNetworkSettings: Codable, Hashable {
         case ipv6Enabled
         case dnsServers
         case encryptedDNSServers
+        case remoteDNSServers
         case proxyTestURLString
         case dnsProtectionMode
     }
@@ -618,6 +769,7 @@ struct RuleSchemeNetworkSettings: Codable, Hashable {
             [String].self,
             forKey: .encryptedDNSServers
         ) ?? []
+        remoteDNSServers = try container.decodeIfPresent([String].self, forKey: .remoteDNSServers) ?? []
         proxyTestURLString = try container.decodeIfPresent(
             String.self,
             forKey: .proxyTestURLString
@@ -632,6 +784,7 @@ struct RuleSchemeNetworkSettings: Codable, Hashable {
         try container.encodeIfPresent(ipv6Enabled, forKey: .ipv6Enabled)
         try container.encode(dnsServers, forKey: .dnsServers)
         try container.encode(encryptedDNSServers, forKey: .encryptedDNSServers)
+        if !remoteDNSServers.isEmpty { try container.encode(remoteDNSServers, forKey: .remoteDNSServers) }
         try container.encodeIfPresent(proxyTestURLString, forKey: .proxyTestURLString)
         try container.encode(dnsProtectionMode.rawValue, forKey: .dnsProtectionMode)
     }
@@ -643,8 +796,26 @@ struct RuleSchemeNetworkSettings: Codable, Hashable {
             "https://223.5.5.5/dns-query",
             "https://doh.pub/dns-query",
         ],
+        // Google first: it honours EDNS Client Subnet, which lets Tower ask
+        // for a Chinese answer through the proxy. Cloudflare ignores ECS.
+        // Literal addresses, because the name dns.google is itself blocked
+        // and a domestic resolver may answer it with a forged address.
+        remoteDNSServers: [
+            "https://8.8.8.8/dns-query",
+            "https://1.1.1.1/dns-query",
+        ],
         proxyTestURLString: "http://www.gstatic.com/generate_204"
     )
+
+    var effectiveRemoteDNSServers: [String] {
+        remoteDNSServers.isEmpty ? Self.towerDefault.remoteDNSServers : remoteDNSServers
+    }
+
+    /// Public resolvers known to answer with the client subnet they are given.
+    static func supportsClientSubnet(_ value: String) -> Bool {
+        guard let host = URLComponents(string: value)?.host?.lowercased() else { return false }
+        return ["dns.google", "8.8.8.8", "8.8.4.4", "dns11.quad9.net", "9.9.9.11", "149.112.112.11"].contains(host)
+    }
 }
 
 enum RuleSchemeDNSProtectionMode: String, CaseIterable, Identifiable {
@@ -665,11 +836,11 @@ enum RuleSchemeDNSProtectionMode: String, CaseIterable, Identifiable {
     var summary: String {
         switch self {
         case .followScheme:
-            String(localized: "只使用当前方案的 DNS，不额外启用 Fake-IP 或 DNS 接管。")
+            String(localized: "只使用当前方案的 DNS，不额外启用 Fake-IP 或 DNS 接管。Clash 系客户端会先在本机解析每个域名。")
         case .standard:
-            String(localized: "使用加密 DNS、Fake-IP、节点域名专用解析和 no-resolve。")
+            String(localized: "国内和直连域名用国内 DNS，其余域名交给代理或经代理的远程 DNS，不会发给国内 DNS。")
         case .strict:
-            String(localized: "在支持的客户端中额外接管传统 DNS，并启用严格路由。")
+            String(localized: "在支持的客户端中所有域名都经代理解析，并接管传统 DNS、启用严格路由。")
         }
     }
 }
@@ -750,6 +921,7 @@ enum RuleSchemeNetworkSettingsDraftError: LocalizedError, Equatable {
     case invalidPlainDNS(String)
     case missingEncryptedDNS
     case invalidEncryptedDNS(String)
+    case missingRemoteDNS
     case invalidTestURL(String)
 
     var errorDescription: String? {
@@ -759,9 +931,11 @@ enum RuleSchemeNetworkSettingsDraftError: LocalizedError, Equatable {
         case .invalidPlainDNS(let value):
             String(localized: "普通 DNS 地址无效：\(value)")
         case .missingEncryptedDNS:
-            String(localized: "请至少保留一个加密 DNS 服务器")
+            String(localized: "请至少保留一个国内 DNS 服务器")
         case .invalidEncryptedDNS(let value):
             String(localized: "加密 DNS 地址无效：\(value)")
+        case .missingRemoteDNS:
+            String(localized: "请至少保留一个远程 DNS 服务器")
         case .invalidTestURL(let value):
             String(localized: "测速地址无效：\(value)")
         }
@@ -771,21 +945,29 @@ enum RuleSchemeNetworkSettingsDraftError: LocalizedError, Equatable {
 /// Editable, display-ready values for the native DNS form. Missing fields in
 /// imported schemes inherit Tower's safe defaults instead of appearing blank.
 struct RuleSchemeNetworkSettingsDraft: Equatable {
-    var ipv6Enabled: Bool
+    // Preserve an unspecified value when saving unrelated DNS settings.
+    // Exporters can then apply their own platform-compatible default.
+    var ipv6Override: Bool?
+    var ipv6Enabled: Bool {
+        get { ipv6Override ?? RuleSchemeNetworkSettings.towerDefault.ipv6Enabled ?? true }
+        set { ipv6Override = newValue }
+    }
     var dnsServers: [String]
     var encryptedDNSServers: [String]
+    var remoteDNSServers: [String]
     var proxyTestURLString: String
     var dnsProtectionMode: RuleSchemeDNSProtectionMode
 
     init(settings: RuleSchemeNetworkSettings?) {
         let defaults = RuleSchemeNetworkSettings.towerDefault
-        ipv6Enabled = settings?.ipv6Enabled ?? defaults.ipv6Enabled ?? true
+        ipv6Override = settings?.ipv6Enabled
         dnsServers = settings?.dnsServers.isEmpty == false
             ? settings?.dnsServers ?? defaults.dnsServers
             : defaults.dnsServers
         encryptedDNSServers = settings?.encryptedDNSServers.isEmpty == false
             ? settings?.encryptedDNSServers ?? defaults.encryptedDNSServers
             : defaults.encryptedDNSServers
+        remoteDNSServers = settings?.effectiveRemoteDNSServers ?? defaults.remoteDNSServers
         proxyTestURLString = settings?.proxyTestURLString ?? defaults.proxyTestURLString ?? ""
         dnsProtectionMode = settings?.dnsProtectionMode ?? defaults.dnsProtectionMode
     }
@@ -807,7 +989,19 @@ struct RuleSchemeNetworkSettingsDraft: Equatable {
         }
         for value in encryptedDNS {
             guard let url = URL(string: value),
-                  ["https", "tls", "quic"].contains(url.scheme?.lowercased() ?? ""),
+                  ["https", "h3", "tls", "quic"].contains(url.scheme?.lowercased() ?? ""),
+                  url.host != nil else {
+                throw RuleSchemeNetworkSettingsDraftError.invalidEncryptedDNS(value)
+            }
+        }
+
+        let remoteDNS = normalized(remoteDNSServers)
+        guard !remoteDNS.isEmpty else {
+            throw RuleSchemeNetworkSettingsDraftError.missingRemoteDNS
+        }
+        for value in remoteDNS {
+            guard let url = URL(string: value),
+                  ["https", "h3", "tls", "quic"].contains(url.scheme?.lowercased() ?? ""),
                   url.host != nil else {
                 throw RuleSchemeNetworkSettingsDraftError.invalidEncryptedDNS(value)
             }
@@ -819,9 +1013,10 @@ struct RuleSchemeNetworkSettingsDraft: Equatable {
         let testURL = proxyTestURLString.trimmingCharacters(in: .whitespacesAndNewlines)
 
         return RuleSchemeNetworkSettings(
-            ipv6Enabled: ipv6Enabled,
+            ipv6Enabled: ipv6Override,
             dnsServers: plainDNS,
             encryptedDNSServers: encryptedDNS,
+            remoteDNSServers: remoteDNS,
             proxyTestURLString: testURL,
             dnsProtectionMode: dnsProtectionMode
         )
@@ -862,9 +1057,17 @@ enum RuleSchemeGroupEditorMode: Equatable {
 /// overwrite the user's order, mode, or candidate policies.
 struct RuleSchemeCustomization: Codable, Hashable {
     let schemeID: String
+    /// User-owned filters survive source refreshes independently of overrides.
+    var addedNodeGroups: [RuleSchemeGroup]?
     var groupOrder: [String]
-    /// Explicit rule priority, absent in older display-only customizations.
+    /// Rule priority written by 1.0.6–1.0.21 whenever a group was dragged.
+    /// No longer applied or written; still decoded so `AppModel.apply` can
+    /// clear it and tell the user their routing was restored (issue #40).
     var rulePriorityOrder: [String]?
+    /// Matching order of the rule groups after the user dragged one (issue
+    /// #45). Only groups actually moved change place (`RuleScheme.reordering`);
+    /// unlike the old `rulePriorityOrder` it is never the display order.
+    var matchingOrder: [String]?
     var groupOverrides: [String: RuleSchemeGroupOverride]
     /// Source policy names mapped to user-facing names. Optional keeps every
     /// snapshot written before identity editing decodable without migration.
@@ -879,8 +1082,10 @@ struct RuleSchemeCustomization: Codable, Hashable {
 
     init(
         schemeID: String,
+        addedNodeGroups: [RuleSchemeGroup]? = nil,
         groupOrder: [String] = [],
         rulePriorityOrder: [String]? = nil,
+        matchingOrder: [String]? = nil,
         groupOverrides: [String: RuleSchemeGroupOverride] = [:],
         groupRenames: [String: String]? = nil,
         removedGroupNames: Set<String>? = nil,
@@ -888,8 +1093,10 @@ struct RuleSchemeCustomization: Codable, Hashable {
         overridesNetworkSettings: Bool? = nil
     ) {
         self.schemeID = schemeID
+        self.addedNodeGroups = addedNodeGroups
         self.groupOrder = groupOrder
         self.rulePriorityOrder = rulePriorityOrder
+        self.matchingOrder = matchingOrder
         self.groupOverrides = groupOverrides
         self.groupRenames = groupRenames
         self.removedGroupNames = removedGroupNames
@@ -921,6 +1128,13 @@ struct RuleSchemeCustomization: Codable, Hashable {
                 return removedNames.contains(name)
             }
             let kind = override?.kind ?? group.kind
+            var parameters = group.renamedParameters(using: renamedGroupName)
+            if let patterns = override?.sourceNodePatterns,
+               let data = try? JSONEncoder().encode(patterns),
+               let encoded = String(data: data, encoding: .utf8) {
+                parameters = parameters ?? [:]
+                parameters?["tower-source-patterns"] = encoded
+            }
             return RuleSchemeGroup(
                 name: visibleName,
                 kind: kind,
@@ -931,7 +1145,8 @@ struct RuleSchemeCustomization: Codable, Hashable {
                 algorithm: kind == group.kind && override?.resetsSourceOptions != true ? group.algorithm : nil,
                 sourceType: kind == group.kind && override?.resetsSourceOptions != true ? group.sourceType : nil,
                 sourceFormat: kind == group.kind && override?.resetsSourceOptions != true ? group.sourceFormat : nil,
-                parameters: kind == group.kind && override?.resetsSourceOptions != true ? group.renamedParameters(using: renamedGroupName) : nil
+                parameters: kind == group.kind && override?.resetsSourceOptions != true ? parameters : nil,
+                isCustomNodeFilter: group.isCustomNodeFilter
             )
         }
 
@@ -962,19 +1177,24 @@ struct RuleSchemeGroupOverride: Codable, Hashable {
     var kind: RuleSchemeGroup.Kind?
     var members: [RuleSchemeGroupMember]?
     var resetsSourceOptions: Bool?
+    var sourceNodePatterns: [String]?
 
     init(
         kind: RuleSchemeGroup.Kind? = nil,
         members: [RuleSchemeGroupMember]? = nil,
-        resetsSourceOptions: Bool? = nil
+        resetsSourceOptions: Bool? = nil,
+        sourceNodePatterns: [String]? = nil
     ) {
         self.kind = kind
         self.members = members
         self.resetsSourceOptions = resetsSourceOptions
+        self.sourceNodePatterns = sourceNodePatterns
     }
 }
 
 struct RuleSchemeGroup: Codable, Hashable {
+    /// App metadata, never emitted as a client configuration option.
+    let isCustomNodeFilter: Bool?
     enum Kind: String, Codable {
         case select
         case urlTest
@@ -1035,7 +1255,8 @@ struct RuleSchemeGroup: Codable, Hashable {
         algorithm: String? = nil,
         sourceType: String? = nil,
         sourceFormat: String? = nil,
-        parameters: [String: String]? = nil
+        parameters: [String: String]? = nil,
+        isCustomNodeFilter: Bool? = nil
     ) {
         self.name = name
         self.kind = kind
@@ -1047,6 +1268,7 @@ struct RuleSchemeGroup: Codable, Hashable {
         self.sourceType = sourceType
         self.sourceFormat = sourceFormat
         self.parameters = parameters
+        self.isCustomNodeFilter = isCustomNodeFilter
     }
 
     /// Only policy-valued fields are rewritten; SSIDs and regex keys remain literal.
@@ -1122,4 +1344,47 @@ struct RuleSchemeRuleset: Codable, Hashable {
 
     let groupName: String
     let resource: Resource
+
+    /// Where a materialized ruleset came from, for display only. Never
+    /// persisted and ignored by equality, so generation and caches are
+    /// unaffected.
+    enum Origin: Hashable {
+        /// A condition the user attached to an existing group.
+        case supplement
+        /// A catalog item or a ruleset from the user's library.
+        case added(String)
+    }
+
+    /// mihomo's binary rule set format (`format: mrs`). Tower has no decoder
+    /// for it: it is never downloaded or read as text.
+    var isBinaryRuleSet: Bool {
+        provider?.format?.lowercased() == "mrs" || resource.downloadURL?.pathExtension.lowercased() == "mrs"
+    }
+
+    /// Options on a FINAL or remote reference survive persistence and group edits.
+    var options: [String]? = nil
+    var provider: RuleProviderMetadata? = nil
+    var origin: Origin? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case groupName, resource, options, provider
+    }
+
+    static func == (lhs: RuleSchemeRuleset, rhs: RuleSchemeRuleset) -> Bool {
+        lhs.groupName == rhs.groupName && lhs.resource == rhs.resource
+            && lhs.options == rhs.options && lhs.provider == rhs.provider
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(groupName)
+        hasher.combine(resource)
+        hasher.combine(options)
+        hasher.combine(provider)
+    }
+}
+
+struct RuleProviderMetadata: Codable, Hashable {
+    var behavior: String?
+    var format: String?
+    var interval: Int?
 }

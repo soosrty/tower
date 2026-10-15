@@ -20,7 +20,7 @@
 
 1. 订阅内容、节点和生成配置只在本机处理，不上传到第三方转换或 IP 查询服务。
 2. 域名节点可以使用系统 DNS 解析，但国家识别必须继续查询内置离线 IP 库。
-3. Surge、Stash、Shadowrocket、Loon 的一键导入继续使用仅绑定 `127.0.0.1`、45 秒自动失效的临时服务。
+3. Surge、Stash、Shadowrocket、Loon 的一键导入继续使用仅绑定 `127.0.0.1`、3 分钟自动失效的临时服务。
 4. Quantumult X 没有完整本地配置导入 Scheme，保持系统文件分享，不要伪装成完整一键导入。依据是官方 [url-scheme.md](https://github.com/crossutility/Quantumult-X/blob/master/url-scheme.md)：`update-configuration` 和 `add-resource` 的 `remote-resource` 只接受 `server_remote` / `filter_remote` / `rewrite_remote` 三种**远程资源地址**，`[policy]` 策略组不在其中。只导节点和规则会得到一份引用了不存在策略组的配置。
 5. 国家/地区组默认使用延迟优选，同时保留父级策略中的手动选择入口；不要让地区组互相引用或引用包含自己的上级组。
 6. 策略组名称只显示一个前置 Logo。生成配置时可附带各客户端支持的图标字段，但不要把同一个 Emoji 再拼进可见名称。
@@ -41,6 +41,11 @@
 21. `Tower/Resources/` 下的第三方数据不适用源码的 MIT 许可。新增或更新打包资源时，必须同步更新 `THIRD-PARTY-NOTICES.md` 和对应目录的 NOTICE，注明来源、固定版本和许可证。`LICENSE` 里「仅覆盖源码」那段说明不要删除，即使 GitHub 因此把许可证识别成 `Other`。
 22. 刷新订阅必须保住用户「取消勾选」的节点。节点 id 每次解析都会重新生成，机场又常把剩余流量、倍率写进 remark，塔台自己也会给纯国旗节点重编号——所以不能只按含 name 的精确 identity 匹配。`AppModel.carriedOverExclusions` 是唯一的判定入口：先精确匹配，失配再用去掉 remark 的宽松键，且只有该键在刷新前后都唯一时才认。丢失排除的后果是静默的——节点直接回到每一份导出配置里。
 23. `AppModel.apply()` 必须把 `snapshot.updatedAt` 恢复到 `lastLocalEditAt`。不恢复的话，启动后第一次前台同步会拿 `.distantPast` 去和 iCloud 比，任何远端快照都赢——包括更旧的那份，然后覆盖本地文件。离线时改的订阅会在下次启动被静默丢弃。
+24. Tailscale 内网（`TailnetConnection`）不是节点，不能进任何策略组、测速组或地区组，只接收置顶的 Tailscale 地址段、MagicDNS 后缀和用户子网规则。Auth Key 只存本机钥匙串（`TailnetAuthKeyStore`），不进快照、不同步 iCloud，配置预览里要打码；不要写给 Surge（它按 Key 哈希存身份，会多注册一台设备），Stash 目前没有可用的客户端登录，必须写。`stableSlug` 来自连接 UUID，Surge 配置段名和 mihomo / sing-box 状态目录都依赖它，改了会让每次重新导入都多出一台设备。塔台不代用户登录 Tailscale 或自动生成 Key（OAuth apps 只限同一 tailnet、Key 一次性且 1 小时过期），评估见 `docs/TAILSCALE.md`。
+
+25. 分流规则只按各客户端文档输出：规则类型、选项、内置策略都以 `RoutingRuleCapabilities` / `RoutingBuiltinPolicies` 的白名单为准，选项写在策略名后面。不能表达的规则跳过并提示；拦截规则跳过时，要在兼容性提示最前面说明「这些请求不会被拦截」，但不阻止整份导出。可以换成等价写法的就换（例如 Loon 的 `*.x` 通配改写成「后缀 x 且不是 x 本身」的 `AND`/`NOT` 逻辑规则、sing-box 的 GEOIP / IP-ASN 用内置库展开），不能为了「看起来能导」把 Surge 方言原样透传，也不能改写成更宽的拦截范围。MRS 规则集没有解码器，只给 mihomo 系远程引用。Loon 和 QuanX 先匹配本地规则、再匹配远程列表，远程规则集不能排到任何本地规则前面。IP 规则默认自动加 `no-resolve`；唯一例外是 mihomo 系（不含 Karing 和与 Stash 同文档的「Clash」App）MATCH 前最后一条自动加的 `GEOIP`，而且只在 DNS 经代理带 ECS 解析时（或「跟随方案」）才去掉——别在 DNS 仍走国内解析时去掉，否则列表外的域名会全部泄露给国内 DNS。依据见 `docs/RULE_EXPORT_AUDIT.md`。
+
+26. 规则定制页的「分流规则」是一个列表、所有组都能拖，按**客户端里策略组的声明顺序**（`groupOrder`）排列，和规则首页「查看策略组」、导出到 Stash 等客户端的面板顺序必须一致（「节点选择」排第一）；不要单独拆出「节点分组」。**拖动同时调整被拖组的匹配优先级**（用户 2026-10-15 确认）：`AppModel.matchingOrderAfterDragging` 看这次拖动越过了哪些组——往下拖越过了原本排在它后面匹配的组，就改为紧跟在其中最后匹配的那个之后；往上拖越过了原本排在它前面匹配的组，就改为紧挨在其中最先匹配的那个之前（拖过头、越过多组时也成立）；往上拖从不降低优先级，往下拖从不提高，放下位置与现有匹配先后一致时匹配不变；没有规则的节点组只改面板顺序。结果存 `RuleSchemeCustomization.matchingOrder`，由 `RuleScheme.reordering` 应用：只有被拖的组整组移动，其余组每条规则原地不动，行尾 `GEOIP` 兜底规则留在原处。匹配一旦改变且有域名因此改走别的组（`matchingOrderConflicts` / `RuleGroupDomainMatcher`），必须弹「匹配结果会改变」并可「撤销」（同时恢复 `groupOrder` 和 `matchingOrder`）。绝不能把 `groupOrder` 整张套到规则上（issue #40：会让「节点选择」的 GFW 大列表压过 AI、奈飞、直连和广告拦截）。匹配顺序其余部分 = 来源方案顺序 + 规则库/规则集插到第一条冲突规则前（`customRulesetInsertionIndex`）+ 策略组详情「我添加的规则」（`CustomRuleFlow.isGroupSupplement`）永远最先、按 `SupplementRule.matchingOrder` 从具体到宽泛。`rulePriorityOrder` 只为清理旧数据保留读取，不要再写入或应用。
 
 ## 开发入口
 

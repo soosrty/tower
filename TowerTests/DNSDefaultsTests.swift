@@ -102,6 +102,9 @@ final class DNSDefaultsTests: XCTestCase {
                 .map(String.init)
                 .filter { $0.lowercased().contains("geoip,") }
             for rule in rules {
+                // mihomo cores resolve the terminal GEOIP,CN through the
+                // proxy instead (DNSSplitTests).
+                if ConfigurationGenerator.clashStrictDNSTargets.contains(target), rule.hasSuffix("GEOIP,CN,DIRECT") { continue }
                 XCTAssertTrue(
                     rule.lowercased().contains("no-resolve"),
                     "\(target.name) 的 GEOIP 规则缺少 no-resolve：\(rule)"

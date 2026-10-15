@@ -54,6 +54,47 @@ final class ReviewFixTests: XCTestCase {
             .appendingPathComponent("tower-review-fix-\(UUID().uuidString).json")
     }
 
+    func testSkippedDetailsMatchFilteringAndSurviveRename() {
+        let node = makeNode(name: "Filtered node", server: "192.0.2.1")
+        let generator = ConfigurationGenerator()
+        let output = generator.generateNodeSubscription(nodes: [node], target: .clash, excludedKinds: [.shadowsocks])
+        XCTAssertEqual(output.skippedNodeCount, 1)
+        XCTAssertEqual(output.skippedNodes.map(\.name), [node.name])
+        XCTAssertEqual(output.skippedNodes.first?.reason, String(localized: "已在协议筛选中排除。"))
+        XCTAssertEqual(output.named("Renamed").skippedNodes.count, 1)
+    }
+
+    func testSkippedDetailsExplainCertificatePinsAndExcludeRemoteNodes() {
+        var pinned = makeNode(name: "Pinned node", server: "192.0.2.2")
+        pinned.tls = true
+        pinned.certificateFingerprint = String(repeating: "ab", count: 32)
+        let generator = ConfigurationGenerator()
+        let output = generator.generate(nodes: [pinned], preset: RulePreset.builtIns[0], target: .singBox)
+        XCTAssertEqual(output.skippedNodeCount, 1)
+        XCTAssertEqual(output.skippedNodes.count, 1)
+        XCTAssertEqual(output.skippedNodes.first?.reason, String(localized: "当前客户端无法保留此节点的证书指纹校验。"))
+        let source = SubscriptionSource(name: "Remote", urlString: "https://example.com/sub")
+        pinned.sourceID = source.id
+        let remote = generator.generate(nodes: [pinned], preset: RulePreset.builtIns[0], target: .clash,
+                                        remoteSubscriptions: [RemoteSubscriptionLink(source: source)])
+        XCTAssertEqual(remote.skippedNodeCount, 0)
+        XCTAssertTrue(remote.skippedNodes.isEmpty)
+    }
+
+    @MainActor
+    func testExportCacheLookupNeverGeneratesOrReturnsAnotherMode() async {
+        let model = AppModel(arguments: ["--demo"])
+        let full = model.configurationRequest(target: .surge, contentMode: .fullConfiguration)
+        let nodes = model.configurationRequest(target: .surge, contentMode: .nodesOnly)
+        let before = model.configurationGenerationCount
+        XCTAssertNil(model.cachedConfiguration(for: full))
+        XCTAssertEqual(model.configurationGenerationCount, before)
+        let result = await model.configuration(for: full)
+        XCTAssertEqual(model.cachedConfiguration(for: full)?.content, result.content)
+        XCTAssertNil(model.cachedConfiguration(for: nodes))
+        XCTAssertEqual(model.configurationGenerationCount, before + 1)
+    }
+
     @MainActor
     func testWarmConfigurationPerformanceAudit() {
         let model = AppModel(arguments: ["--demo"])
@@ -201,13 +242,16 @@ final class ReviewFixTests: XCTestCase {
     @MainActor
     func testRefreshReusesFreshHostCountryBeforePublishingNewNodeIDs() async throws {
         let url = "https://provider.example.com/sub"
-        let old = makeNode(name: "Premium", server: "203.0.113.5")
-        let fresh = makeNode(name: "Premium renamed", server: "203.0.113.5")
+        // A host name: literal addresses are answered from the database
+        // directly and never need this cache.
+        let old = makeNode(name: "Premium", server: "premium.example.com")
+        let fresh = makeNode(name: "Premium renamed", server: "premium.example.com")
         let stateURL = temporaryStateURL()
         defer { try? FileManager.default.removeItem(at: stateURL) }
         let store = PersistenceStore(fileURL: stateURL)
         let first = AppModel(persistence: store, subscriptionService: ScriptedFetcher(nodesByURL: [url: [old]]),
-            ipCountryLookupService: makeIPCountryService(range: 0xCB00_7100...0xCB00_71FF, code: "SG"), arguments: [])
+            ipCountryLookupService: makeIPCountryService(range: 0xCB00_7100...0xCB00_71FF, code: "SG",
+                                                         resolvingTo: "203.0.113.5"), arguments: [])
         try await first.addSubscription(name: "机场", urlString: url)
         await first.resolveIPCountries(for: first.nodes)
         let model = AppModel(persistence: store, subscriptionService: ScriptedFetcher(nodesByURL: [url: [fresh]]), arguments: [])
@@ -351,7 +395,8 @@ final class ReviewFixTests: XCTestCase {
 
     /// A two-record offline database, so the lookup path can be exercised
     /// without a network and without the 10 MB bundled table.
-    private func makeIPCountryService(range: ClosedRange<UInt32>, code: String) -> IPCountryLookupService {
+    private func makeIPCountryService(range: ClosedRange<UInt32>, code: String,
+                                      resolvingTo address: String? = nil) -> IPCountryLookupService {
         var record = Data()
         for value in [range.lowerBound, range.upperBound] {
             record.append(contentsOf: [
@@ -361,7 +406,8 @@ final class ReviewFixTests: XCTestCase {
         }
         record.append(contentsOf: Array(code.utf8))
         return IPCountryLookupService(
-            database: IPCountryDatabase(ipv4Data: record, ipv6Data: Data())
+            database: IPCountryDatabase(ipv4Data: record, ipv6Data: Data()),
+            resolver: address.map { address in { _ in [address] } }
         )
     }
 
@@ -417,7 +463,7 @@ final class ReviewFixTests: XCTestCase {
         let stateURL = temporaryStateURL()
         defer { try? FileManager.default.removeItem(at: stateURL) }
         let store = PersistenceStore(fileURL: stateURL)
-        let host = "203.0.113.5"
+        let host = "drift.example.com"
         let node = makeNode(name: "会漂移的域名", server: host)
 
         try store.save(AppSnapshot(
@@ -433,7 +479,8 @@ final class ReviewFixTests: XCTestCase {
             persistence: store,
             ipCountryLookupService: makeIPCountryService(
                 range: 0xCB00_7100...0xCB00_71FF,
-                code: "ZZ"
+                code: "ZZ",
+                resolvingTo: "203.0.113.5"
             ),
             arguments: []
         )

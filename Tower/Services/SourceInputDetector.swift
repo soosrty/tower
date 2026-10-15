@@ -19,6 +19,12 @@ struct SourceInputDetector {
         let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return .unknown }
 
+        if value.hasPrefix("{") || value.hasPrefix("[") {
+            let parsed = parser.parse(data: Data(value.utf8))
+            if parsed.nodes.count == 1, let node = parsed.nodes.first { return .node(node.kind) }
+            if parsed.nodes.count > 1 { return .nodeBatch(count: parsed.nodes.count) }
+        }
+
         let meaningfulLines = value.components(separatedBy: .newlines).filter {
             let line = $0.trimmingCharacters(in: .whitespacesAndNewlines)
             return !line.isEmpty && !line.hasPrefix("#")
@@ -29,6 +35,9 @@ struct SourceInputDetector {
                 return .subscriptionBatch(count: subscriptions.count)
             }
             let parsed = parser.parse(data: Data(value.utf8))
+            // A one-proxy `proxies:` snippet is how SSH and TrustTunnel nodes
+            // are shared (they have no URI), so it reads as a single node.
+            if parsed.nodes.count == 1, let node = parsed.nodes.first { return .node(node.kind) }
             if !parsed.nodes.isEmpty {
                 return .nodeBatch(count: parsed.nodes.count)
             }
@@ -50,12 +59,7 @@ struct SourceInputDetector {
         }
 
         if scheme == "http" || scheme == "https" {
-            let looksLikeProxy = components.user != nil
-                || (components.port != nil
-                    && components.path.isEmpty
-                    && (scheme == "http" || components.fragment != nil))
-            if let node = parser.parseURI(value),
-               looksLikeProxy || isEncodedHTTPProxy(node, originalHost: components.host) {
+            if let node = httpProxyNode(value, components: components, scheme: scheme) {
                 return .node(node.kind)
             }
 
@@ -76,15 +80,23 @@ struct SourceInputDetector {
                   components.host != nil else {
                 return nil
             }
-            let looksLikeProxy = components.user != nil
-                || (components.port != nil && components.path.isEmpty && components.fragment != nil)
-            if looksLikeProxy { return nil }
-            if let node = parser.parseURI(value),
-               isEncodedHTTPProxy(node, originalHost: components.host) {
-                return nil
-            }
-            return value
+            return httpProxyNode(value, components: components, scheme: scheme) == nil ? value : nil
         }
+    }
+
+    /// HTTP(S) proxy links and subscription URLs share a scheme. The single
+    /// and multi-line paths must classify them identically, otherwise two
+    /// `http://host:8080` proxies pasted together import as subscriptions.
+    private func httpProxyNode(_ value: String, components: URLComponents, scheme: String) -> ProxyNode? {
+        let looksLikeProxy = components.user != nil
+            || (components.port != nil
+                && components.path.isEmpty
+                && (scheme == "http" || components.fragment != nil))
+        guard let node = parser.parseURI(value),
+              looksLikeProxy || isEncodedHTTPProxy(node, originalHost: components.host) else {
+            return nil
+        }
+        return node
     }
 
     private func isEncodedHTTPProxy(_ node: ProxyNode, originalHost: String?) -> Bool {

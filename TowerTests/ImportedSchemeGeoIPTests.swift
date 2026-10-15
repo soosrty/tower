@@ -35,7 +35,9 @@ final class ImportedSchemeGeoIPTests: XCTestCase {
                 // sing-box has no GEOIP matcher — it replaced the built-in
                 // database with rule-sets — so `singBoxRuleFields` drops the
                 // rule instead of writing one that cannot resolve.
-                XCTAssertFalse(content.lowercased().contains("geoip"), content)
+                // The removed matcher is the `"geoip"` key; Tower's own inline
+                // rule set is named tower-geoip-<country>.
+                XCTAssertFalse(content.contains(#""geoip""#), content)
                 continue
             }
 

@@ -611,10 +611,65 @@ final class ConfigurationGeneratorTests: XCTestCase {
         XCTAssertFalse(content.contains("tls=true"))
     }
 
+    func testSurgeNodeResourceDoesNotEmitDanglingWireGuardSections() {
+        var wireguard = ProxyNode(kind: .wireguard, name: "WG", server: "wg.example", port: 51820, rawURI: "wg://test")
+        wireguard.wireGuardPrivateKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        wireguard.wireGuardPublicKey = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+        wireguard.wireGuardIPv4 = "10.0.0.2"
+        for target in [ClientTarget.surge, .surgeMac] {
+            let result = ConfigurationGenerator().generateNodeSubscription(nodes: [wireguard], target: target)
+            XCTAssertEqual(result.content, "")
+            XCTAssertEqual(result.supportedNodeCount, 0)
+            XCTAssertEqual(result.skippedNodeCount, 1)
+        }
+    }
+
+    func testSurgeNodeResourceUsesNativePoliciesAndFiltersUnsupportedNodes() {
+        let snell = ProxyNode(kind: .snell, name: "Private", server: "snell.example", port: 443,
+            password: "psk", version: 4, rawURI: "snell://test")
+        let unsupported = ProxyNode(kind: .vless, name: "VLESS", server: "vless.example", port: 443,
+            uuid: "5d1c3d8f-77b7-45c7-98c7-6fa54d37766e", rawURI: "vless://test")
+        for target in [ClientTarget.surge, .surgeMac] {
+            let result = ConfigurationGenerator().generateNodeSubscription(
+                nodes: nodes + [snell, unsupported], target: target, excludedKinds: [.vmess])
+            XCTAssertEqual(result.supportedNodeCount, 2)
+            XCTAssertEqual(result.skippedNodeCount, 2)
+            XCTAssertEqual(result.ruleCount, 0)
+            XCTAssertTrue(result.content.contains("Hong Kong = ss, hk.example.com, 8388"))
+            XCTAssertTrue(result.content.contains("Private = snell, snell.example, 443, psk=psk, version=4"))
+            XCTAssertEqual(result.content.split(separator: "\n").count, 2)
+            for forbidden in ["[Proxy]", "[Rule]", "[Proxy Group]", "[General]", "policy-path=", "Tokyo", "VLESS"] {
+                XCTAssertFalse(result.content.contains(forbidden), forbidden)
+            }
+        }
+    }
+
+    func testAllClashNodeSubscriptionsContainOnlyProxyYAML() {
+        for target in ClientTarget.allCases.filter(\.usesClashFormat) {
+            XCTAssertEqual(target.supportedContentModes, [.fullConfiguration, .nodesOnly], target.name)
+            XCTAssertTrue(target.copiesAggregatedSubscription(mode: .nodesOnly), target.name)
+            XCTAssertFalse(target.supportsDirectImport(mode: .nodesOnly), target.name)
+            let result = ConfigurationGenerator().generateNodeSubscription(
+                nodes: nodes, target: target, excludedKinds: [.vmess], profileName: "Nodes")
+            XCTAssertEqual(result.fileName, "Nodes.yaml", target.name)
+            XCTAssertEqual(result.supportedNodeCount, 1, target.name)
+            XCTAssertEqual(result.skippedNodeCount, 1, target.name)
+            XCTAssertEqual(result.ruleCount, 0, target.name)
+            let rootKeys = result.content.split(separator: "\n").filter { !$0.hasPrefix(" ") }
+            XCTAssertEqual(rootKeys, ["proxies:"], target.name)
+            let parsed = SubscriptionParser().parse(data: Data(result.content.utf8), sourceID: UUID())
+            XCTAssertEqual(parsed.nodes.count, 1, target.name)
+            XCTAssertEqual(parsed.nodes.first?.server, nodes.first?.server, target.name)
+            XCTAssertEqual(parsed.nodes.first?.password, nodes.first?.password, target.name)
+            let empty = ConfigurationGenerator().generateNodeSubscription(nodes: [], target: target)
+            XCTAssertEqual(empty.content, "proxies:\n  []\n", target.name)
+        }
+    }
+
     func testNodeOnlyResourcesContainNodesWithoutRulesOrGroups() {
         let generator = ConfigurationGenerator()
 
-        for target in [ClientTarget.shadowrocket, .loon, .quanx, .hiddify] {
+        for target in [ClientTarget.surge, .surgeMac, .shadowrocket, .loon, .quanx, .hiddify] {
             let result = generator.generateNodeSubscription(
                 nodes: nodes,
                 target: target,

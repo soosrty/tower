@@ -79,6 +79,123 @@ struct IPCountryDatabase: @unchecked Sendable {
         return nil
     }
 
+    /// Every CIDR the database assigns to `countryCode`, IPv4 first. sing-box
+    /// dropped its GeoIP database, so exported profiles spell `GEOIP,CN` out
+    /// as the same address ranges the app uses to recognise node countries.
+    static func cidrs(forCountry countryCode: String) -> [String] {
+        let code = countryCode.uppercased()
+        cidrCacheLock.lock()
+        if let cached = cidrCache[code] { cidrCacheLock.unlock(); return cached }
+        cidrCacheLock.unlock()
+        let result = IPCountryDatabase().cidrs(forCountry: code)
+        cidrCacheLock.lock()
+        cidrCache[code] = result
+        cidrCacheLock.unlock()
+        return result
+    }
+
+    nonisolated(unsafe) private static var cidrCache: [String: [String]] = [:]
+    private static let cidrCacheLock = NSLock()
+
+    func cidrs(forCountry countryCode: String) -> [String] {
+        let code = Array(countryCode.uppercased().utf8)
+        guard code.count == 2 else { return [] }
+        var ranges: [(AddressWord, AddressWord)] = []
+        func matches(_ data: Data, _ offset: Int) -> Bool {
+            data[data.startIndex + offset] == code[0] && data[data.startIndex + offset + 1] == code[1]
+        }
+        func append(_ start: AddressWord, _ end: AddressWord) {
+            // Records are sorted; join neighbours so each block is as wide as possible.
+            if let last = ranges.last, last.1.successor == start {
+                ranges[ranges.count - 1].1 = end
+            } else {
+                ranges.append((start, end))
+            }
+        }
+        for record in 0..<(ipv4Data.count / Self.ipv4RecordSize) {
+            let offset = record * Self.ipv4RecordSize
+            guard matches(ipv4Data, offset + 8) else { continue }
+            append(AddressWord(high: 0, low: UInt64(readUInt32(from: ipv4Data, at: offset))),
+                   AddressWord(high: 0, low: UInt64(readUInt32(from: ipv4Data, at: offset + 4))))
+        }
+        var result = ranges.flatMap { Self.blocks(from: $0.0, to: $0.1, width: 32) }
+        ranges = []
+        for record in 0..<(ipv6Data.count / Self.ipv6RecordSize) {
+            let offset = record * Self.ipv6RecordSize
+            guard matches(ipv6Data, offset + 32) else { continue }
+            append(readWord(from: ipv6Data, at: offset), readWord(from: ipv6Data, at: offset + 16))
+        }
+        result += ranges.flatMap { Self.blocks(from: $0.0, to: $0.1, width: 128) }
+        return result
+    }
+
+    /// A 128-bit address; IPv4 uses the low 32 bits.
+    struct AddressWord: Equatable {
+        var high: UInt64
+        var low: UInt64
+
+        var successor: AddressWord? {
+            if low != .max { return AddressWord(high: high, low: low + 1) }
+            return high == .max ? nil : AddressWord(high: high + 1, low: 0)
+        }
+
+        var trailingZeroBitCount: Int {
+            low != 0 ? low.trailingZeroBitCount : (high != 0 ? 64 + high.trailingZeroBitCount : 128)
+        }
+
+        /// This address with its lowest `bits` bits set.
+        func filling(_ bits: Int) -> AddressWord {
+            if bits == 0 { return self }
+            if bits < 64 { return AddressWord(high: high, low: low | ((1 << UInt64(bits)) - 1)) }
+            let highBits = bits - 64
+            return AddressWord(high: highBits == 64 ? .max : (highBits == 0 ? high : high | ((1 << UInt64(highBits)) - 1)), low: .max)
+        }
+
+        static func <= (lhs: AddressWord, rhs: AddressWord) -> Bool {
+            lhs.high < rhs.high || (lhs.high == rhs.high && lhs.low <= rhs.low)
+        }
+    }
+
+    /// The fewest aligned CIDR blocks covering `start...end`.
+    static func blocks(from start: AddressWord, to end: AddressWord, width: Int) -> [String] {
+        var result: [String] = []
+        var current: AddressWord? = start
+        while let base = current, base <= end {
+            var size = min(base.trailingZeroBitCount, width)
+            while size > 0, !(base.filling(size) <= end) { size -= 1 }
+            result.append("\(format(base, width: width))/\(width - size)")
+            let last = base.filling(size)
+            current = last == end ? nil : last.successor
+        }
+        return result
+    }
+
+    private static func format(_ address: AddressWord, width: Int) -> String {
+        if width == 32 {
+            let value = UInt32(truncatingIfNeeded: address.low)
+            return "\(value >> 24).\((value >> 16) & 0xFF).\((value >> 8) & 0xFF).\(value & 0xFF)"
+        }
+        var bytes = [UInt8](repeating: 0, count: 16)
+        for index in 0..<8 {
+            bytes[index] = UInt8(truncatingIfNeeded: address.high >> UInt64(56 - index * 8))
+            bytes[index + 8] = UInt8(truncatingIfNeeded: address.low >> UInt64(56 - index * 8))
+        }
+        var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+        return bytes.withUnsafeBytes { raw in
+            inet_ntop(AF_INET6, raw.baseAddress, &buffer, socklen_t(buffer.count)).map { String(cString: $0) } ?? ""
+        }
+    }
+
+    private func readWord(from data: Data, at offset: Int) -> AddressWord {
+        var high: UInt64 = 0, low: UInt64 = 0
+        let start = data.startIndex + offset
+        for index in 0..<8 {
+            high = high << 8 | UInt64(data[start + index])
+            low = low << 8 | UInt64(data[start + 8 + index])
+        }
+        return AddressWord(high: high, low: low)
+    }
+
     private func readUInt32(from data: Data, at offset: Int) -> UInt32 {
         let start = data.startIndex + offset
         return (UInt32(data[start]) << 24)
@@ -123,7 +240,7 @@ actor IPCountryLookupService {
         let expiresAt: Date
     }
 
-    private let database: IPCountryDatabase
+    private nonisolated let database: IPCountryDatabase
     private let successTTL: TimeInterval
     private let failureTTL: TimeInterval
     private let resolver: @Sendable (String) async -> [String]
@@ -133,8 +250,11 @@ actor IPCountryLookupService {
 
     init(
         database: IPCountryDatabase = IPCountryDatabase(),
-        successTTL: TimeInterval = 3600,
-        failureTTL: TimeInterval = 30,
+        // A proxy server's address rarely moves and the country database is
+        // offline and fixed per release: a day is plenty. Only a DNS failure
+        // is worth retrying soon, and not every half minute.
+        successTTL: TimeInterval = 86_400,
+        failureTTL: TimeInterval = 600,
         resolver: (@Sendable (String) async -> [String])? = nil
     ) {
         self.database = database
@@ -147,6 +267,18 @@ actor IPCountryLookupService {
 
     func countryCode(forHost host: String) async -> String? {
         await info(forHost: host).countryCode
+    }
+
+    /// The country of a literal address, answered from the offline database
+    /// without DNS; `nil` for host names. Cheap enough for a row to ask while
+    /// it is being built, so an IP node never shows a placeholder first.
+    nonisolated func countryCode(forLiteralAddress host: String) -> String? {
+        let normalized = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        var v4 = in_addr()
+        var v6 = in6_addr()
+        guard inet_pton(AF_INET, normalized, &v4) == 1 || inet_pton(AF_INET6, normalized, &v6) == 1 else { return nil }
+        return database.countryCode(forIPAddress: normalized)
     }
 
     func organizations(forHost host: String) async -> [NetworkOrganization] {
@@ -186,8 +318,11 @@ actor IPCountryLookupService {
         inFlight[normalized] = nil
         if cache.count >= 8000 { cache = cache.filter { $0.value.expiresAt > .now } }
         if cache.count >= 8000 { cache.removeAll(keepingCapacity: true) }
+        // Resolved but absent from the database is a settled answer, not a
+        // failure: asking again returns the same thing. Only no address at
+        // all (DNS failed) retries after the short failure window.
         cache[normalized] = CachedResult(info: info, expiresAt: .now.addingTimeInterval(
-            info.countryCode == nil ? failureTTL : successTTL
+            info.addresses.isEmpty ? failureTTL : successTTL
         ))
         return info
     }

@@ -1,0 +1,7 @@
+Anywhere icon, downloaded 2026-09-14 from the official README asset:
+https://storage.argsment.com/Anywhere-AppIcon-iOS.png
+Upstream reference: NodePassProject/Anywhere commit 9ae49a73a0cf15317712545f9ead679da43cd308.
+Copyright its respective owners; used solely to identify the official client.
+Not covered by Tower's MIT license. No Anywhere source code is bundled.
+
+2026-09-27: resized proportionally to 180 px on the longest side for display performance; artwork unchanged.

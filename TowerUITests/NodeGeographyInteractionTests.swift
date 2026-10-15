@@ -21,6 +21,16 @@ final class NodeGeographyInteractionTests: XCTestCase {
         let details = app.buttons["节点详情"]
         XCTAssertTrue(details.waitForExistence(timeout: 3))
         details.tap()
+        let organization = app.staticTexts["网络组织"]
+        XCTAssertTrue(organization.waitForExistence(timeout: 10))
+        let retest = app.buttons["重新测试延迟"]
+        XCTAssertTrue(retest.waitForExistence(timeout: 5))
+        let initialY = retest.frame.minY
+        retest.tap()
+        expectation(for: NSPredicate(format: "enabled == true"), evaluatedWith: retest)
+        waitForExpectations(timeout: 30)
+        XCTAssertFalse(app.staticTexts["测试方式"].exists)
+        XCTAssertEqual(retest.frame.minY, initialY, accuracy: 2, "Latency results must not insert a detail row")
         app.buttons["设置地区"].tap()
         let search = app.searchFields.firstMatch
         XCTAssertTrue(search.waitForExistence(timeout: 3))

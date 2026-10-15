@@ -84,6 +84,7 @@ struct SharePayloadSheet: View {
                 }
             }
             .task(id: payload.id) { await renderQRCode() }
+            .towerFeedback(.success, trigger: copied)
         }
         .presentationDetents([.large])
     }

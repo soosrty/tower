@@ -197,8 +197,8 @@ final class CloudSyncTriggerTests: XCTestCase {
             "欢迎页关闭前，启动任务和前台任务都不能在遮罩下面联网：\n\(source)"
         )
         // Two call sites each: the launch task and the foreground change.
-        XCTAssertEqual(occurrences(of: "synchronizeWithCloud()", in: source), 2, source)
-        XCTAssertEqual(occurrences(of: "refreshOnOpenIfEnabled()", in: source), 2, source)
+        XCTAssertEqual(occurrences(of: "performForegroundOpenWork()", in: source), 2, source)
+        XCTAssertTrue(source.contains("if phase == .background { model.didEnterBackground() }"), source)
     }
 
     private func occurrences(of needle: String, in haystack: String) -> Int {

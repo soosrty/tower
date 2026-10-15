@@ -118,36 +118,51 @@ final class DirectImportServiceTests: XCTestCase {
 
             XCTAssertEqual(components.scheme, scheme, target.name)
             XCTAssertEqual(components.host, "install-config", target.name)
-            XCTAssertEqual(
-                components.queryItems?.first(where: { $0.name == "url" })?.value,
-                localURL.absoluteString,
-                target.name
-            )
-            XCTAssertEqual(
-                components.queryItems?.first(where: { $0.name == "name" })?.value,
-                "塔台 配置",
-                target.name
-            )
+            // Karing's copy carries a per-import revision; the resource is the same.
+            let served = try XCTUnwrap(components.queryItems?.first(where: { $0.name == "url" })?.value)
+            XCTAssertTrue(served.hasPrefix(localURL.absoluteString), target.name)
+            // Karing also rejects a name it already has, so its copy is dated.
+            let name = try XCTUnwrap(components.queryItems?.first(where: { $0.name == "name" })?.value)
+            XCTAssertTrue(target == .karing ? name.hasPrefix("塔台 配置 ") : name == "塔台 配置", "\(target.name): \(name)")
         }
     }
 
-    func testClashMiAndKaringKeepAStableRemoteIdentityAcrossExports() throws {
-        for target in [ClientTarget.clashMi, .karing] {
-            let first = try ClientImportURLBuilder.make(
-                target: target,
-                configurationURL: localURL,
-                displayName: "塔台",
-                importRevision: "first"
-            )
-            let second = try ClientImportURLBuilder.make(
-                target: target,
-                configurationURL: localURL,
-                displayName: "塔台",
-                importRevision: "second"
-            )
+    func testClashMiKeepsAStableRemoteIdentityAcrossExports() throws {
+        let first = try ClientImportURLBuilder.make(
+            target: .clashMi, configurationURL: localURL, displayName: "塔台", importRevision: "first"
+        )
+        let second = try ClientImportURLBuilder.make(
+            target: .clashMi, configurationURL: localURL, displayName: "塔台", importRevision: "second"
+        )
+        XCTAssertEqual(first, second, "Clash Mi 不应因重复导出创建新来源地址")
+    }
 
-            XCTAssertEqual(first, second, "\(target.name) 不应因重复导出创建新来源地址")
-        }
+    /// Karing skips a URL it already has instead of updating it, so a second
+    /// export only imported after the user deleted the first profile.
+    func testKaringGetsANewSourceURLForEachExport() throws {
+        let first = try ClientImportURLBuilder.make(
+            target: .karing, configurationURL: localURL, displayName: "塔台", importRevision: "first"
+        )
+        let second = try ClientImportURLBuilder.make(
+            target: .karing, configurationURL: localURL, displayName: "塔台", importRevision: "second"
+        )
+        XCTAssertNotEqual(first, second)
+        let dated = try ClientImportURLBuilder.make(
+            target: .karing, configurationURL: localURL, displayName: "塔台", importRevision: "x",
+            importDate: Date(timeIntervalSince1970: 0)
+        )
+        let name = URLComponents(url: dated, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "name" }?.value
+        XCTAssertNotNil(name?.range(of: #"^塔台 \d{2}-\d{2} \d{2}:\d{2}:\d{2}$"#, options: .regularExpression), name ?? "")
+        let served = try XCTUnwrap(URLComponents(url: first, resolvingAgainstBaseURL: false)?
+            .queryItems?.first { $0.name == "url" }?.value)
+        let servedURL = try XCTUnwrap(URL(string: served))
+        // The local server drops the query before matching, so the same
+        // resource still answers.
+        XCTAssertEqual(servedURL.query, "tower-import=first")
+        XCTAssertTrue(LocalConfigurationServer.matchesRequestPath(
+            try XCTUnwrap(URLComponents(url: servedURL, resolvingAgainstBaseURL: false)?.percentEncodedPath),
+            configurationURL: localURL
+        ))
     }
 
     func testSingBoxMTUsesOfficialRemoteProfileImportScheme() throws {
@@ -204,6 +219,46 @@ final class DirectImportServiceTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? DirectImportError, .unsupportedTarget(.quanx))
         }
+    }
+
+    @MainActor
+    func testCopiedSurgeResourceUsesLoopbackAndCanBeUpdatedWithoutInstallingProfile() async throws {
+        let service = DirectImportService()
+        defer { service.stop() }
+        for target in [ClientTarget.surge, .surgeMac] {
+            func fixture(_ content: String) -> GeneratedConfiguration {
+                GeneratedConfiguration(target: target, content: content, supportedNodeCount: 1,
+                    skippedNodeCount: 0, ruleCount: 0, contentMode: .nodesOnly, fileExtensionOverride: "txt")
+            }
+            let first = try await service.prepareNodeSubscriptionURL(fixture("First = ss, first.example, 443"))
+            XCTAssertEqual(first.scheme, "http")
+            XCTAssertEqual(first.host, "127.0.0.1")
+            let (data, response) = try await URLSession.shared.data(from: first)
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+            XCTAssertEqual(String(decoding: data, as: UTF8.self), "First = ss, first.example, 443")
+            let second = try await service.prepareNodeSubscriptionURL(fixture("Second = ss, second.example, 443"))
+            XCTAssertEqual(first, second)
+            let (updated, _) = try await URLSession.shared.data(from: first)
+            XCTAssertEqual(String(decoding: updated, as: UTF8.self), "Second = ss, second.example, 443")
+            let other = GeneratedConfiguration(target: .loon, content: "other dialect", supportedNodeCount: 1,
+                skippedNodeCount: 0, ruleCount: 0, contentMode: .nodesOnly, fileExtensionOverride: "txt")
+            _ = try await service.prepare(other)
+            let (_, oldResponse) = try await URLSession.shared.data(from: first)
+            XCTAssertEqual((oldResponse as? HTTPURLResponse)?.statusCode, 404)
+        }
+    }
+
+    func testSurgeNodeModeCopiesResourceInsteadOfInstallingAProfile() {
+        for target in [ClientTarget.surge, .surgeMac] {
+            XCTAssertEqual(target.supportedContentModes, [.fullConfiguration, .nodesOnly])
+            XCTAssertTrue(target.copiesAggregatedSubscription(mode: .nodesOnly))
+            XCTAssertFalse(target.copiesAggregatedSubscription(mode: .fullConfiguration))
+            XCTAssertTrue(target.supportsDirectImport(mode: .fullConfiguration))
+            XCTAssertFalse(target.supportsDirectImport(mode: .nodesOnly))
+            XCTAssertThrowsError(try ClientImportURLBuilder.make(target: target,
+                configurationURL: localURL, contentMode: .nodesOnly))
+        }
+        XCTAssertFalse(ClientTarget.shadowrocket.copiesAggregatedSubscription(mode: .nodesOnly))
     }
 
     func testNodeOnlySchemesKeepExistingClientRules() throws {
@@ -429,7 +484,7 @@ extension DirectImportServiceTests {
 
     func testFileOnlyClientsDoNotAdvertiseAFullConfigurationScheme() {
         let withoutScheme = ClientTarget.allCases.filter { !$0.supportsDirectConfigurationImport }
-        XCTAssertEqual(withoutScheme, [.quanx, .v2box, .clashMac])
+        XCTAssertEqual(withoutScheme, [.quanx, .v2box, .anywhere, .clashMac])
     }
 }
 

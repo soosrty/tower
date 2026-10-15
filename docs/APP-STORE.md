@@ -35,7 +35,7 @@
 
 转换不经过在线转换服务。用户可主动开启自己的 iCloud 同步，或在兼容客户端配置中引用原始订阅 URL；这些功能默认关闭并有说明。开发者不收集订阅、节点或使用数据。
 
-Info.plist 的 NSAllowsArbitraryLoads 用于用户自行提供的 HTTP 订阅地址和本机配置交接服务；HTTP 输入会提示明文风险。正常一键导入只绑定 127.0.0.1、45 秒失效。用户单独开启局域网共享时才请求本地网络权限，并通过随机访问密钥保护配置。
+Info.plist 的 NSAllowsArbitraryLoads 用于用户自行提供的 HTTP 订阅地址和本机配置交接服务；HTTP 输入会提示明文风险。正常一键导入只绑定 127.0.0.1、3 分钟失效。用户单独开启局域网共享时才请求本地网络权限，并通过随机访问密钥保护配置。
 
 无登录功能，不需要演示账号。转换测试需要脱敏的订阅样本，不要向审核备注附加个人真实订阅凭据。源码：https://github.com/pengchujin/tower
 
@@ -47,7 +47,8 @@ Info.plist 的 NSAllowsArbitraryLoads 用于用户自行提供的 HTTP 订阅地
 | 支持 URL | https://pengchujin.github.io/tower/support.html |
 | 隐私政策 URL | https://pengchujin.github.io/tower/privacy.html |
 | 营销 URL | 可留空 |
-| 设备 | 当前仅 iPhone |
+| 设备 | iPhone、iPad；Mac 版通过 GitHub Releases 和 Homebrew 分发 |
+| 截图 | iPhone 6.9″ 与 iPad 13″ 各 5 张，Mac 4 张；拍摄方法见 [DEVELOPMENT](DEVELOPMENT.md#app-store-截图) |
 | 隐私问卷 | 按实际无开发者数据收集行为填写，并与隐私政策、PrivacyInfo.xcprivacy 核对 |
 | 出口合规 | 当前工程 ITSAppUsesNonExemptEncryption = NO；引入新的加密实现时重新评估 |
 

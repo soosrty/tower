@@ -151,4 +151,83 @@ final class NodeSelectionTests: XCTestCase {
         XCTAssertEqual(Set(model.enabledNodes.map(\.id)), Set(nodes.map(\.id)))
         XCTAssertNil(try store.load()?.excludedNodeIDs)
     }
+
+    @MainActor
+    func testSavedNameConditionFiltersNewNodesAndBothExportModes() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tower-export-name-filter-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PersistenceStore(fileURL: fileURL)
+        let source = SubscriptionSource(name: "Airport", urlString: "https://example.com/sub")
+        func node(_ name: String) -> ProxyNode {
+            ProxyNode(sourceID: source.id, kind: .shadowsocks, name: name,
+                server: "example.com", port: 443, cipher: "aes-128-gcm",
+                password: "test", rawURI: "ss://test")
+        }
+        let initial = [node("US IEPL 01"), node("US 普通 02")]
+        try store.save(AppSnapshot(subscriptions: [source], nodes: initial,
+            selectedPresetID: AppModel.defaultRuleSchemeID, selectedTarget: .surge))
+
+        let model = AppModel(persistence: store, arguments: [])
+        try model.setNodeExportNameFilter(.init(pattern: "(?i)IEPL", ignoresCase: true))
+        XCTAssertEqual(model.enabledNodes.map(\.name), ["US IEPL 01"])
+        XCTAssertEqual(model.configuration(target: .hiddify, contentMode: .nodesOnly).supportedNodeCount, 1)
+        XCTAssertEqual(model.configuration(target: .surge, contentMode: .fullConfiguration).supportedNodeCount, 1)
+        XCTAssertFalse(model.isNodeAllowedByName(initial[1]))
+
+        let restored = AppModel(persistence: store, arguments: [])
+        XCTAssertEqual(restored.nodeExportNameFilter?.pattern, "(?i)IEPL")
+        restored.nodes.append(contentsOf: [node("SG iepl 03"), node("SG 普通 04")])
+        XCTAssertEqual(restored.enabledNodes.map(\.name), ["US IEPL 01", "SG iepl 03"])
+        XCTAssertEqual(restored.configuration(target: .hiddify, contentMode: .nodesOnly).supportedNodeCount, 2)
+        for target in ClientTarget.allCases {
+            for mode in target.supportedContentModes {
+                let output = restored.configuration(target: target, contentMode: mode)
+                XCTAssertEqual(output.supportedNodeCount, 2, "\(target) \(mode)")
+            }
+        }
+        restored.setNode(initial[0], included: false)
+        XCTAssertThrowsError(try restored.setNodeExportNameFilter(.init(pattern: "[", ignoresCase: true)))
+        XCTAssertEqual(restored.enabledNodes.count, 1)
+        try restored.setNodeExportNameFilter(.init(pattern: "  \n", ignoresCase: true))
+        XCTAssertNil(restored.nodeExportNameFilter)
+        XCTAssertNil(try store.load()?.nodeExportNameFilter)
+        XCTAssertEqual(restored.enabledNodes.count, 3)
+        XCTAssertFalse(restored.isNodeIncluded(initial[0]))
+    }
+
+    @MainActor
+    func testTogglingNodesReusesNameConditionMatches() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tower-name-filter-cache-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PersistenceStore(fileURL: fileURL)
+        let source = SubscriptionSource(name: "Airport", urlString: "https://example.com/sub")
+        func node(_ name: String) -> ProxyNode {
+            ProxyNode(sourceID: source.id, kind: .shadowsocks, name: name,
+                server: "example.com", port: 443, cipher: "aes-128-gcm",
+                password: "test", rawURI: "ss://test")
+        }
+        let initial = [node("US IEPL 01"), node("US 普通 02"), node("JP IEPL 03")]
+        try store.save(AppSnapshot(subscriptions: [source], nodes: initial,
+            selectedPresetID: AppModel.defaultRuleSchemeID, selectedTarget: .surge))
+
+        let model = AppModel(persistence: store, arguments: [])
+        try model.setNodeExportNameFilter(.init(pattern: "IEPL", ignoresCase: true))
+        XCTAssertEqual(model.enabledNodes.map(\.name), ["US IEPL 01", "JP IEPL 03"])
+        let evaluations = model.nodeNameFilterEvaluationCount
+
+        for included in [false, true, false] {
+            model.setNode(initial[0], included: included)
+            XCTAssertEqual(model.enabledNodes.map(\.name),
+                           included ? ["US IEPL 01", "JP IEPL 03"] : ["JP IEPL 03"])
+        }
+        XCTAssertEqual(model.nodeNameFilterEvaluationCount, evaluations,
+                       "勾选节点不应重新执行名称匹配")
+        XCTAssertNil(model.nodeExportNameFilterError)
+
+        model.nodes.append(node("SG iepl 04"))
+        XCTAssertEqual(model.enabledNodes.map(\.name), ["JP IEPL 03", "SG iepl 04"])
+        XCTAssertEqual(model.nodeNameFilterEvaluationCount, evaluations + 1)
+    }
 }

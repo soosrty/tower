@@ -34,6 +34,36 @@ final class ExportPresentationTests: XCTestCase {
     }
 
     @MainActor
+    func testPreviewAccessibilityPreservesFullPlainTextAndTracksUpdates() {
+        let preview = AccessibleConfigurationPreview(isScrollEnabled: true)
+        let content = String(repeating: "🇯🇵 node = ss, 192.0.2.1, 443\n", count: 5000)
+        preview.render(content, spans: [])
+        XCTAssertTrue(preview.isAccessibilityElement)
+        XCTAssertTrue(preview.accessibilityTraits.contains(.staticText))
+        XCTAssertTrue(preview.textView.accessibilityElementsHidden)
+        XCTAssertEqual(preview.accessibilityLabel, content)
+        XCTAssertEqual(preview.textView.text, content)
+        XCTAssertTrue(preview.textView.isSelectable)
+        preview.render("replacement", spans: [])
+        XCTAssertEqual(preview.accessibilityLabel, "replacement")
+        XCTAssertEqual(preview.textView.text, "replacement")
+    }
+
+    @MainActor
+    func testPreviewAccessibilityScrollRespectsContentBounds() {
+        let preview = AccessibleConfigurationPreview(isScrollEnabled: true)
+        preview.frame = CGRect(x: 0, y: 0, width: 320, height: 400)
+        preview.layoutIfNeeded()
+        preview.textView.contentSize = CGSize(width: 320, height: 1200)
+        XCTAssertFalse(preview.accessibilityScroll(.up))
+        XCTAssertTrue(preview.accessibilityScroll(.down))
+        XCTAssertEqual(preview.textView.contentOffset.y, 320)
+        XCTAssertTrue(preview.accessibilityScroll(.up))
+        XCTAssertEqual(preview.textView.contentOffset.y, 0)
+        XCTAssertFalse(preview.accessibilityScroll(.left))
+    }
+
+    @MainActor
     func testConfigurationEditorUsesGitHubStyleLineNumbersAndUnwrappedCode() {
         let editor = ConfigurationEditorTextViewFactory.make()
 
@@ -198,7 +228,7 @@ final class ExportPresentationTests: XCTestCase {
         XCTAssertEqual(target.supportedContentModes, [.fullConfiguration])
         XCTAssertTrue(target.supportsDirectImport(mode: .fullConfiguration))
         XCTAssertFalse(target.supportsDirectImport(mode: .nodesOnly))
-        XCTAssertEqual(ClientTargetOrder.defaultOrder.firstIndex(of: target), 7)
+        XCTAssertEqual(ClientTargetOrder.defaultOrder.firstIndex(of: target), 8)
     }
 
     func testClashMiAndKaringKeepTheirPositionsWhenDesktopClientsAreAdded() throws {
@@ -278,14 +308,36 @@ final class ExportPresentationTests: XCTestCase {
         XCTAssertEqual(draft.committedName, "家庭网络配置")
     }
 
-    func testConfigurationNameDraftLoadsThePersistedNameOnlyOncePerEditingSession() {
-        var draft = ConfigurationNameDraft()
+    func testUntouchedConfigurationNameDraftFollowsARestoredName() {
+        var draft = ConfigurationNameDraft(text: "-QA塔台")
 
-        draft.loadPersistedNameIfNeeded("塔台")
-        draft.text = "tower"
-        draft.loadPersistedNameIfNeeded("塔台")
+        draft.followSavedName("塔台")
 
-        XCTAssertEqual(draft.text, "tower", "视图再次出现时不能用旧配置覆盖正在输入的名称")
+        XCTAssertFalse(draft.isEdited)
+        XCTAssertEqual(draft.text, "塔台")
+        XCTAssertEqual(draft.committedName, "塔台", "关闭设置时不能把恢复前的旧名称写回去")
+    }
+
+    func testEditedConfigurationNameDraftKeepsTypedNameWhenSavedNameChanges() {
+        var draft = ConfigurationNameDraft(text: "塔台")
+        draft.text = "家庭网络"
+
+        draft.followSavedName("iCloud 名称")
+
+        XCTAssertTrue(draft.isEdited)
+        XCTAssertEqual(draft.text, "家庭网络", "正在输入的名称不能被同步拉下来的名称覆盖")
+        XCTAssertEqual(draft.committedName, "家庭网络")
+        draft.text = "iCloud 名称"
+        XCTAssertFalse(draft.isEdited)
+    }
+
+    func testFollowedConfigurationNameSurvivesATransientEmptyWrite() {
+        var draft = ConfigurationNameDraft(text: "-QA塔台")
+
+        draft.followSavedName("塔台")
+        draft.text = ""
+
+        XCTAssertEqual(draft.committedName, "塔台", "结束编辑时的临时空值不能退回跟随前的旧名称")
     }
 
     func testConfigurationNameDraftKeepsTheLastValidNameWhenTextFieldEndsWithATransientEmptyWrite() {

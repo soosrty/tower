@@ -3,7 +3,7 @@ import XCTest
 
 /// TUIC and Hysteria 1 are the two protocols Mihomo carries that real airports
 /// actually ship and that at least one target client can express. Everything
-/// else missing from Tower's list (mieru, shadowquic, masque, trusttunnel,
+/// else missing from Tower's list (mieru, shadowquic, trusttunnel,
 /// sudoku, tailscale, openvpn, ssh) has no target support to write it into, so
 /// importing it would only produce nodes that look healthy and never connect.
 ///
@@ -432,6 +432,25 @@ final class TUICHysteriaTests: XCTestCase {
     /// `password=`, so both clients keep it. This pins the verified spelling
     /// against a future reader who compares the manual to the code and
     /// "corrects" it; see docs/HANDOFF.md.
+    func testHysteria2CertificatePinSurvivesPersistenceAndSurgeExport() throws {
+        let compactPin = String(repeating: "AB", count: 32)
+        let colonPin = Array(repeating: "AB", count: 32).joined(separator: ":")
+        for pin in [compactPin, colonPin] {
+            let parsed = try XCTUnwrap(parser.parseURI(hysteria2URI + "&pinSHA256=\(pin)&fp=chrome"))
+            let node = try JSONDecoder().decode(ProxyNode.self, from: JSONEncoder().encode(parsed))
+            XCTAssertEqual(node.certificateFingerprint, pin)
+            XCTAssertEqual(node.fingerprint, "chrome")
+            for target: ClientTarget in [.surge, .surgeMac] {
+                let line = try proxyLine(for: node, target: target)
+                XCTAssertTrue(line.contains("server-cert-fingerprint-sha256=\(compactPin)"), line)
+                XCTAssertFalse(line.contains("server-cert-fingerprint-sha256=chrome"), line)
+                XCTAssertTrue(line.contains("skip-cert-verify=true"), line)
+            }
+        }
+        let unpinned = try XCTUnwrap(parser.parseURI(hysteria2URI))
+        XCTAssertFalse(try proxyLine(for: unpinned, target: .surge).contains("server-cert-fingerprint-sha256"))
+    }
+
     func testHysteria2KeepsThePasswordSpellingVerifiedOnDevice() throws {
         let node = try XCTUnwrap(parser.parseURI(hysteria2URI))
 
@@ -486,7 +505,7 @@ final class TUICHysteriaTests: XCTestCase {
 
     func testClashWritesTUICAndHysteriaWithMihomoKeys() {
         let content = ConfigurationGenerator()
-            .generate(nodes: [tuicNode(), hysteriaNode()], preset: RulePreset.builtIns[0], target: .clash)
+            .generate(nodes: [tuicNode(), hysteriaNode()], preset: RulePreset.builtIns[0], target: .clashApple)
             .content
 
         XCTAssertTrue(content.contains("type: tuic"), content)
@@ -509,11 +528,18 @@ final class TUICHysteriaTests: XCTestCase {
         node.downMbps = nil
 
         let content = ConfigurationGenerator()
-            .generate(nodes: [node], preset: RulePreset.builtIns[0], target: .clash)
+            .generate(nodes: [node], preset: RulePreset.builtIns[0], target: .clashApple)
             .content
 
         XCTAssertTrue(content.contains("up: 50"), content)
         XCTAssertTrue(content.contains("down: 100"), content)
+
+        // Stash spells the same budget `up-speed` / `down-speed`.
+        let stash = ConfigurationGenerator()
+            .generate(nodes: [node], preset: RulePreset.builtIns[0], target: .clash)
+            .content
+        XCTAssertTrue(stash.contains("up-speed: 50"), stash)
+        XCTAssertTrue(stash.contains("down-speed: 100"), stash)
     }
 
     func testEgernWritesTUICWithAnALPNList() {
@@ -840,6 +866,220 @@ final class ManualNodeDraftTests: XCTestCase {
             XCTAssertEqual(rebuilt.udpRelayMode, original.udpRelayMode, uri)
             XCTAssertEqual(rebuilt.upMbps, original.upMbps, uri)
             XCTAssertEqual(rebuilt.downMbps, original.downMbps, uri)
+        }
+    }
+}
+
+final class MASQUETests: XCTestCase {
+    private let sample = "MASQUE Test = masque, proxy.example.com, 443, username=test, password=secret, sni=tls.example.com, alpn=h3"
+
+    func testBasicMASQUEImportAndClientBoundary() throws {
+        let parser = SubscriptionParser()
+        let node = try XCTUnwrap(parser.parseURI(sample))
+        XCTAssertEqual(node.kind.rawValue, "masque")
+        XCTAssertEqual(node.username, "test")
+        XCTAssertEqual(node.password, "secret")
+        XCTAssertTrue(node.tls)
+        XCTAssertEqual(parser.parse(data: Data("[Proxy]\n\(sample)".utf8)).nodes.count, 1)
+        XCTAssertEqual(SourceInputDetector().detect(sample), .node(node.kind))
+        for target in ClientTarget.allCases {
+            let output = ConfigurationGenerator().generate(nodes: [node], preset: RulePreset.builtIns[0], target: target)
+            XCTAssertEqual(output.supportedNodeCount, [.surge, .surgeMac].contains(target) ? 1 : 0, target.name)
+            let subscription = ConfigurationGenerator().generateNodeSubscription(nodes: [node], target: target)
+            XCTAssertEqual(subscription.supportedNodeCount, [.surge, .surgeMac].contains(target) ? 1 : 0, target.name)
+            if [.surge, .surgeMac].contains(target) {
+                XCTAssertTrue(output.content.contains(" = masque, proxy.example.com, 443"))
+                XCTAssertTrue(output.content.contains("username=test"))
+            }
+        }
+        let restored = try JSONDecoder().decode(ProxyNode.self, from: JSONEncoder().encode(node))
+        XCTAssertEqual(restored, node)
+        let shared = ProxyNodeShareLinkGenerator().canonicalLink(for: node)
+        XCTAssertEqual(parser.parseURI(shared)?.password, "secret")
+        XCTAssertEqual(try ManualNodeDraft(node: node).makeNode().username, "test")
+    }
+
+    func testMASQUECertificatePinAndManualRoundTrip() throws {
+        let pin = String(repeating: "ab", count: 32)
+        let node = try XCTUnwrap(SubscriptionParser().parseURI(sample + ", server-cert-fingerprint-sha256=" + pin))
+        let restored = try ManualNodeDraft(node: node).makeNode()
+        let line = ProxyNodeShareLinkGenerator().canonicalLink(for: restored)
+        XCTAssertTrue(line.contains("server-cert-fingerprint-sha256=" + pin))
+        XCTAssertEqual(SubscriptionParser().parseURI(line)?.certificateFingerprint, pin)
+        var invalid = node
+        invalid.password = "secret,username=other"
+        let output = ConfigurationGenerator().generate(nodes: [invalid], preset: RulePreset.builtIns[0], target: .surge)
+        XCTAssertEqual(output.supportedNodeCount, 0)
+        XCTAssertEqual(output.skippedNodeCount, 1)
+        let yaml = "proxies:\n  - name: WARP\n    type: masque\n    server: proxy.example.com\n    port: 443\n    private-key: not-basic-auth"
+        XCTAssertTrue(SubscriptionParser().parse(data: Data(yaml.utf8)).nodes.isEmpty)
+    }
+
+    func testMASQUERejectsUnrepresentedOptionsAndInvalidEndpoints() {
+        let parser = SubscriptionParser()
+        for extra in [", skip-cert-verify=invalid", ", underlying-proxy=other", ", private-key=key", ", port-hopping=443;8443", ", sni=bad%0Ahost"] {
+            XCTAssertNil(parser.parseURI(sample + extra))
+        }
+        XCTAssertNil(parser.parseURI("Bad = masque, bad host, 443"))
+        XCTAssertNil(parser.parseURI("Bad = masque, proxy.example.com, 0"))
+        XCTAssertNotNil(parser.parseURI("Anonymous = masque, proxy.example.com, 443"))
+    }
+}
+
+final class MASQUEConnectIPTests: XCTestCase {
+    // Disposable fixture keys, unrelated to any deployed account.
+    private let yaml = """
+    proxies:
+      - name: Test-IP
+        type: masque
+        server: proxy.example.com
+        port: 443
+        private-key: MHcCAQEEICtwVnkxgqryZvFcQHlFFFrV1d+z78ilgfTIfbvYPZ5EoAoGCCqGSM49AwEHoUQDQgAEX0R39YbIb9BROHrhEEZJUJF1dYKv2c+i0SL8dzCN3mbaR4f38jPczo7uZMQTV4uOWBRGLWzbLXfCpAaqPOUjkQ==
+        public-key: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEX0R39YbIb9BROHrhEEZJUJF1dYKv2c+i0SL8dzCN3mbaR4f38jPczo7uZMQTV4uOWBRGLWzbLXfCpAaqPOUjkQ==
+        ip: 10.89.0.2/32
+        ipv6: fd00:abcd::2/128
+        mtu: 1280
+        network: h3
+        udp: true
+        sni: tls.example.com
+        dns: [1.1.1.1, 8.8.8.8]
+    """
+    private let json = #"{"endpoints":[{"type":"masque-client","tag":"IP","server":"proxy.example.com","server_port":443,"username":"test","password":"secret","version":3,"mtu":1280,"path":"/.well-known/masque/ip/{target}/{ipproto}/","disable_version_fallback":true,"headers":{"X-Test":"value"},"tls":{"enabled":true,"server_name":"tls.example.com","alpn":["h3"]}}]}"#
+
+    func testKeyCONNECTIPRoundTripAndClientMatrix() throws {
+        let parser = SubscriptionParser()
+        let node = try XCTUnwrap(parser.parse(data: Data(yaml.utf8)).nodes.first)
+        XCTAssertFalse(node.usesReality)
+        XCTAssertEqual(node.masque?.dns, ["1.1.1.1", "8.8.8.8"])
+        let supported: Set<ClientTarget> = [.clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi, .shadowrocket]
+        for target in ClientTarget.allCases {
+            let result = ConfigurationGenerator().generate(nodes: [node], preset: RulePreset.builtIns[0], target: target)
+            XCTAssertEqual(result.supportedNodeCount, supported.contains(target) ? 1 : 0, target.name)
+            let subscription = ConfigurationGenerator().generateNodeSubscription(nodes: [node], target: target)
+            XCTAssertEqual(subscription.supportedNodeCount, supported.contains(target) ? 1 : 0, target.name)
+            if supported.contains(target) {
+                let roundTrip = try XCTUnwrap(parser.parse(data: Data(subscription.content.utf8)).nodes.first)
+                XCTAssertEqual(roundTrip.masque?.privateKey, node.masque?.privateKey)
+                XCTAssertEqual(roundTrip.masque?.network, target == .clash ? "h3" : "quic")
+                XCTAssertEqual(roundTrip.udpRelayEnabled, true)
+            }
+        }
+        let stored = try JSONDecoder().decode(ProxyNode.self, from: JSONEncoder().encode(node))
+        XCTAssertEqual(stored, node)
+        let edited = try ManualNodeDraft(node: stored).makeNode()
+        XCTAssertEqual(edited.masque, node.masque)
+        XCTAssertEqual(edited.udpRelayEnabled, true)
+        let share = ProxyNodeShareLinkGenerator().canonicalLink(for: edited)
+        XCTAssertEqual(parser.parse(data: Data(share.utf8)).nodes.first?.masque?.privateKey, node.masque?.privateKey)
+    }
+
+    func testSingBoxEndpointAndRoundTrip() throws {
+        let parser = SubscriptionParser()
+        let node = try XCTUnwrap(parser.parse(data: Data(json.utf8)).nodes.first)
+        for target in ClientTarget.allCases {
+            let result = ConfigurationGenerator().generate(nodes: [node], preset: RulePreset.builtIns[0], target: target)
+            XCTAssertEqual(result.supportedNodeCount, target == .singBox ? 1 : 0, target.name)
+            if target == .singBox {
+                let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(result.content.utf8)) as? [String: Any])
+                let endpoints = try XCTUnwrap(root["endpoints"] as? [[String: Any]])
+                XCTAssertEqual(endpoints.count, 1)
+                XCTAssertEqual(endpoints[0]["type"] as? String, "masque-client")
+                let outbounds = try XCTUnwrap(root["outbounds"] as? [[String: Any]])
+                XCTAssertFalse(outbounds.contains { $0["type"] as? String == "masque-client" })
+                XCTAssertTrue(outbounds.contains { ($0["outbounds"] as? [String])?.contains("IP") == true })
+            }
+        }
+        let edited = try ManualNodeDraft(node: node).makeNode()
+        XCTAssertEqual(edited.masque, node.masque)
+        XCTAssertEqual(edited.path, node.path)
+        let shared = ProxyNodeShareLinkGenerator().canonicalLink(for: edited)
+        let restored = try XCTUnwrap(parser.parse(data: Data(shared.utf8)).nodes.first)
+        XCTAssertEqual(restored.masque, node.masque)
+        XCTAssertEqual(restored.password, node.password)
+        XCTAssertEqual(restored.path, node.path)
+        var other = node
+        other.masque?.httpVersion = 2
+        XCTAssertNotEqual(other.canonicalKey, node.canonicalKey)
+    }
+
+    func testImportedSchemeEndpointsAndHTTP2() throws {
+        let scheme = try RuleSchemeParser().parse(
+            text: "ruleset=Selected,[]FINAL\ncustom_proxy_group=Selected`select`.*",
+            id: "masque-test", name: "Test", summary: "Test")
+        let parser = SubscriptionParser()
+        let basic = try XCTUnwrap(parser.parse(data: Data(json.utf8)).nodes.first)
+        let key = try XCTUnwrap(parser.parse(data: Data(yaml.utf8)).nodes.first)
+        let output = ConfigurationGenerator().generate(nodes: [basic, key], scheme: scheme, target: .singBox)
+        XCTAssertEqual(output.supportedNodeCount, 1)
+        XCTAssertEqual(output.skippedNodeCount, 1)
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(output.content.utf8)) as? [String: Any])
+        XCTAssertEqual((root["endpoints"] as? [[String: Any]])?.first?["type"] as? String, "masque-client")
+        var http2 = basic
+        http2.masque?.httpVersion = 2
+        http2.tls = false
+        http2.alpn = nil
+        let rebuilt = try ManualNodeDraft(node: http2).makeNode()
+        XCTAssertFalse(rebuilt.tls)
+        XCTAssertEqual(rebuilt.masque, http2.masque)
+        let shared = ProxyNodeShareLinkGenerator().canonicalLink(for: rebuilt)
+        XCTAssertEqual(parser.parse(data: Data(shared.utf8)).nodes.first?.masque?.httpVersion, 2)
+        let forced = ConfigurationGenerator().generate(nodes: [key], preset: RulePreset.builtIns[0], target: .surge, supportedKindsOverride: [.masque])
+        XCTAssertEqual(forced.supportedNodeCount, 0)
+    }
+
+    func testMASQUERemoteDNSDefaultsAndExplicitSettings() throws {
+        let parser = SubscriptionParser()
+        var node = try XCTUnwrap(parser.parse(data: Data(yaml.utf8)).nodes.first)
+        node.masque?.dns = nil
+        let generator = ConfigurationGenerator()
+        for target: ClientTarget in [.clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi] {
+            for content in [generator.generate(nodes: [node], preset: RulePreset.builtIns[0], target: target).content,
+                            generator.generateNodeSubscription(nodes: [node], target: target).content] {
+                let restored = try XCTUnwrap(parser.parse(data: Data(content.utf8)).nodes.first)
+                XCTAssertEqual(restored.masque?.remoteDNSResolve, true, target.name)
+                XCTAssertEqual(restored.masque?.dns, ["1.1.1.1", "8.8.8.8"], target.name)
+                XCTAssertFalse(content.contains("#🚀 节点选择"))
+            }
+        }
+        XCTAssertFalse(ClientTarget.clash.supports(.masque))
+        XCTAssertEqual(generator.generateNodeSubscription(nodes: [node], target: .clash).supportedNodeCount, 0)
+        XCTAssertFalse(generator.generateNodeSubscription(nodes: [node], target: .shadowrocket).content.contains("remote-dns-resolve"))
+        node.masque?.remoteDNSResolve = false
+        node.masque?.dns = ["9.9.9.9"]
+        let output = generator.generateNodeSubscription(nodes: [node], target: .clashMi)
+        let restored = try XCTUnwrap(parser.parse(data: Data(output.content.utf8)).nodes.first)
+        XCTAssertEqual(restored.masque?.remoteDNSResolve, false)
+        XCTAssertEqual(restored.masque?.dns, ["9.9.9.9"])
+        XCTAssertEqual(try JSONDecoder().decode(ProxyNode.self, from: JSONEncoder().encode(restored)), restored)
+        XCTAssertEqual(try ManualNodeDraft(node: restored).makeNode().masque, restored.masque)
+        XCTAssertTrue(parser.parse(data: Data((yaml + "\n    remote-dns-resolve: invalid").utf8)).nodes.isEmpty)
+    }
+
+    func testShadowrocketMixedNodesOnlyUsesYAMLAndPreservesBothNodes() throws {
+        let parser = SubscriptionParser()
+        let masque = try XCTUnwrap(parser.parse(data: Data(yaml.utf8)).nodes.first)
+        let trojan = try XCTUnwrap(parser.parseURI("trojan://secret@proxy.example.com:443#Trojan"))
+        let result = ConfigurationGenerator().generateNodeSubscription(nodes: [masque, trojan], target: .shadowrocket)
+        XCTAssertEqual(result.supportedNodeCount, 2)
+        XCTAssertTrue(result.content.hasPrefix("proxies:"))
+        XCTAssertEqual(parser.parse(data: Data(result.content.utf8)).nodes.count, 2)
+        let restored = try XCTUnwrap(parser.parse(data: Data(result.content.utf8)).nodes.first { $0.kind == .masque })
+        XCTAssertEqual(restored.masque?.privateKey, masque.masque?.privateKey)
+        XCTAssertEqual(restored.masque?.publicKey, masque.masque?.publicKey)
+        XCTAssertEqual(restored.masque?.ipv4, masque.masque?.ipv4)
+        XCTAssertEqual(restored.udpRelayEnabled, true)
+    }
+
+    func testUnknownParametersRejectInsteadOfLosingFields() {
+        let parser = SubscriptionParser()
+        for suffix in ["    connect-uri: https://other.example.com", "    dialer-proxy: Other", "    network: h3-l4proxy", "    private-key: YWJj", "    ip: invalid"] {
+            XCTAssertTrue(parser.parse(data: Data((yaml + "\n" + suffix).utf8)).nodes.isEmpty, suffix)
+        }
+        for extra in [#", "detour":"other""#, #", "system":true"#, #", "advertise_routes":["0.0.0.0/0"]"#] {
+            let modified = json.replacingOccurrences(of: #""version":3"#, with: #""version":3"# + extra)
+            let parsed = parser.parse(data: Data(modified.utf8))
+            XCTAssertTrue(parsed.nodes.isEmpty)
+            XCTAssertEqual(parsed.rejectedLineCount, 1)
         }
     }
 }

@@ -9,7 +9,7 @@
 ## ACL4SSR 规则
 
 - **来源**：https://github.com/ACL4SSR/ACL4SSR
-- **固定版本**：`f7c4233b2bc706c89668753b18a9f899d7e9f9bf`
+- **固定版本**：`802e3abf065f8609e7d9073ba506158dbe2ba6e7`
 - **本地路径**：`Tower/Resources/ACL4SSR/`（3 份 `.ini` 配置 + 32 个 `.list` 规则）
 - **托管派生资源**：`Rulesets/ACL4SSR/<固定版本>/`（不随 App 打包）
 - **许可证**：**CC BY-SA 4.0**（https://creativecommons.org/licenses/by-sa/4.0/）
@@ -68,6 +68,7 @@ App 和本仓库不再包含 Self-Configuration 的配置、规则列表或图�
 | `ClientLoon` | Loon | Lin Zhang |
 | `ClientQuantumultX` | Quantumult X | Cross Utility |
 | `ClientHiddify` | Hiddify Proxy & VPN | Holistic Resilience |
+| `ClientAnywhere` | Anywhere | NodePassProject / respective rights holders |
 | `ClientEgern` | Egern | BYTE CROSSING LTD |
 | `ClientClashMi` | Clash Mi | Supernova Nebula LLC |
 | `ClientKaring` | Karing | Supernova Nebula LLC |
@@ -78,6 +79,10 @@ App 和本仓库不再包含 Self-Configuration 的配置、规则列表或图�
 
 这些图标是各自权利人的商标，**不适用本项目的 MIT 许可**。塔台仅将其用于在导出目标列表里指代对应客户端（指称性使用），不表示任何关联、赞助或背书，也不分发这些客户端软件本身。Surge Mac 图标取自本机官方 6.4.4 安装包。移动客户端图标取自 Apple 的公开 iTunes Search API 返回的 artwork 地址。Clash Verge 图标取自 [v2.5.2 官方发布包](https://github.com/clash-verge-rev/clash-verge-rev/releases/tag/v2.5.2)；ClashMac 图标取自 [27.1.4 官方发布包](https://github.com/666OS/ClashMac/releases/tag/27.1.4)，仅将 ICNS 转成 PNG，未修改图案。权利人如有异议可提 issue，将立即移除并改用 SF Symbol 占位。
 
+2026-09-27 起，所有客户端图标统一等比缩放到最长边 180 像素（界面最大显示 58pt，按 3 倍屏约 174 像素），以免首次显示时在主线程解码 512–1024 像素的原图；只改尺寸，未修改图案或颜色。
+
+README 使用的 `docs/images/clients/*.png` 是上述图标的展示副本（含 sing-box、V2Box 和 Clash 的同源图标）：方形原图按 iOS 图标的圆角裁切四角，自带形状的原图只缩放，下方附客户端名称；未修改图案或颜色，权利归属与上表相同。
+
 ## 客户端配置格式
 
 塔台生成 Surge、Clash/Stash/Clash Mi/Karing、Shadowrocket、Loon、Quantumult X、Hiddify/sing-box MT 和 Egern 七类配置。这些格式的规范归各自客户端的开发者所有，本项目仅按其公开文档生成配置文件，不包含、不修改、不分发任何客户端软件。
@@ -85,3 +90,5 @@ App 和本仓库不再包含 Self-Configuration 的配置、规则列表或图�
 FlClash 图标取自 [官方项目 assets/images/icon.png](https://github.com/chen08209/FlClash/blob/main/assets/images/icon.png)，仅用于标识对应客户端。
 
 Mihomo Party 图标取自本机已安装的官方应用，仅将 ICNS 转成 PNG，用于标识导出客户端。
+
+Anywhere 图标来自上游 README 的官方资源 https://storage.argsment.com/Anywhere-AppIcon-iOS.png ，2026-09-14 获取，对应源码参考版本 `9ae49a73a0cf15317712545f9ead679da43cd308`。仅用于识别目标客户端，权利保留；来源说明见该 imageset 的 NOTICE.txt，未打包上游 GPL 源码。

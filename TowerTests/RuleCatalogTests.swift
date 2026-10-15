@@ -3,6 +3,31 @@ import XCTest
 @testable import Tower
 
 final class RuleCatalogTests: XCTestCase {
+    @MainActor
+    func testSavedBundledSchemeRemainsReadyWithoutDownloadCacheAfterReload() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = RuleDownloadStore(folderURL: directory.appendingPathComponent("rules"))
+        let persistence = PersistenceStore(fileURL: directory.appendingPathComponent("state.json"))
+        let model = AppModel(persistence: persistence, downloadStore: store, arguments: [])
+        let scheme = try XCTUnwrap(RuleSchemeRepository().bundledSchemes().first { $0.id == "acl4ssr-default" })
+        let saved = model.saveCustomizedScheme(named: "Offline copy", from: scheme)
+        XCTAssertFalse(saved.remoteRulesetURLs.isEmpty)
+        XCTAssertTrue(saved.remoteRulesetURLs.allSatisfy { !store.hasCachedRules(for: $0) })
+        XCTAssertTrue(model.isSchemeReady(saved))
+        let restored = try JSONDecoder().decode(RuleScheme.self, from: JSONEncoder().encode(saved))
+        let reloaded = AppModel(persistence: persistence, downloadStore: store, arguments: [])
+        XCTAssertTrue(reloaded.isSchemeReady(restored))
+
+        let missing = URL(string: "https://rules.example.com/unique-unavailable-rule.list")!
+        var incomplete = restored
+        incomplete.rulesets.append(RuleSchemeRuleset(groupName: scheme.finalGroupName!, resource: .remote(missing)))
+        let fresh = AppModel(persistence: persistence, downloadStore: store, arguments: [])
+        XCTAssertFalse(fresh.isSchemeReady(incomplete))
+        try store.store("", for: missing)
+        XCTAssertTrue(fresh.isSchemeReady(incomplete))
+    }
+
     func testBuiltInCatalogContainsBothMaintainersAndRepresentativeRoutes() throws {
         let catalog = RuleCatalog.builtIn
 
@@ -126,6 +151,43 @@ final class RuleCatalogTests: XCTestCase {
         XCTAssertTrue(model.isSchemeReady(scheme))
     }
 
+    /// A rule added to a built-in scheme on another device arrives through
+    /// iCloud without its download. The rules page must report it and the
+    /// refresh must fetch only that addition, never the bundled lists.
+    @MainActor
+    func testBundledSchemeWithSyncedCatalogRuleRefreshesOnlyTheAddition() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tower-rule-catalog-synced-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = RuleDownloadStore(folderURL: directory.appendingPathComponent("rules"))
+        let entry = makeAIEntry()
+        let url = try XCTUnwrap(URL(string: entry.sourceURLString))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RuleCatalogURLProtocol.self]
+        RuleCatalogURLProtocol.payloads = [url: Data("DOMAIN-SUFFIX,openai.com".utf8)]
+        RuleCatalogURLProtocol.requestedURLs = []
+        let model = AppModel(
+            persistence: PersistenceStore(fileURL: directory.appendingPathComponent("state.json")),
+            schemeImportService: RuleSchemeImportService(store: store, session: URLSession(configuration: configuration)),
+            downloadStore: store,
+            arguments: []
+        )
+        let scheme = try XCTUnwrap(model.ruleSchemes.first { $0.id == "acl4ssr-default" })
+        XCTAssertTrue(scheme.isBundled)
+        model.upsertCustomRuleFlow(try entry.makeCustomization(for: scheme))
+
+        XCTAssertFalse(model.isSchemeReady(scheme))
+        await model.prepareRulesPage()
+        XCTAssertEqual(model.rulesPageSummaries[scheme.id]?.isReady, false)
+
+        await model.refreshScheme(scheme)
+
+        XCTAssertEqual(RuleCatalogURLProtocol.requestedURLs, [url])
+        XCTAssertTrue(model.isSchemeReady(scheme))
+        await model.prepareRulesPage()
+        XCTAssertEqual(model.rulesPageSummaries[scheme.id]?.isReady, true)
+    }
+
     func testCatalogRuleDownloaderCachesTheRemoteList() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("tower-rule-catalog-download-\(UUID().uuidString)", isDirectory: true)
@@ -144,6 +206,48 @@ final class RuleCatalogTests: XCTestCase {
 
         XCTAssertEqual(failed, 0)
         XCTAssertEqual(store.lines(for: url), ["DOMAIN-SUFFIX,openai.com"])
+    }
+
+    @MainActor
+    func testReaddingDeletedOriginalCatalogGroupRestoresExport() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tower-rule-catalog-install-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = RuleDownloadStore(folderURL: directory.appendingPathComponent("rules"))
+        let url = try XCTUnwrap(URL(string: "https://rules.example.com/ai.list"))
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RuleCatalogURLProtocol.self]
+        RuleCatalogURLProtocol.payloads = [url: Data("DOMAIN-SUFFIX,openai.com".utf8)]
+        let service = RuleSchemeImportService(
+            store: store,
+            session: URLSession(configuration: configuration)
+        )
+        let model = AppModel(
+            persistence: PersistenceStore(fileURL: directory.appendingPathComponent("state.json")),
+            schemeImportService: service,
+            downloadStore: store,
+            arguments: []
+        )
+        var scheme = makeScheme(includeAIGroup: false)
+        scheme.groups.append(RuleSchemeGroup(name: "AI 服务", kind: .select, members: [.reference("节点选择")]))
+        let entry = makeAIEntry()
+
+        let groupName = try entry.makeCustomization(for: scheme).policyName
+        model.deleteRuleGroup(named: groupName, for: scheme)
+        XCTAssertFalse(model.customizableRuleGroups(for: scheme).contains { $0.name == groupName })
+        try await model.installCatalogEntry(entry, for: scheme)
+        XCTAssertTrue(model.customizableRuleGroups(for: scheme).contains { $0.name == groupName })
+        XCTAssertFalse(model.ruleSchemeCustomizations[scheme.id]?.removedGroupNames?.contains(groupName) == true)
+        let effective = model.customizableScheme(for: scheme)
+        XCTAssertTrue(effective.rulesets.contains { $0.groupName == groupName })
+        let firstID = try XCTUnwrap(model.customRuleFlows(for: scheme).first?.id)
+        try await model.installCatalogEntry(entry, for: scheme)
+
+        let flows = model.customRuleFlows(for: scheme)
+        XCTAssertEqual(flows.count, 1)
+        XCTAssertEqual(flows.first?.id, firstID)
+        XCTAssertTrue(store.hasCachedRules(for: url))
+        XCTAssertEqual(model.toast?.tone, .success)
     }
 
     @MainActor
@@ -178,6 +282,12 @@ final class RuleCatalogTests: XCTestCase {
         XCTAssertEqual(flows.first?.id, firstID)
         XCTAssertTrue(store.hasCachedRules(for: url))
         XCTAssertEqual(model.toast?.tone, .success)
+        let groupName = try entry.makeCustomization(for: scheme).policyName
+        model.deleteRuleGroup(named: groupName, for: scheme)
+        XCTAssertFalse(model.customizableRuleGroups(for: scheme).contains { $0.name == groupName })
+        try await model.installCatalogEntry(entry, for: scheme)
+        XCTAssertTrue(model.customizableRuleGroups(for: scheme).contains { $0.name == groupName })
+        XCTAssertTrue(model.customizableScheme(for: scheme).rulesets.contains { $0.groupName == groupName })
     }
 
     @MainActor
@@ -248,13 +358,12 @@ final class RuleCatalogTests: XCTestCase {
         model.upsertCustomRuleFlow(try entry.makeCustomization(for: scheme))
         let before = model.customizableRuleGroups(for: scheme)
         let changed = expectation(description: "Cached rule presentation invalidated")
-        var cancellable: AnyCancellable?
-        cancellable = model.objectWillChange.sink {
+        let cancellable = model.objectWillChange.prefix(1).sink {
             changed.fulfill()
         }
+        defer { cancellable.cancel() }
         model.removeCatalogEntry(entry, from: scheme)
         await fulfillment(of: [changed], timeout: 1)
-        cancellable?.cancel()
         XCTAssertNotEqual(model.customizableRuleGroups(for: scheme), before)
     }
 
@@ -433,6 +542,17 @@ final class RuleCatalogTests: XCTestCase {
         )
     }
 
+    func testImportedPolicyNamesDoNotAcquireInferredEmoji() {
+        for name in ["节点选择", "Apple", "Telegram", "dns", "广告拦截", "1 香港", "#Proxy"] {
+            XCTAssertEqual(RulePolicyPresentation.emoji(for: name, kind: .select, inferFromName: false), "")
+            XCTAssertEqual(RulePolicyPresentation.nameWithoutLeadingEmoji(name), name)
+        }
+        XCTAssertEqual(RulePolicyPresentation.emoji(for: "🍎 Apple", kind: .select, inferFromName: false), "🍎")
+        XCTAssertEqual(RulePolicyPresentation.emoji(for: "🇯🇵 日本", kind: .select, inferFromName: false), "🇯🇵")
+        XCTAssertEqual(RulePolicyPresentation.emoji(for: "♻️ 自动选择", kind: .urlTest, inferFromName: false), "♻️")
+        XCTAssertEqual(RulePolicyPresentation.nameWithoutLeadingEmoji("🍎 Apple"), "Apple")
+    }
+
     func testChineseNetflixPolicyUsesStreamingEmoji() {
         XCTAssertEqual(
             RulePolicyPresentation.emoji(for: "奈飞视频", kind: .select),
@@ -594,11 +714,13 @@ final class RuleCatalogTests: XCTestCase {
 
 private final class RuleCatalogURLProtocol: URLProtocol {
     nonisolated(unsafe) static var payloads: [URL: Data] = [:]
+    nonisolated(unsafe) static var requestedURLs: [URL] = []
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        if let url = request.url { Self.requestedURLs.append(url) }
         guard let url = request.url, let payload = Self.payloads[url] else {
             client?.urlProtocol(self, didFailWithError: URLError(.resourceUnavailable))
             return

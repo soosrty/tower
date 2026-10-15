@@ -4,6 +4,95 @@ import XCTest
 @testable import Tower
 
 final class LANSubscriptionServerTests: XCTestCase {
+    @MainActor
+    func testAggregatedURLKeepsNodeModeAndReflectsSourceChanges() async throws {
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent("tower-node-sub-\(UUID()).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PersistenceStore(fileURL: fileURL)
+        let first = SubscriptionSource(name: "One", urlString: "https://one.example/sub")
+        let second = SubscriptionSource(name: "Two", urlString: "https://two.example/sub")
+        let nodes = [first, second].map { source in
+            ProxyNode(sourceID: source.id, kind: .shadowsocks, name: source.name,
+                server: "\(source.name.lowercased()).example", port: 8388,
+                cipher: "aes-128-gcm", password: "test", rawURI: "ss://test")
+        }
+        try store.save(AppSnapshot(subscriptions: [first, second], nodes: nodes,
+            selectedPresetID: AppModel.defaultRuleSchemeID, selectedTarget: .surge))
+        let model = AppModel(persistence: store, arguments: [])
+        let targets = ClientTarget.allCases.filter { $0.copiesAggregatedSubscription(mode: .nodesOnly) }
+        for target in targets { model.setExportContentMode(.nodesOnly, for: target) }
+        let reloaded = AppModel(persistence: store, arguments: [])
+        for target in targets { XCTAssertEqual(reloaded.exportContentMode(for: target), .nodesOnly) }
+        await model.startLANSharing(listenerEnvironment: .loopback)
+        defer { model.stopLANSharing() }
+        for target in targets {
+            let url = try XCTUnwrap(model.lanSubscriptionURL(target: target, contentMode: .nodesOnly))
+            let session = URLSession(configuration: .ephemeral)
+            defer { session.invalidateAndCancel() }
+            let (initial, response) = try await session.data(from: url)
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+            let text = String(decoding: initial, as: UTF8.self)
+            XCTAssertTrue(text.contains("one.example"))
+            XCTAssertTrue(text.contains("two.example"))
+            XCTAssertFalse(text.contains("[Rule]"))
+            model.setExportContentMode(.fullConfiguration, for: target)
+            model.selectedTarget = .clash
+            model.setEmbedRemoteSubscriptionLinks(true)
+            model.setSubscriptions([second], enabled: false)
+            let (updated, _) = try await session.data(from: url)
+            let updatedText = String(decoding: updated, as: UTF8.self)
+            XCTAssertTrue(updatedText.contains("one.example"))
+            XCTAssertFalse(updatedText.contains("two.example"))
+            XCTAssertFalse(updatedText.contains("[Rule]"))
+            XCTAssertFalse(updatedText.contains("policy-path="))
+            XCTAssertEqual(model.lanSubscriptionURL(target: target, contentMode: .nodesOnly), url)
+            let fullURL = try XCTUnwrap(model.lanSubscriptionURL(target: target))
+            let (full, _) = try await session.data(from: fullURL)
+            XCTAssertTrue(String(decoding: full, as: UTF8.self).contains(target.usesClashFormat ? "rules:" : "[Rule]"))
+            model.setNode(nodes[0], included: false)
+            let (empty, _) = try await session.data(from: url)
+            XCTAssertEqual(String(decoding: empty, as: UTF8.self), target.usesClashFormat ? "proxies:\n  []\n" : "")
+            model.setNode(nodes[0], included: true)
+            model.setExcluded(true, kind: .shadowsocks, for: target)
+            let (filtered, _) = try await session.data(from: url)
+            XCTAssertEqual(String(decoding: filtered, as: UTF8.self), target.usesClashFormat ? "proxies:\n  []\n" : "")
+            model.setExcluded(false, kind: .shadowsocks, for: target)
+            model.setSubscriptions([second], enabled: true)
+        }
+    }
+
+    func testNodeRouteValidatesModeTargetAndTokenBeforeGenerating() {
+        for query in ["target=sing-box&content=nodesOnly", "target=surge&content=typo", "target=surge&content=",
+                      "target=surge&content=nodesOnly&content=fullConfiguration"] {
+            let response = LANSubscriptionHTTPRouter.response(
+                request: "GET /sub/test?\(query) HTTP/1.1\r\n\r\n", token: "test",
+                nodeConfiguration: { _ in XCTFail("Invalid request"); return self.configuration(for: .surge) },
+                formatConfiguration: { _ in XCTFail("Invalid mode must not serve a full profile"); return self.configuration(for: .surge) })
+            XCTAssertEqual(response.statusCode, 400)
+        }
+        for target in [ClientTarget.surge, .surgeMac] {
+            let url = try! LANSubscriptionURLBuilder.make(host: "127.0.0.1", port: 1234,
+                token: "test", target: target.rawValue, contentMode: .nodesOnly)
+            for method in ["GET", "HEAD"] {
+                let response = LANSubscriptionHTTPRouter.response(
+                    request: "\(method) \(url.path)?\(url.query!) HTTP/1.1\r\n\r\n", token: "test",
+                    nodeConfiguration: { client in
+                        XCTAssertEqual(client, target)
+                        return GeneratedConfiguration(target: client, content: "Node = ss, example.com, 443", supportedNodeCount: 1,
+                            skippedNodeCount: 0, ruleCount: 0, contentMode: .nodesOnly, fileExtensionOverride: "txt")
+                    }, formatConfiguration: { _ in XCTFail("Node URL cannot return full configuration"); return self.configuration(for: .surge) })
+                XCTAssertEqual(response.statusCode, 200)
+                XCTAssertTrue(response.headers["Content-Disposition"]?.contains(".txt") == true)
+                XCTAssertEqual(response.body.isEmpty, method == "HEAD")
+            }
+            let denied = LANSubscriptionHTTPRouter.response(
+                request: "GET /sub/wrong?target=\(target.rawValue)&content=nodesOnly HTTP/1.1\r\n\r\n", token: "test",
+                nodeConfiguration: { _ in XCTFail("Wrong token"); return self.configuration(for: .surge) },
+                formatConfiguration: { _ in XCTFail("Wrong token"); return self.configuration(for: .surge) })
+            XCTAssertEqual(denied.statusCode, 404)
+        }
+    }
+
     func testCopiedMacSubscriptionsKeepExactClientInsteadOfGenericDialect() {
         for target in [ClientTarget.surgeMac, .clashMac] {
             var calledTarget: ClientTarget?
@@ -67,13 +156,13 @@ final class LANSubscriptionServerTests: XCTestCase {
 
     func testExplicitTargetsAndDesktopAliasesResolve() throws {
         let expected: [String: ClientTarget] = [
-            "clash": .clash,
-            "clash-mi": .clash,
-            "clashmi": .clash,
-            "karing": .clash,
-            "openclash": .clash,
-            "nikki": .clash,
-            "mihomo": .clash,
+            "clash": .clashMi,
+            "clash-mi": .clashMi,
+            "clashmi": .clashMi,
+            "karing": .clashMi,
+            "openclash": .clashMi,
+            "nikki": .clashMi,
+            "mihomo": .clashMi,
             "stash": .clash,
             "surge": .surge,
             "surfboard": .surge,
@@ -129,12 +218,13 @@ final class LANSubscriptionServerTests: XCTestCase {
 
     func testAutoTargetUsesClientUserAgent() throws {
         let expected: [(String, ClientTarget)] = [
-            ("clash.meta", .clash),
-            ("OpenClash/v0.46.014", .clash),
-            ("Nikki/1.6.3", .clash),
-            ("Clash-Verge/2.3", .clash),
-            ("Clash Mi/1.0", .clash),
-            ("Karing/1.2", .clash),
+            ("clash.meta", .clashMi),
+            ("Stash/3.0", .clash),
+            ("OpenClash/v0.46.014", .clashMi),
+            ("Nikki/1.6.3", .clashMi),
+            ("Clash-Verge/2.3", .clashMi),
+            ("Clash Mi/1.0", .clashMi),
+            ("Karing/1.2", .clashMi),
             ("Surge iOS/5.14", .surge),
             ("Surfboard/2.33.0", .surge),
             ("Shadowrocket/1997 CFNetwork", .shadowrocket),
@@ -175,7 +265,7 @@ final class LANSubscriptionServerTests: XCTestCase {
     func testClashLANFormatNamesItsCompatibleClientsInUserFacingOrder() {
         XCTAssertEqual(
             LANSubscriptionFormat.clash.displayName,
-            "Clash / Clash Verge / ClashMac / Clash Mi / Karing / OpenClash / Nikki / Stash"
+            "Clash / Clash Verge / ClashMac / Clash Mi / Karing / OpenClash / Nikki"
         )
     }
 

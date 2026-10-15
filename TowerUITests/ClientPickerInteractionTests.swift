@@ -2,6 +2,78 @@ import XCTest
 
 @MainActor
 final class ClientPickerInteractionTests: XCTestCase {
+    func testAnywhereShowsNodeSubscriptionImport() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--demo", "--tab=export", "-hasSeenWelcome", "YES", "-AppleLanguages", "(zh-Hans)"]
+        app.launchEnvironment["TOWER_UI_TEST_RUN"] = UUID().uuidString
+        app.launch()
+        let first = app.buttons["client-shadowrocket"]
+        XCTAssertTrue(first.waitForExistence(timeout: 15))
+        let y = first.frame.midY
+        let anywhere = app.buttons["client-anywhere"]
+        for _ in 0..<8 {
+            if anywhere.exists && anywhere.frame.minX >= 0 && anywhere.frame.maxX <= app.frame.width { break }
+            app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 330, dy: y))
+                .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 100, dy: y)))
+        }
+        XCTAssertTrue(anywhere.exists)
+        anywhere.tap()
+        assertExportTarget("Anywhere", in: app)
+        XCTAssertFalse(app.segmentedControls["export-content-mode"].exists)
+        XCTAssertTrue(app.buttons["export-config"].label.contains("仅导出节点到 Anywhere"))
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    func testSurgeNodeModeOffersCopyAndFullModeRestoresImport() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--demo", "--tab=export", "-hasSeenWelcome", "YES", "-AppleLanguages", "(zh-Hans)"]
+        app.launchEnvironment["TOWER_UI_TEST_RUN"] = UUID().uuidString
+        app.launch()
+        let modes = app.segmentedControls["export-content-mode"]
+        XCTAssertTrue(modes.waitForExistence(timeout: 10))
+        modes.buttons["仅节点"].tap()
+        let action = app.buttons["export-config"]
+        XCTAssertTrue(action.waitForExistence(timeout: 10))
+        XCTAssertTrue(action.label.contains("复制聚合的订阅链接"), action.label)
+        modes.buttons["完整配置"].tap()
+        XCTAssertTrue(action.label.contains("一键导出到 Surge"), action.label)
+        modes.buttons["仅节点"].tap()
+        XCTAssertTrue(action.label.contains("复制聚合的订阅链接"), action.label)
+        action.tap()
+        XCTAssertTrue(app.staticTexts["tower-toast"].waitForExistence(timeout: 5))
+        XCTAssertEqual(app.staticTexts["tower-toast"].label, "订阅链接已复制")
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        XCTAssertTrue(action.waitForExistence(timeout: 5))
+        XCTAssertTrue(action.label.contains("复制聚合的订阅链接"), action.label)
+    }
+
+    func testClashNodeModeOffersCopyAndRestoresFullExport() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--demo", "--tab=export", "-hasSeenWelcome", "YES", "-AppleLanguages", "(zh-Hans)"]
+        app.launchEnvironment["TOWER_UI_TEST_RUN"] = UUID().uuidString
+        app.launch()
+        let stash = app.buttons["client-clash"]
+        XCTAssertTrue(stash.waitForExistence(timeout: 10))
+        for _ in 0..<2 {
+            app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 45, dy: stash.frame.midY))
+                .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 365, dy: stash.frame.midY)))
+        }
+        stash.tap()
+        let modes = app.segmentedControls["export-content-mode"]
+        XCTAssertTrue(modes.waitForExistence(timeout: 10))
+        modes.buttons["仅节点"].tap()
+        let action = app.buttons["export-config"]
+        XCTAssertTrue(action.label.contains("复制聚合的订阅链接"), action.label)
+        action.tap()
+        XCTAssertTrue(app.staticTexts["tower-toast"].waitForExistence(timeout: 5))
+        XCTAssertEqual(app.staticTexts["tower-toast"].label, "订阅链接已复制")
+        modes.buttons["完整配置"].tap()
+        XCTAssertTrue(action.label.contains("一键导出到 Stash"), action.label)
+    }
+
     func testSwitchingClientsKeepsExportBarAndViewportStable() {
         let app = XCUIApplication()
         app.launchEnvironment["TOWER_UI_TEST_RUN"] = UUID().uuidString

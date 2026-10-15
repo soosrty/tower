@@ -20,6 +20,8 @@ struct RuleSetEmissionPlanner {
         let url: URL
         let policyName: String
         let format: NativeFormat
+        var options: [String] = []
+        var provider: RuleProviderMetadata? = nil
     }
 
     struct InlineRule: Equatable {
@@ -32,9 +34,17 @@ struct RuleSetEmissionPlanner {
         case inline(InlineRule)
     }
 
+    /// A binary MRS rule set the target cannot read or reference.
+    struct UnreadableResource: Equatable {
+        let policyName: String
+        let url: URL
+    }
+
     struct Plan: Equatable {
         let entries: [Entry]
         let finalGroupName: String?
+        var finalOptions: [String] = []
+        var unreadableResources: [UnreadableResource] = []
 
         var remoteResources: [RemoteResource] {
             entries.compactMap {
@@ -64,12 +74,39 @@ struct RuleSetEmissionPlanner {
     ) -> Plan {
         var entries: [Entry] = []
         var finalGroupName: String?
+        var finalOptions: [String] = []
         var remoteIndex = 0
+        // What each generic remote entry expands to if it has to be inlined.
+        var inlineFallbacks: [Int: [Entry]] = [:]
+        var unreadable: [UnreadableResource] = []
 
         for ruleset in scheme.rulesets {
+            // Only mihomo reads MRS, and it can only fetch it: there are no
+            // lines to write locally, whatever the rule-set preference.
+            if ruleset.isBinaryRuleSet, let url = ruleset.resource.downloadURL {
+                let behavior = ruleset.provider?.behavior?.lowercased()
+                if Self.mrsTargets.contains(target), behavior == "domain" || behavior == "ipcidr" {
+                    remoteIndex += 1
+                    entries.append(.remote(RemoteResource(
+                        identifier: identifier(for: url, index: remoteIndex, suffix: behavior == "ipcidr" ? "ip" : "domain"),
+                        url: url,
+                        policyName: ruleset.groupName,
+                        format: behavior == "ipcidr" ? .clashIPCIDRMRS : .clashDomainMRS,
+                        options: ruleset.options ?? [],
+                        provider: ruleset.provider
+                    )))
+                } else {
+                    unreadable.append(UnreadableResource(policyName: ruleset.groupName, url: url))
+                }
+                continue
+            }
             if ruleset.resource.domainSetURL != nil, !([.surge, .surgeMac].contains(target) && preferRuleSets) {
+                let options: [String]
+                if case .inline(let body) = ruleset.resource {
+                    options = RoutingRuleSyntax.condition(body)?.options ?? []
+                } else { options = ruleset.options ?? [] }
                 entries.append(contentsOf: repository.lines(for: ruleset.resource).map {
-                    .inline(InlineRule(policyName: ruleset.groupName, line: $0))
+                    .inline(InlineRule(policyName: ruleset.groupName, line: RuleResourceContent.applying(options, to: $0)))
                 })
                 continue
             }
@@ -77,13 +114,14 @@ struct RuleSetEmissionPlanner {
             case .inline(let line):
                 if line.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() == "FINAL" {
                     finalGroupName = ruleset.groupName
+                    finalOptions = ruleset.options ?? []
                 } else {
                     entries.append(.inline(InlineRule(policyName: ruleset.groupName, line: line)))
                 }
 
             case .remote(let url):
                 let lines = repository.lines(for: ruleset.resource)
-                if preferRuleSets,
+                if preferRuleSets, ruleset.options == nil, ruleset.provider == nil,
                    [.clash, .clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi].contains(target),
                    let optimized = optimizedClashEntries(
                     resource: ruleset.resource,
@@ -94,7 +132,7 @@ struct RuleSetEmissionPlanner {
                    ) {
                     entries.append(contentsOf: optimized.entries)
                     remoteIndex = optimized.finalRemoteIndex
-                } else if preferRuleSets,
+                } else if preferRuleSets, ruleset.options == nil, ruleset.provider == nil,
                           target == .singBox,
                           let optimized = optimizedSingBoxEntries(
                             resource: ruleset.resource,
@@ -106,29 +144,49 @@ struct RuleSetEmissionPlanner {
                     entries.append(contentsOf: optimized.entries)
                     remoteIndex = optimized.finalRemoteIndex
                 } else if preferRuleSets,
-                   let format = nativeFormat(
+                   RoutingRuleCapabilities.optionsSupported((ruleset.options ?? []).filter { !$0.hasPrefix("update-interval=") }, target: target),
+                   let format = providerFormat(ruleset, target: target, lines: lines) ?? nativeFormat(
                     for: target,
                     url: url,
                     lines: lines,
                     isClashProviderYAML: repository.isClashProviderYAML(ruleset.resource)
                    ) {
                     remoteIndex += 1
+                    inlineFallbacks[entries.count] = RuleResourceContent.normalized(lines, behavior: ruleset.provider?.behavior).map {
+                        .inline(InlineRule(policyName: ruleset.groupName, line: RuleResourceContent.applying(ruleset.options ?? [], to: $0)))
+                    }
                     entries.append(.remote(RemoteResource(
                         identifier: identifier(for: url, index: remoteIndex),
                         url: url,
                         policyName: ruleset.groupName,
-                        format: format
+                        format: format,
+                        options: ruleset.options ?? [], provider: ruleset.provider
                     )))
                 } else {
-                    entries.append(contentsOf: lines.map {
-                        .inline(InlineRule(policyName: ruleset.groupName, line: $0))
+                    entries.append(contentsOf: RuleResourceContent.normalized(lines, behavior: ruleset.provider?.behavior).map {
+                        .inline(InlineRule(policyName: ruleset.groupName, line: RuleResourceContent.applying(ruleset.options ?? [], to: $0)))
                     })
                 }
             }
         }
 
-        return Plan(entries: entries, finalGroupName: finalGroupName)
+        // Loon and Quantumult X keep remote rule lists in their own section
+        // and match every local rule before any of them (Loon: local > plugin
+        // > remote; Quantumult X: filter_local > filter_remote). A list that
+        // came before a local rule would lose to it, so it is inlined instead.
+        if [.loon, .quanx].contains(target),
+           let lastInline = entries.lastIndex(where: { if case .inline = $0 { return true } else { return false } }) {
+            entries = entries.indices.flatMap { index -> [Entry] in
+                guard index < lastInline, let fallback = inlineFallbacks[index] else { return [entries[index]] }
+                return fallback
+            }
+        }
+
+        return Plan(entries: entries, finalGroupName: finalGroupName, finalOptions: finalOptions, unreadableResources: unreadable)
     }
+
+    /// Karing is left out: its core is sing-box, which has no MRS reader.
+    private static let mrsTargets: Set<ClientTarget> = [.clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi]
 
     /// MRS supports compact domain and CIDR tries, not the mixed `classical`
     /// grammar used by ACL4SSR. Tower therefore emits verified binary slices
@@ -160,6 +218,7 @@ struct RuleSetEmissionPlanner {
         for alternative in alternatives {
             let shouldEmit: Bool
             let format: NativeFormat
+        var options: [String] = []
             let suffix: String
             switch alternative.behavior {
             case .domain:
@@ -228,6 +287,13 @@ struct RuleSetEmissionPlanner {
         return (entries, remoteIndex)
     }
 
+    private func providerFormat(_ ruleset: RuleSchemeRuleset, target: ClientTarget, lines: [String]) -> NativeFormat? {
+        guard target.usesClashFormat, let metadata = ruleset.provider,
+              ["domain", "ipcidr", "domain-text", "ipcidr-text"].contains(metadata.behavior ?? ""),
+              !lines.isEmpty else { return nil }
+        return repository.isClashProviderYAML(ruleset.resource) ? .clashProviderYAML : .classicalText
+    }
+
     private func nativeFormat(
         for target: ClientTarget,
         url: URL,
@@ -235,18 +301,29 @@ struct RuleSetEmissionPlanner {
         isClashProviderYAML: Bool
     ) -> NativeFormat? {
         switch target {
-        case .clash, .clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi, .karing:
+        case .clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi:
+            // Mihomo accepts this Surge domain flag in classical HTTP providers
+            // and ignores it, just as for inline domain rules. This preserves
+            // ordinary domain matching; it does not enable Surge-style sniffing.
+            guard linesAreClassical(lines, allowedTypes: Self.clashRuleTypes, allowExtendedMatching: true) else { return nil }
+            return isClashProviderYAML ? .clashProviderYAML : .classicalText
+        case .clash:
+            // Stash supports classical text providers. Preserve this resource
+            // for client validation; do not claim Surge sniffing semantics.
+            guard linesAreClassical(lines, allowedTypes: Self.clashRuleTypes, allowExtendedMatching: true) else { return nil }
+            return isClashProviderYAML ? .clashProviderYAML : .classicalText
+        case .karing:
             guard linesAreClassical(lines, allowedTypes: Self.clashRuleTypes) else { return nil }
             return isClashProviderYAML ? .clashProviderYAML : .classicalText
         case .surge, .surgeMac:
-            return !isClashProviderYAML && linesAreClassical(lines, allowedTypes: Self.surgeRuleTypes)
+            return !isClashProviderYAML && linesAreClassical(lines, allowedTypes: Self.surgeRuleTypes, allowExtendedMatching: true)
                 ? .classicalText
                 : nil
         case .shadowrocket:
             // Shadowrocket receives a Clash-compatible YAML profile, so its
             // remote resources use Clash provider syntax. The lines inside
             // still have to stay within Shadowrocket's own rule vocabulary.
-            guard linesAreClassical(lines, allowedTypes: Self.surgeRuleTypes) else { return nil }
+            guard linesAreClassical(lines, allowedTypes: Self.shadowrocketRuleTypes) else { return nil }
             return isClashProviderYAML ? .clashProviderYAML : .classicalText
         case .loon:
             return !isClashProviderYAML && linesAreClassical(lines, allowedTypes: Self.loonRuleTypes)
@@ -258,7 +335,7 @@ struct RuleSetEmissionPlanner {
             return isSingBoxSource(url: url, lines: lines) ? .singBoxSource : nil
         case .egern:
             return isEgernRuleSet(lines) ? .egernYAML : nil
-        case .v2box:
+        case .v2box, .anywhere:
             return nil
         }
     }
@@ -266,14 +343,25 @@ struct RuleSetEmissionPlanner {
     /// Classical remote lists contain only the matcher and its value. A list
     /// that already embeds policies is a complete rule file, not a reusable
     /// rule set, so Tower keeps mapping it locally.
-    private func linesAreClassical(_ lines: [String], allowedTypes: Set<String>) -> Bool {
+    private func linesAreClassical(
+        _ lines: [String],
+        allowedTypes: Set<String>,
+        allowExtendedMatching: Bool = false
+    ) -> Bool {
         guard !lines.isEmpty else { return false }
         return lines.allSatisfy { line in
             let parts = fields(in: line)
             guard parts.count >= 2,
                   parts.count <= 3,
                   allowedTypes.contains(parts[0].uppercased()) else { return false }
-            return parts.count == 2 || parts[2].lowercased() == "no-resolve"
+            guard parts.count == 3 else { return true }
+            if parts[2].lowercased() == "no-resolve" { return true }
+            // Surge permits this flag inside external rule sets. Do not apply
+            // it to the RULE-SET reference or assume other dialects support it.
+            return allowExtendedMatching
+                && parts[2].lowercased() == "extended-matching"
+                && ["DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-WILDCARD", "URL-REGEX"]
+                    .contains(parts[0].uppercased())
         }
     }
 
@@ -354,7 +442,17 @@ struct RuleSetEmissionPlanner {
         "PROTOCOL", "SUBNET"
     ]
 
-    private static let loonRuleTypes = surgeRuleTypes
+    /// Loon's remote rule lists (nsloon.app/docs/Rule/sub_rule).
+    private static let loonRuleTypes: Set<String> = [
+        "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "IP-CIDR", "IP-CIDR6",
+        "GEOIP", "IP-ASN", "USER-AGENT", "URL-REGEX"
+    ]
+
+    /// Shadowrocket's documented rule types, without its logical rules.
+    private static let shadowrocketRuleTypes: Set<String> = [
+        "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-WILDCARD", "USER-AGENT",
+        "URL-REGEX", "IP-CIDR", "IP-CIDR6", "IP-ASN", "GEOIP", "DST-PORT"
+    ]
 
     private static let quanXRuleTypes: Set<String> = [
         "host", "host-suffix", "host-keyword", "host-wildcard",

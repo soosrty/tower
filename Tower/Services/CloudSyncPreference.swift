@@ -9,11 +9,11 @@ import Foundation
 enum CloudSyncPreference {
     private static let key = "icloud-sync-enabled"
 
-    static func isEnabled(defaults: UserDefaults = .standard) -> Bool {
+    static func isEnabled(defaults: UserDefaults = TowerTestIsolation.defaults) -> Bool {
         defaults.bool(forKey: key)
     }
 
-    static func setEnabled(_ enabled: Bool, defaults: UserDefaults = .standard) {
+    static func setEnabled(_ enabled: Bool, defaults: UserDefaults = TowerTestIsolation.defaults) {
         defaults.set(enabled, forKey: key)
     }
 }

@@ -117,7 +117,7 @@ struct ClientFilterView: View {
             .onAppear {
                 viewportHeight = viewport.size.height
             }
-            .onChange(of: viewport.size.height) { height in
+            .towerOnChange(of: viewport.size.height) { height in
                 viewportHeight = height
             }
             .onDisappear {
@@ -130,14 +130,15 @@ struct ClientFilterView: View {
         .navigationTitle("客户端筛选")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear(perform: synchronizeOrder)
-        .onChange(of: model.exportDestinationOrder) { destinations in
+        .towerOnChange(of: model.exportDestinationOrder) { destinations in
             guard dragSession == nil else { return }
             orderedDestinations = destinations
         }
-        .onChange(of: scenePhase) { phase in
+        .towerOnChange(of: scenePhase) { phase in
             guard phase != .active, dragSession != nil || settlingSession != nil else { return }
             resetDragState()
         }
+        .towerFeedback(.selection, trigger: interactionFeedback)
     }
 
     private var displayedSection: some View {
@@ -149,7 +150,6 @@ struct ClientFilterView: View {
                 Text("\(displayedDestinations.count) 个")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
-                    .contentTransition(.opacity)
             }
             .padding(.horizontal, 4)
 
@@ -522,13 +522,12 @@ struct ClientFilterView: View {
         settlingSession = dragSession
         dragSession = nil
         let token = session.token
-        withAnimation(
-            TowerMotion.disclosure(reduceMotion: false)
-        ) {
+        towerWithAnimation(TowerMotion.disclosure(reduceMotion: false), {
             settlingSession = session
-        }
+        }, completion: {
             guard settlingSession?.token == token else { return }
             settlingSession = nil
+        }
     }
 
     private func cancelDragging(_ destination: ExportDestination) {
@@ -552,14 +551,13 @@ struct ClientFilterView: View {
         settlingSession = dragSession
         dragSession = nil
         let token = session.token
-        withAnimation(
-            TowerMotion.disclosure(reduceMotion: false)
-        ) {
+        towerWithAnimation(TowerMotion.disclosure(reduceMotion: false), {
             orderedDestinations = session.originalOrder
             settlingSession = session
-        }
+        }, completion: {
             guard settlingSession?.token == token else { return }
             settlingSession = nil
+        }
     }
 
     private func resetDragState() {

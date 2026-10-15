@@ -124,7 +124,7 @@ struct ConfigurationGenerator {
                 preset: preset,
                 regionGroups: regionGroups
             )
-        case .v2box:
+        case .v2box, .anywhere:
             content = ""
         }
 
@@ -135,7 +135,8 @@ struct ConfigurationGenerator {
             skippedNodeCount: nodes.filter { $0.sourceID.map(remoteSourceIDs.contains) != true }.count - inlineNodes.count,
             ruleCount: rules.count(for: preset),
             fileExtensionOverride: target == .shadowrocket ? "yaml" : nil,
-            remoteSourceCount: remoteEntries.count
+            remoteSourceCount: remoteEntries.count,
+            skippedNodes: skippedDetails(nodes: nodes, exported: inlineNodes, remoteSourceIDs: remoteSourceIDs, target: target, excludedKinds: excludedKinds, supportedKindsOverride: supportedKindsOverride)
         )
     }
 
@@ -159,9 +160,40 @@ struct ConfigurationGenerator {
         var scheme = scheme
         var downgradedSmart = false
         var ignoredNotifications = false
+        // Surge-only rejects become the target's nearest reject instead of
+        // blocking the whole export; the request is refused either way.
+        var substitutedPolicies: [String: String] = [:]
+        func substituted(_ name: String) -> String {
+            guard RoutingBuiltinPolicies.names.contains(name),
+                  let replacement = RoutingBuiltinPolicies.substitute(for: name, target: target) else { return name }
+            substitutedPolicies[name] = replacement
+            return replacement
+        }
+        scheme.rulesets = scheme.rulesets.map {
+            RuleSchemeRuleset(groupName: substituted($0.groupName), resource: $0.resource, options: $0.options, provider: $0.provider)
+        }
+        scheme.groups = scheme.groups.map { group in
+            RuleSchemeGroup(name: group.name, kind: group.kind,
+                            members: group.members.map { member in
+                                guard case .reference(let name) = member else { return member }
+                                return .reference(substituted(name))
+                            },
+                            testURLString: group.testURLString, interval: group.interval, tolerance: group.tolerance,
+                            algorithm: group.algorithm, sourceType: group.sourceType,
+                            sourceFormat: group.sourceFormat, parameters: group.parameters,
+                            isCustomNodeFilter: group.isCustomNodeFilter)
+        }
         scheme.groups = scheme.groups.map { group in
             let downgrade = group.kind == .smart && ![ClientTarget.surge, .surgeMac, .egern].contains(target)
             var parameters = group.parameters
+            // Source exclusions still constrain local materialization when the
+            // destination cannot emit these native options. Keep their internal
+            // meaning separate from the options passed to the client.
+            if parameters?["tower-source-patterns"] != nil {
+                for key in ["exclude-filter", "exclude-type"] {
+                    if let value = parameters?[key] { parameters?["tower-source-" + key] = value }
+                }
+            }
             if downgrade {
                 downgradedSmart = true
                 parameters?["priorities"] = nil
@@ -235,12 +267,15 @@ struct ConfigurationGenerator {
             let label = RuleSchemePolicyValidator.Code.duplicateGroupName.displayTitle
             diagnostics.append(String(localized: "策略组校验失败（\(label)）：\(detail)。请修正后导出。"))
         }
+        // Surge fetches a DOMAIN-SET itself when it is referenced remotely;
+        // every other list is read from this device's copy.
         let missingDomainSets = !([.surge, .surgeMac].contains(target) && preferRuleSets)
             && scheme.rulesets.contains { !schemes.hasDomainSetContent($0.resource) }
-        if missingDomainSets {
+        let missingRuleLists = scheme.rulesets.contains { !$0.isBinaryRuleSet && !schemes.hasRuleListContent($0.resource) }
+        if missingDomainSets || missingRuleLists {
             diagnostics.append(String(localized: "部分规则还没下载完成") + " · " + String(localized: "刷新规则"))
         }
-        let capabilityBlocked = !diagnostics.isEmpty
+        var capabilityBlocked = !diagnostics.isEmpty
         diagnostics += adaptationDiagnostics
         if downgradedSmart {
             diagnostics.append(String(localized: "当前客户端不支持 Smart，已转换为延迟优选。"))
@@ -249,13 +284,13 @@ struct ConfigurationGenerator {
             diagnostics.append(String(localized: "已忽略当前客户端不支持的通知设置。"))
         }
         for (source, group) in zip(scheme.groups, resolved) where group.kind == .select
-            && group.members == [builtinPolicyName("REJECT", target: target)]
-            && !(source.kind == .select && source.members == [.reference("REJECT")]) {
-            diagnostics.append(String(localized: "策略组“\(group.name)”没有匹配节点，已设为拒绝连接。"))
+            && group.members == [builtinPolicyName("DIRECT", target: target)]
+            && !(source.kind == .select && source.members == [.reference("DIRECT")]) {
+            diagnostics.append(String(localized: "策略组“\(group.name)”没有可用节点：其他策略组不再引用它，规则直接指向它时走直连。"))
         }
         let knownPolicies = Set(scheme.groups.map(\.name)
             + supported.map { NodeRegionResolver.displayName(for: $0) }
-            + ["DIRECT", "REJECT", "REJECT-DROP", "direct", "reject", "reject-drop"])
+            + Array(RoutingBuiltinPolicies.names))
         let references = scheme.groups.flatMap(\.members).compactMap { member -> String? in
             guard case .reference(let name) = member else { return nil }
             return name
@@ -270,6 +305,59 @@ struct ConfigurationGenerator {
             target: target,
             preferRuleSets: preferRuleSets
         )
+        var droppedOptionNames: Set<String> = []
+        if !rulePlan.finalOptions.isEmpty,
+           !RoutingRuleCapabilities.surgeTargets.contains(target) {
+            // `dns-failed` and the notification options only change what Surge
+            // does around FINAL; every other client falls through to FINAL anyway.
+            let ignorable = RoutingRuleCapabilities.ignorableOptions.union(["dns-failed"])
+            let kept = rulePlan.finalOptions.filter { !ignorable.contains(RoutingRuleCapabilities.optionKey($0)) }
+            droppedOptionNames.formUnion(rulePlan.finalOptions.map(RoutingRuleCapabilities.optionKey).filter(ignorable.contains))
+            if !kept.isEmpty {
+                capabilityBlocked = true
+                let body = (["FINAL", rulePlan.finalGroupName ?? ""] + kept).joined(separator: ",")
+                diagnostics.append(String(localized: "无法转换规则：\(body) → \(target.name)。"))
+            }
+        }
+        var unsupportedRuleCount = 0
+        // A reject the client cannot express is left out rather than blocking
+        // the export: those requests will not be blocked, and the notice at
+        // the top of the list says so.
+        var skippedRejectCount = 0
+        for resource in rulePlan.unreadableResources {
+            if resource.policyName.uppercased().hasPrefix("REJECT") { skippedRejectCount += 1 }
+            let file = resource.url.lastPathComponent
+            diagnostics.append(String(localized: "\(target.name) 无法读取 MRS 规则集，已跳过：\(file)（\(resource.policyName)）。"))
+        }
+        for rule in rulePlan.inlineRules {
+            if rule.line.contains("-matching") || rule.line.contains("notification-") || rule.line.contains("always-capture") {
+                droppedOptionNames.formUnion(RoutingRuleCapabilities.droppedOptions(inRule: rule.line, target: target)
+                    .map(RoutingRuleCapabilities.optionKey))
+            }
+            let supportedRule: Bool
+            if target.usesSingBoxFormat { supportedRule = RoutingRuleCapabilities.singBoxCondition(rule.line) != nil }
+            else if target == .egern { supportedRule = egernRule(rule.line, policy: rule.policyName) != nil }
+            else { supportedRule = mappedRule(rule.line, policyName: rule.policyName, target: target) != nil }
+            if !supportedRule {
+                unsupportedRuleCount += 1
+                if rule.policyName.uppercased().hasPrefix("REJECT") { skippedRejectCount += 1 }
+                diagnostics.append(String(localized: "无法转换规则：\(rule.line) → \(target.name)。"))
+            }
+        }
+        if skippedRejectCount > 0 {
+            diagnostics.insert(String(localized: "\(skippedRejectCount) 条拦截规则无法在 \(target.name) 中表达，已跳过：这些请求不会被拦截。"), at: 0)
+        }
+        for policy in Set(scheme.rulesets.map(\.groupName) + references) where RoutingBuiltinPolicies.names.contains(policy) && !RoutingBuiltinPolicies.supports(policy, target: target) {
+            capabilityBlocked = true
+            diagnostics.append(String(localized: "当前客户端不支持内置策略：\(policy)。"))
+        }
+        for (policy, replacement) in substitutedPolicies.sorted(by: { $0.key < $1.key }) {
+            diagnostics.append(String(localized: "已将内置策略 \(policy) 转换为 \(replacement)。"))
+        }
+        if !droppedOptionNames.isEmpty {
+            let names = droppedOptionNames.sorted().joined(separator: ", ")
+            diagnostics.append(String(localized: "已忽略当前客户端不支持的规则参数：\(names)。"))
+        }
         let content: String
         switch target {
         case .clash, .clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi, .karing:
@@ -326,7 +414,12 @@ struct ConfigurationGenerator {
                 groups: resolved,
                 nodes: supported,
                 rulePlan: rulePlan,
-                target: target
+                target: target,
+                dnsDomainRules: target == .singBox ? SingBoxDNSPolicy.domainRules(from:
+                    RuleSetEmissionPlanner(repository: schemes).plan(
+                        for: scheme, target: target, preferRuleSets: false
+                    ).inlineRules
+                ) : []
             )
         case .egern:
             content = egernScheme(
@@ -337,7 +430,7 @@ struct ConfigurationGenerator {
                 remoteSubscriptions: remoteEntries,
                 rulePlan: rulePlan
             )
-        case .v2box:
+        case .v2box, .anywhere:
             content = ""
         }
 
@@ -346,11 +439,12 @@ struct ConfigurationGenerator {
             content: unknownPolicies.isEmpty && !capabilityBlocked ? content : "",
             supportedNodeCount: inlineNodes.count,
             skippedNodeCount: nodes.filter { $0.sourceID.map(remoteSourceIDs.contains) != true }.count - inlineNodes.count,
-            ruleCount: ruleCount(for: scheme, schemes: schemes),
+            ruleCount: capabilityBlocked || !unknownPolicies.isEmpty ? 0 : max(0, ruleCount(for: scheme, schemes: schemes) - unsupportedRuleCount),
             fileExtensionOverride: target == .shadowrocket ? "yaml" : nil,
             remoteSourceCount: remoteEntries.count,
             diagnostics: diagnostics,
-            hasInvalidPolicyReferences: !unknownPolicies.isEmpty || capabilityBlocked
+            hasInvalidPolicyReferences: !unknownPolicies.isEmpty || capabilityBlocked,
+            skippedNodes: skippedDetails(nodes: nodes, exported: inlineNodes, remoteSourceIDs: remoteSourceIDs, target: target, excludedKinds: excludedKinds, supportedKindsOverride: supportedKindsOverride)
         )
     }
 
@@ -570,6 +664,8 @@ struct ConfigurationGenerator {
                     return false
                 }
                 if ["tower-source-patterns", "tower-source-tags"].contains(key) { return stringArray(value) == nil }
+                if key == "tower-source-exclude-filter" { return !isSafeNativeOption("exclude-filter", value: value) }
+                if key == "tower-source-exclude-type" { return !isSafeNativeOption("exclude-type", value: value) }
                 if represented.contains(key) { return false }
                 if nativeOptionKeys(sourceFormat: group.sourceFormat, target: target).contains(key),
                    isSafeNativeOption(key, value: value) { return false }
@@ -595,7 +691,7 @@ struct ConfigurationGenerator {
         excludedKinds: Set<ProxyKind> = [],
         profileName: String = TowerBrand.localizedName
     ) -> GeneratedConfiguration {
-        guard target.supportsNodesOnlyImport else {
+        guard target.supportsNodesOnlyExport else {
             return GeneratedConfiguration(
                 target: target,
                 content: "",
@@ -604,35 +700,83 @@ struct ConfigurationGenerator {
                 ruleCount: 0,
                 profileName: profileName,
                 contentMode: .nodesOnly,
-                fileExtensionOverride: "txt"
+                fileExtensionOverride: target.usesClashFormat ? "yaml" : "txt",
+                skippedNodes: skippedDetails(nodes: nodes, exported: [], target: target, excludedKinds: excludedKinds, nodesOnly: true)
             )
         }
 
         var supported = uniquedNames(
             nodes.filter { writes($0, to: target, excluding: excludedKinds) },
-            reservedNames: []
+            reservedNames: target.copiesAggregatedSubscription(mode: .nodesOnly)
+                ? ["DIRECT", "REJECT", "direct", "reject"] : []
         )
+        // A Surge policy-path list cannot carry the separate WireGuard section
+        // required by section-name. Keep these nodes in full-profile export.
+        if target == .surge || target == .surgeMac {
+            supported.removeAll { $0.kind == .wireguard }
+        }
         // Snell has no subscription URI. WireGuard URI conventions also vary
         // between producers, so Shadowrocket receives both only in the full
         // profile form that carries their complete settings.
         if target == .shadowrocket {
             supported.removeAll { $0.kind == .snell || $0.kind == .wireguard }
         }
+        // These clients accept structured node subscriptions. Keep the legacy
+        // URI path for ordinary lists; ShadowTLS needs both credential layers.
+        // Native SS TLS also has no URI form, so it takes Shadowrocket's YAML.
+        // SSH and TrustTunnel have no URI either.
+        let structuredNodes = supported.contains {
+            $0.shadowTLS != nil || $0.masque?.mode == .keyConnectIP
+                || (target == .shadowrocket && isNativeShadowsocksTLS($0))
+                || [.ssh, .trustTunnel].contains($0.kind)
+        }
+        var fileExtension = target.usesClashFormat ? "yaml" : "txt"
 
         let content: String
         switch target {
         case .shadowrocket:
-            let generator = ProxyNodeShareLinkGenerator()
-            let links = supported.map { generator.canonicalLink(for: $0) }
-                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            content = Data(links.joined(separator: "\n").utf8).base64EncodedString()
+            if structuredNodes {
+                content = "proxies:\n" + supported.map { clashNode($0, target: target) }.joined(separator: "\n") + "\n"
+                fileExtension = "yaml"
+            } else {
+                let generator = ProxyNodeShareLinkGenerator()
+                let links = supported.map { generator.canonicalLink(for: $0) }
+                    .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                content = Data(links.joined(separator: "\n").utf8).base64EncodedString()
+            }
+        case .clash, .clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi, .karing:
+            content = "proxies:\n" + (supported.isEmpty
+                ? "  []\n"
+                : supported.map { clashNode($0, target: target) }.joined(separator: "\n") + "\n")
+        case .surge, .surgeMac:
+            content = supported.map { surgeNode($0, shadowrocket: false) }.joined(separator: "\n")
+                + (supported.isEmpty ? "" : "\n")
         case .loon:
             content = supported.map(loonNode).joined(separator: "\n") + (supported.isEmpty ? "" : "\n")
         case .quanx:
             content = supported.map(quanXNode).joined(separator: "\n") + (supported.isEmpty ? "" : "\n")
         case .hiddify:
-            let generator = ProxyNodeShareLinkGenerator()
-            content = supported.map { generator.canonicalLink(for: $0) }.joined(separator: "\n")
+            if structuredNodes {
+                // Hiddify builds its own routing and selectors from outbounds.
+                // Its §hide§ convention keeps the TLS transport out of choices.
+                let payload: [String: Any] = ["outbounds": singBoxNodeOutbounds(
+                    supported, reservedTags: [], hideHelpers: true
+                )]
+                if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]),
+                   let json = String(data: data, encoding: .utf8) {
+                    content = json
+                } else {
+                    content = ""
+                    supported = []
+                }
+                fileExtension = "json"
+            } else {
+                let generator = ProxyNodeShareLinkGenerator()
+                content = supported.map { generator.canonicalLink(for: $0) }.joined(separator: "\n")
+                    + (supported.isEmpty ? "" : "\n")
+            }
+        case .anywhere:
+            content = supported.map { AnywhereExport.link(for: $0) }.joined(separator: "\n")
                 + (supported.isEmpty ? "" : "\n")
         case .v2box:
             let generator = ProxyNodeShareLinkGenerator()
@@ -652,8 +796,41 @@ struct ConfigurationGenerator {
             ruleCount: 0,
             profileName: profileName,
             contentMode: .nodesOnly,
-            fileExtensionOverride: "txt"
+            fileExtensionOverride: fileExtension,
+            skippedNodes: skippedDetails(nodes: nodes, exported: supported, target: target, excludedKinds: excludedKinds, nodesOnly: true)
         )
+    }
+
+    private func skippedDetails(
+        nodes: [ProxyNode], exported: [ProxyNode], remoteSourceIDs: Set<UUID> = [],
+        target: ClientTarget, excludedKinds: Set<ProxyKind>,
+        supportedKindsOverride: Set<ProxyKind>? = nil, nodesOnly: Bool = false
+    ) -> [SkippedExportNode] {
+        let exportedIDs = Set(exported.map(\.id))
+        return nodes.compactMap { node in
+            guard !exportedIDs.contains(node.id), node.sourceID.map(remoteSourceIDs.contains) != true else { return nil }
+            let reason: String
+            if excludedKinds.contains(node.kind) {
+                reason = String(localized: "已在协议筛选中排除。")
+            } else if !(supportedKindsOverride?.contains(node.kind) ?? target.supports(node.kind)) {
+                reason = String(localized: "当前客户端不支持此协议。")
+            } else if [.singBox, .hiddify].contains(target), certificatePin(node) != nil {
+                reason = String(localized: "当前客户端无法保留此节点的证书指纹校验。")
+            } else if [.vmess, .vless].contains(node.kind), node.exportableUUID == nil {
+                reason = String(localized: "节点认证信息无效或不完整。")
+            } else if nodesOnly && (!target.supportsNodesOnlyExport
+                || ([ClientTarget.surge, .surgeMac].contains(target) && node.kind == .wireguard)
+                || (target == .shadowrocket && [.snell, .wireguard].contains(node.kind))) {
+                reason = String(localized: "仅节点格式无法保留完整参数，请使用完整配置。")
+            } else if target == .anywhere, let anywhere = AnywhereExport.unsupportedReason(node) {
+                reason = anywhere
+            } else if !canExpressTransport(of: node, on: target) {
+                reason = String(localized: "当前客户端不支持此节点的传输方式。")
+            } else {
+                reason = String(localized: "此节点的协议参数无法在当前客户端完整保留。")
+            }
+            return SkippedExportNode(name: node.name, kind: node.kind, reason: reason)
+        }
     }
 
     /// A node reaches the configuration when the client can express it and the
@@ -665,8 +842,23 @@ struct ConfigurationGenerator {
         excluding excludedKinds: Set<ProxyKind>,
         supportedKindsOverride: Set<ProxyKind>? = nil
     ) -> Bool {
+        if node.kind == .masque {
+            guard node.hasSupportedMASQUEFields else { return false }
+            switch node.masque?.mode {
+            case .keyConnectIP:
+                guard [.clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi, .shadowrocket].contains(target) else { return false }
+            case .basicConnectIP:
+                guard target == .singBox else { return false }
+            case nil:
+                guard [.surge, .surgeMac].contains(target) else { return false }
+            }
+        }
         let supportsKind = supportedKindsOverride?.contains(node.kind) ?? target.supports(node.kind)
         guard supportsKind, !excludedKinds.contains(node.kind) else { return false }
+        if target == .anywhere, !AnywhereExport.supports(node) { return false }
+        // sing-box supports SPKI/public-key hashes, not leaf-certificate hashes.
+        // Never silently discard a pin or relabel it as a public-key digest.
+        if [.singBox, .hiddify].contains(target), certificatePin(node) != nil { return false }
         // An id that is neither a UUID nor short enough for Xray's name mapping
         // has no faithful form; writing it blank would look fine and never
         // connect.
@@ -696,16 +888,53 @@ struct ConfigurationGenerator {
         // Do not emit ordinary TLS when the source requires Reality.
         if target == .clash, node.usesReality,
            node.kind != .vless || !["", "tcp"].contains(node.transport?.lowercased() ?? "tcp") { return false }
-        // Hako's verified outbound implementations do not consume Reality for
-        // these kinds or native SS TLS. Preserve the source and report skips.
-        if [.clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty].contains(target) {
-            if node.usesReality, [.anytls, .socks5, .http].contains(node.kind) { return false }
-            if node.kind == .shadowsocks, node.tls,
-               (node.plugin ?? "").isEmpty, simpleObfsMode(node) == nil { return false }
+        // Mihomo's outbounds (Hako and Clash Mi ship it too) do not consume
+        // Reality for these kinds; the YAML loads and then connects with plain
+        // TLS to the borrowed SNI. Clash Mi users reported exactly 07/09/10
+        // failing, and a mihomo 1.19.31 run reproduces it.
+        if [.clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi].contains(target),
+           node.usesReality, [.anytls, .socks5, .http].contains(node.kind) { return false }
+        // Only Loon's VMess, VLESS, Trojan and AnyTLS take `public-key`. Its
+        // SOCKS5 and HTTP(S) proxies have no Reality field. Karing's sing-box
+        // core has no SOCKS TLS at all, and users saw its HTTP Reality fail.
+        if [.loon, .karing].contains(target), node.usesReality, [.socks5, .http].contains(node.kind) { return false }
+        if target == .karing, node.kind == .socks5, node.tls { return false }
+        // Karing users saw Trojan Reality fail twice (2026-09-06, 2026-09-28).
+        if target == .karing, node.kind == .trojan, node.usesReality { return false }
+        // Mihomo's and Stash's SOCKS5 have no SNI field: TLS always names the
+        // server address. A node whose SNI differs (an IP or a front) failed
+        // its certificate check there, so it is skipped rather than degraded.
+        if node.kind == .socks5, node.tls, !node.usesReality,
+           let sni = node.sni?.trimmingCharacters(in: .whitespacesAndNewlines), !sni.isEmpty,
+           sni.lowercased() != node.server.lowercased(),
+           [.clash, .clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi].contains(target) { return false }
+        // Native SS-over-TLS (no plugin, no simple-obfs) has a field only in
+        // Shadowrocket (`tls: true`) and Quantumult X (`obfs=over-tls`). Every
+        // other writer — Surge, Loon, Stash, mihomo, sing-box, URI lists —
+        // dropped TLS and handed out plain Shadowsocks that cannot connect.
+        if isNativeShadowsocksTLS(node), ![.shadowrocket, .quanx].contains(target) { return false }
+        if node.kind == .ssh {
+            let options = node.ssh ?? SSHOptions()
+            // Surge keeps SSH keys in [Keystore], which Tower does not write.
+            if [.surge, .surgeMac].contains(target), options.privateKey != nil { return false }
+            // Neither Surge nor Egern takes a key passphrase.
+            if [.surge, .surgeMac, .egern].contains(target), options.privateKeyPassphrase != nil { return false }
+            // Stash cannot pin the host key; dropping the pin would trust any server.
+            if target == .clash, !options.hostKeys.isEmpty { return false }
+            // Shadowrocket 2.2.92 logs in with a password but closes key-based
+            // sessions before authenticating (sshd log, 2026-09-28), with the
+            // same key mihomo, Egern and Clash Mi accept.
+            if target == .shadowrocket, options.privateKey != nil { return false }
         }
-        // Native SS-over-TLS is distinct from Stash's supported SS plugins.
-        if target == .clash, node.kind == .shadowsocks, node.tls,
-           (node.plugin ?? "").isEmpty, simpleObfsMode(node) == nil { return false }
+        // Stash 3.4.1 timed out on TrustTunnel over HTTP/2, with or without an
+        // h2 ALPN, while HTTP/3 to the same server and HTTP/2 from Surge,
+        // Shadowrocket and Clash Mi all connected.
+        if node.kind == .trustTunnel, target == .clash, node.trustTunnel?.quic != true { return false }
+        if !supportsShadowsocksCipher(node, on: target) { return false }
+        // Xray's VLESS encryption was run against mihomo 1.19.31 only; other
+        // clients either lack the field or ignore it and send plain VLESS.
+        if node.kind == .vless, node.vlessEncryption != nil,
+           ![.clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi].contains(target) { return false }
         // Stash before iOS 3.6 rejects Snell v4/v5 at configuration load time.
         // Until a client-version preference exists, use the compatible v1-v3
         // baseline. Never rewrite the version: it must match the server.
@@ -721,22 +950,65 @@ struct ConfigurationGenerator {
             guard [4, 5].contains(node.version ?? 4) else { return false }
             if let obfs = node.obfs, !obfs.isEmpty, !["none", "http"].contains(obfs.lowercased()) { return false }
         }
-        // Official Shadowsocks has no native TLS field. Its SIP003 plugins
-        // carry their own TLS; never silently export native SS TLS as plain SS.
-        if [.singBox, .hiddify].contains(target), node.kind == .shadowsocks,
-           node.tls, (node.plugin ?? "").isEmpty, simpleObfsMode(node) == nil { return false }
         // The official SOCKS outbound cannot express TLS. Dropping TLS would
         // change the protocol; exclude the node and keep it in skipped counts.
         if [.singBox, .hiddify].contains(target), node.kind == .socks5, node.tls || node.usesReality { return false }
-        // Surge and Shadowrocket carry Hysteria 2's obfuscator in the key name
-        // — `salamander-password` and a bare `obfsParam` — so neither has any
+        // Surge, Loon and Shadowrocket carry Hysteria 2's obfuscator in the key
+        // name — `salamander-password` and a bare `obfsParam` — so none has any
         // way to say "some other obfuscator". (Surge also documents its own
         // `gecko-password`, but nothing Tower parses produces that name.)
         // Writing one anyway would hand the password to Salamander and produce
         // the "looks right, never connects" outcome, so the node is skipped and
         // counted instead.
-        if node.kind == .hysteria2, [.surge, .surgeMac, .shadowrocket].contains(target),
+        if node.kind == .hysteria2, [.surge, .surgeMac, .shadowrocket, .loon].contains(target),
            let obfs = hysteria2Obfs(node), obfs.type.lowercased() != "salamander" { return false }
+        // Loon's Salamander password is a bare field; a delimiter inside it
+        // would split the line into different settings.
+        if node.kind == .hysteria2, target == .loon, let obfs = hysteria2Obfs(node),
+           obfs.password.rangeOfCharacter(from: Self.loonBareFieldDelimiters) != nil { return false }
+        if node.shadowTLS != nil || node.plugin == "shadow-tls" {
+            guard node.kind == .shadowsocks, node.plugin == "shadow-tls",
+                  let options = node.shadowTLS, options.isValid,
+                  node.obfs == nil, node.transport == nil, !node.tls,
+                  certificatePin(node) == nil else { return false }
+            switch target {
+            case .clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi:
+                // Mihomo's ShadowTLS client does not offer skip-cert-verify.
+                guard !options.skipCertificateVerification else { return false }
+            case .clash:
+                guard options.version >= 2, node.fingerprint == nil else { return false }
+            case .surge, .surgeMac:
+                guard options.version >= 2, !options.skipCertificateVerification,
+                      node.fingerprint == nil else { return false }
+                if node.cipher == "2022-blake3-chacha20-poly1305" { return false }
+            case .shadowrocket:
+                // Official release notes confirm v3; Sub-Store retains the SS
+                // plugin object in YAML. Do not infer support for extra TLS
+                // options or the separate URI import path from that evidence.
+                guard options.version == 3, !options.skipCertificateVerification,
+                      node.fingerprint == nil else { return false }
+            case .loon:
+                // Loon uses v2/v3 and a bare ShadowTLS password (unlike its
+                // quoted positional SS password). Do not change the credential
+                // with percent escaping or let delimiters create extra fields.
+                let delimiters = Self.loonBareFieldDelimiters
+                guard options.version >= 2, !options.skipCertificateVerification,
+                      node.fingerprint == nil,
+                      options.password.rangeOfCharacter(from: delimiters) == nil,
+                      options.host.rangeOfCharacter(from: delimiters) == nil else { return false }
+            case .egern:
+                // Egern's shadow_tls object has no version selector. Its
+                // documented fields and Sub-Store adapter describe v3 only.
+                guard options.version == 3, !options.skipCertificateVerification,
+                      node.fingerprint == nil else { return false }
+            case .singBox, .hiddify:
+                // A ShadowTLS detour only carries TCP. Explicit UDP support
+                // requires a separately modelled native UDP path or UoT.
+                guard node.udpRelayEnabled != true else { return false }
+            default:
+                return false
+            }
+        }
         if node.plugin == "v2ray-plugin" {
             // Quantumult X requires a confirmed non-multiplexed server.
             if target == .quanx, node.pluginMux != false { return false }
@@ -750,6 +1022,52 @@ struct ConfigurationGenerator {
         return true
     }
 
+    /// Shadowsocks ciphers each text-format client documents. A cipher outside
+    /// its list either fails the whole profile or never handshakes — most
+    /// often `2022-blake3-chacha20-poly1305`, which Surge, Loon, Quantumult X
+    /// and Stash do not implement. Sources: the Surge manual and Loon and Egern
+    /// proxy documentation; Quantumult X and Stash via Sub-Store's producers.
+    /// Other targets' cores (mihomo, sing-box, Xray, Shadowrocket) take all.
+    private static let shadowsocksCiphers: [ClientTarget: Set<String>] = {
+        let legacy: Set<String> = ["rc4", "rc4-md5", "aes-128-cfb", "aes-192-cfb", "aes-256-cfb",
+                                   "aes-128-ctr", "aes-192-ctr", "aes-256-ctr", "salsa20", "chacha20", "chacha20-ietf"]
+        let extraLegacy: Set<String> = ["bf-cfb", "camellia-128-cfb", "camellia-192-cfb", "camellia-256-cfb",
+                                        "cast5-cfb", "des-cfb", "idea-cfb", "rc2-cfb", "seed-cfb"]
+        let aead: Set<String> = ["aes-128-gcm", "aes-192-gcm", "aes-256-gcm", "chacha20-ietf-poly1305", "xchacha20-ietf-poly1305"]
+        let aes2022: Set<String> = ["2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"]
+        let surge = legacy.union(aead).union(aes2022).union(["none"])
+        return [
+            .surge: surge,
+            .surgeMac: surge,
+            .loon: legacy.union(extraLegacy).union(aead).union(aes2022),
+            .quanx: legacy.union(aead).union(aes2022)
+                .union(["none", "rc4-md5-6", "bf-cfb", "cast5-cfb", "des-cfb", "rc2-cfb"]),
+            .egern: legacy.union(extraLegacy).union(aes2022)
+                .union(["2022-blake3-chacha20-poly1305", "aes-128-gcm", "aes-256-gcm",
+                        "chacha20-ietf-poly1305", "chacha20-poly1305", "none", "table"]),
+            .clash: aead.union(aes2022).union(["rc4-md5", "chacha20-ietf", "xchacha20",
+                "aes-128-cfb", "aes-192-cfb", "aes-256-cfb", "aes-128-ctr", "aes-192-ctr", "aes-256-ctr"])
+        ]
+    }()
+
+    private func supportsShadowsocksCipher(_ node: ProxyNode, on target: ClientTarget) -> Bool {
+        guard node.kind == .shadowsocks, let allowed = Self.shadowsocksCiphers[target] else { return true }
+        let cipher = (node.cipher ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        // A missing cipher is written as aes-256-gcm, which every list has.
+        return cipher.isEmpty || allowed.contains(cipher)
+    }
+
+    /// Characters that would end or split an unquoted Loon value.
+    private static let loonBareFieldDelimiters = CharacterSet.whitespacesAndNewlines
+        .union(.controlCharacters)
+        .union(CharacterSet(charactersIn: ",\"'\\#;"))
+
+    /// Shadowsocks wrapped in ordinary TLS by the proxy itself, as opposed to
+    /// a SIP003 plugin or simple-obfs carrying its own TLS.
+    private func isNativeShadowsocksTLS(_ node: ProxyNode) -> Bool {
+        node.kind == .shadowsocks && node.tls && (node.plugin ?? "").isEmpty && simpleObfsMode(node) == nil
+    }
+
     private func canExpressTransport(of node: ProxyNode, on target: ClientTarget) -> Bool {
         guard [.vmess, .vless, .trojan].contains(node.kind) else { return true }
         let transport = node.transport?.lowercased() ?? "tcp"
@@ -758,26 +1076,54 @@ struct ConfigurationGenerator {
         case .clash:
             if node.kind == .trojan { return ["ws", "grpc"].contains(transport) }
             return ["ws", "http", "h2", "grpc"].contains(transport)
-        case .clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi, .karing:
+        case .clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi:
             if transport == "xhttp" { return node.kind == .vless }
             return ["ws", "http", "h2", "grpc", "httpupgrade"].contains(transport)
+        case .karing:
+            // Karing converts Clash YAML into its own sing-box core. On device
+            // (1.2.25) HTTP/2 and HTTPUpgrade nodes failed while the same file
+            // connected in mihomo; ws, HTTP/1.1, gRPC and XHTTP all worked.
+            if transport == "xhttp" { return node.kind == .vless }
+            return ["ws", "http", "grpc"].contains(transport)
         case .surge, .surgeMac:
             return transport == "ws" && [.vmess, .trojan].contains(node.kind)
         case .shadowrocket:
             return ["ws", "http", "h2", "grpc", "httpupgrade", "xhttp"].contains(transport)
                 && (transport != "xhttp" || node.kind == .vless)
         case .loon:
-            if node.kind == .trojan { return ["ws", "http"].contains(transport) }
+            // Loon reads a Trojan `transport=http` as WebSocket, so only ws is real.
+            if node.kind == .trojan { return transport == "ws" }
             return ["ws", "http"].contains(transport)
         case .quanx:
-            return transport == "ws" || (node.kind == .vmess && transport == "http" && !node.tls)
+            // sample.conf documents `obfs=http` for both VMess and VLESS.
+            return transport == "ws" || ([.vmess, .vless].contains(node.kind) && transport == "http" && !node.tls)
         case .hiddify, .singBox:
-            return ["ws", "http", "h2", "grpc", "httpupgrade"].contains(transport)
+            // sing-box's one `http` transport is HTTP/2 over TLS and HTTP/1.1
+            // without it, so the other two pairings cannot be written.
+            if transport == "http" { return !node.tls }
+            if transport == "h2" { return node.tls }
+            return ["ws", "grpc", "httpupgrade"].contains(transport)
         case .egern:
-            if node.kind == .trojan { return ["ws", "http"].contains(transport) }
-            return ["ws", "http", "h2", "grpc"].contains(transport)
+            // Egern's Trojan has only `websocket`; any other transport was
+            // written as plain Trojan over TCP.
+            if node.kind == .trojan { return transport == "ws" && !node.usesReality }
+            // Egern takes Reality on its `tls` (TCP) and `grpc` transports
+            // (egernapp.com/docs/configuration/proxies). HTTP/2 is always
+            // ordinary TLS and HTTP/1 never TLS, so other pairings would be
+            // written without the security they need.
+            if node.usesReality { return transport == "grpc" }
+            switch transport {
+            case "ws": return true
+            case "http": return !node.tls
+            case "h2", "grpc": return node.tls
+            default: return false
+            }
+        case .anywhere:
+            return node.kind == .vless && ["ws", "grpc", "httpupgrade", "xhttp"].contains(transport)
         case .v2box:
-            return ["ws", "http", "h2", "grpc", "httpupgrade", "xhttp"].contains(transport)
+            // V2Box runs Xray, which removed its HTTP/2 transport; those
+            // nodes timed out on device.
+            return ["ws", "http", "grpc", "httpupgrade", "xhttp"].contains(transport)
                 && (transport != "xhttp" || node.kind == .vless)
         }
     }
@@ -889,11 +1235,21 @@ struct ConfigurationGenerator {
         return Set(sourceURLHashes.compactMap { hashes.contains($0.value) ? $0.key : nil })
     }
 
+    /// Shared by export and the asynchronous node-matching preview.
+    func sourceEligibleNodes(for group: RuleSchemeGroup, nodes: [ProxyNode], sourceURLHashes: [UUID: String]) -> [ProxyNode] {
+        let sourceIDs = boundSourceIDs(group, sourceURLHashes: sourceURLHashes)
+        return nodes.filter { node in
+            (sourceIDs == nil || node.sourceID.map { sourceIDs!.contains($0) } == true)
+                && sourceNodeAllowed(node, parameters: group.parameters ?? [:],
+                    caseInsensitive: group.sourceFormat == nil || group.sourceFormat == "subconverter")
+        }
+    }
+
     private func sourceNodeAllowed(_ node: ProxyNode, parameters: [String: String], caseInsensitive: Bool) -> Bool {
-        if let exclude = parameters["exclude-filter"],
+        if let exclude = parameters["tower-source-exclude-filter"] ?? parameters["exclude-filter"],
            let expression = try? NSRegularExpression(pattern: exclude, options: caseInsensitive ? [.caseInsensitive] : []),
            expression.firstMatch(in: node.name, range: NSRange(node.name.startIndex..., in: node.name)) != nil { return false }
-        if let excluded = parameters["exclude-type"] {
+        if let excluded = parameters["tower-source-exclude-type"] ?? parameters["exclude-type"] {
             let kind = node.kind == .shadowsocks ? "ss" : node.kind.rawValue.lowercased()
             if excluded.lowercased().split(separator: "|").map(String.init).contains(kind) { return false }
         }
@@ -916,7 +1272,10 @@ struct ConfigurationGenerator {
         let groupNames = Set(scheme.groups.map(\.name))
         let displayNames = nodes.map { NodeRegionResolver.displayName(for: $0) }
 
-        return scheme.groups.map { group in
+        // Groups that had no usable member and were given DIRECT here. A group
+        // that lists DIRECT itself is a real choice, whatever else it lost.
+        var injectedFallbacks = Set<String>()
+        var resolved: [ResolvedSchemeGroup] = scheme.groups.map { group in
             var members: [String] = []
             var nodeNames: [String] = []
             var matchesAllNodes = false
@@ -924,11 +1283,7 @@ struct ConfigurationGenerator {
             var inlineNodeNames: Set<String> = []
             let sourceIDs = boundSourceIDs(group, sourceURLHashes: sourceURLHashes)
             let sourcePatterns = Set(stringArray(group.parameters?["tower-source-patterns"]) ?? [])
-            let dynamicSourceNodes = nodes.filter { node in
-                (sourceIDs == nil || node.sourceID.map { sourceIDs!.contains($0) } == true)
-                    && sourceNodeAllowed(node, parameters: group.parameters ?? [:],
-                        caseInsensitive: group.sourceFormat == nil || group.sourceFormat == "subconverter")
-            }
+            let dynamicSourceNodes = sourceEligibleNodes(for: group, nodes: nodes, sourceURLHashes: sourceURLHashes)
 
             for member in group.members {
                 switch member {
@@ -963,7 +1318,10 @@ struct ConfigurationGenerator {
             let hasRemotePool = !nodePatterns.isEmpty && preserveUnresolvedPatterns
                 && (sourceIDs == nil || !sourceIDs!.intersection(remoteSourceIDs).isEmpty)
             let empty = members.isEmpty && !hasRemotePool
-            if empty { members = [builtinPolicyName("REJECT", target: target)] }
+            if empty {
+                members = [builtinPolicyName("DIRECT", target: target)]
+                injectedFallbacks.insert(group.name)
+            }
             return ResolvedSchemeGroup(
                 name: group.name,
                 kind: empty ? .select : group.kind,
@@ -981,6 +1339,38 @@ struct ConfigurationGenerator {
                 inlineNodeNames: inlineNodeNames
             )
         }
+
+        // A group with no usable node falls back to DIRECT so the client
+        // accepts it, but a parent that lists it first would then default to
+        // DIRECT: ACL4SSR's 🎥 奈飞视频 starts with 🎥 奈飞节点, so a
+        // subscription without Netflix-tagged nodes sent Netflix direct.
+        // Parents drop such groups instead; a parent left with nothing falls
+        // back the same way, and a rule that names the group still works.
+        let direct = builtinPolicyName("DIRECT", target: target)
+        var fallbacks = injectedFallbacks
+        var changed = !fallbacks.isEmpty
+        while changed {
+            changed = false
+            for index in resolved.indices where !fallbacks.contains(resolved[index].name) {
+                let group = resolved[index]
+                guard group.members.contains(where: fallbacks.contains) else { continue }
+                var members = group.members.filter { !fallbacks.contains($0) }
+                let emptied = members.isEmpty
+                if emptied {
+                    members = [direct]
+                    fallbacks.insert(group.name)
+                }
+                resolved[index] = ResolvedSchemeGroup(
+                    name: group.name, kind: emptied ? .select : group.kind, members: members,
+                    nodeNames: group.nodeNames, matchesAllNodes: group.matchesAllNodes, nodePatterns: group.nodePatterns,
+                    testURL: group.testURL, interval: group.interval, tolerance: group.tolerance,
+                    algorithm: group.algorithm, parameters: group.parameters, sourceFormat: group.sourceFormat,
+                    allowedRemoteSourceIDs: group.allowedRemoteSourceIDs, inlineNodeNames: group.inlineNodeNames
+                )
+                changed = true
+            }
+        }
+        return resolved
     }
 
     /// Matches the source regex against both the original remark and the name
@@ -1066,7 +1456,9 @@ struct ConfigurationGenerator {
         let sourceRequestsNoResolve = plan.inlineRules.contains {
             quanXSourceRuleRequestsNoResolve($0.line)
         }
-        if dnsProtectionMode != .followScheme || sourceRequestsNoResolve {
+        // filter_local is matched in full before filter_remote, so this
+        // catch-all would take every hostname before a remote list is read.
+        if dnsProtectionMode != .followScheme || sourceRequestsNoResolve, plan.remoteResources.isEmpty {
             output += "host-keyword, ., \(policy)\n"
         }
         output += "final, \(policy)\n"
@@ -1106,14 +1498,22 @@ struct ConfigurationGenerator {
     }
 
     private func schemePlainDNS(_ scheme: RuleScheme) -> [String] {
-        let values = (scheme.networkSettings?.dnsServers ?? []).compactMap(
+        plainDNS(scheme.networkSettings)
+    }
+
+    private func plainDNS(_ settings: RuleSchemeNetworkSettings?) -> [String] {
+        let values = (settings?.dnsServers ?? []).compactMap(
             RuleSchemeNetworkSettings.normalizedPlainDNSServer
         )
         return values.isEmpty ? ["223.5.5.5", "119.29.29.29"] : values
     }
 
     private func schemeEncryptedDNS(_ scheme: RuleScheme) -> [String] {
-        let values = scheme.networkSettings?.encryptedDNSServers ?? []
+        encryptedDNS(scheme.networkSettings)
+    }
+
+    private func encryptedDNS(_ settings: RuleSchemeNetworkSettings?) -> [String] {
+        let values = settings?.encryptedDNSServers ?? []
         return values.isEmpty
             ? ["https://223.5.5.5/dns-query", "https://doh.pub/dns-query"]
             : values
@@ -1128,17 +1528,44 @@ struct ConfigurationGenerator {
         scheme.networkSettings?.dnsProtectionMode ?? .standard
     }
 
-    private func clashNetworkBlock(_ scheme: RuleScheme, target: ClientTarget) -> String {
-        let plain = schemePlainDNS(scheme)
-        let nameservers = schemeEncryptedDNS(scheme)
-        let protectionMode = schemeDNSProtectionMode(scheme)
-        let proxyResolvers = scheme.networkSettings == nil
-            ? ["https://223.5.5.5/dns-query"]
-            : nameservers
-        let fallbackResolvers = scheme.networkSettings == nil
-            ? ["https://1.1.1.1/dns-query", "https://dns.google/dns-query"]
-            : nameservers
-        var output = "ipv6: \(schemeIPv6(scheme))\n\n"
+    /// Surge writes DNS over HTTP/3 as `h3://`; mihomo marks an HTTPS
+    /// resolver with `#h3=true` and rejects the scheme outright ("unsupport
+    /// scheme: h3"). Stash and Shadowrocket document neither, so they get the
+    /// same resolver over ordinary HTTPS.
+    private func clashDNSServer(_ value: String, target: ClientTarget) -> String {
+        guard var components = URLComponents(string: value), components.scheme?.lowercased() == "h3" else { return value }
+        components.scheme = "https"
+        if components.percentEncodedPath.isEmpty { components.percentEncodedPath = "/dns-query" }
+        let https = components.string ?? value
+        return RoutingRuleCapabilities.mihomoTargets.contains(target) && target != .karing ? https + "#h3=true" : https
+    }
+
+    /// Clients that take mihomo's `#<proxy>&ecs=` nameserver suffix. Karing
+    /// embeds mihomo but documents neither it nor the TUN block; the "Clash"
+    /// app shares Stash's document (ConfigurationGeneratorTests), so it only
+    /// gets the TUN block.
+    static let clashStrictDNSTargets: Set<ClientTarget> = [.clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi]
+    private static let clashTUNTargets = clashStrictDNSTargets.union([.clashApple])
+
+    /// With fake-ip a proxied domain is never resolved on the device: the
+    /// name goes to the node as is. What still needs an answer is direct
+    /// traffic and the terminal `GEOIP,CN`, which since 2026-09-29 resolves
+    /// on mihomo cores so unlisted Chinese sites can go direct.
+    ///
+    /// Those lookups go through the proxy with a Chinese client subnet, so
+    /// an unlisted foreign name never reaches a domestic resolver and an
+    /// unlisted Chinese one still gets a Chinese answer, which the direct
+    /// connection then reuses. In standard mode `direct-nameserver` answers
+    /// names a list already sends DIRECT, so those keep exact CDN edges even
+    /// where the site ignores ECS (measured with mihomo 1.19.31). Strict mode
+    /// leaves it out: nothing goes to domestic resolvers but node hostnames. The old `fallback` + `fallback-filter` pair, which asked
+    /// 1.1.1.1 and Google directly for every lookup, is gone.
+    private func clashNetworkBlock(_ settings: RuleSchemeNetworkSettings?, target: ClientTarget, dnsGroup: String?) -> String {
+        let plain = plainDNS(settings)
+        let nameservers = encryptedDNS(settings).map { clashDNSServer($0, target: target) }
+        let protectionMode = settings?.dnsProtectionMode ?? .standard
+        let proxiedGroup = clashResolvesThroughProxy(settings, target: target, dnsGroup: dnsGroup) ? dnsGroup : nil
+        var output = "ipv6: \(settings?.ipv6Enabled ?? true)\n\n"
         output += "dns:\n"
         output += "  enable: true\n"
         if protectionMode != .followScheme {
@@ -1153,18 +1580,21 @@ struct ConfigurationGenerator {
         for value in plain { output += "    - \(value)\n" }
         if protectionMode != .followScheme {
             output += "  proxy-server-nameserver:\n"
-            for value in proxyResolvers { output += "    - \(value)\n" }
+            for value in nameservers { output += "    - \(value)\n" }
         }
         output += "  nameserver:\n"
-        for value in nameservers { output += "    - \(value)\n" }
-        if protectionMode != .followScheme {
-            output += "  fallback:\n"
-            for value in fallbackResolvers { output += "    - \(value)\n" }
-            output += "  fallback-filter:\n"
-            output += "    geoip: true\n"
-            output += "    geoip-code: CN\n"
+        if let proxiedGroup {
+            for value in clashProxiedResolvers(settings, group: proxiedGroup, target: target) {
+                output += "    - \(yaml(value))\n"
+            }
+            if protectionMode == .standard {
+                output += "  direct-nameserver:\n"
+                for value in nameservers { output += "    - \(value)\n" }
+            }
+        } else {
+            for value in nameservers { output += "    - \(value)\n" }
         }
-        if protectionMode == .strict, [.clashApple, .clashVerge, .clashMac, .flClash, .mihomoParty, .clashMi].contains(target) {
+        if protectionMode == .strict, Self.clashTUNTargets.contains(target) {
             output += "\ntun:\n"
             output += "  enable: true\n"
             output += "  stack: mixed\n"
@@ -1176,6 +1606,69 @@ struct ConfigurationGenerator {
             output += "  strict-route: true\n"
         }
         return output
+    }
+
+    private func clashResolvesThroughProxy(_ settings: RuleSchemeNetworkSettings?, target: ClientTarget, dnsGroup: String?) -> Bool {
+        Self.clashStrictDNSTargets.contains(target) && dnsGroup != nil
+            && (settings?.dnsProtectionMode ?? .standard) != .followScheme
+    }
+
+    /// Whether the terminal `GEOIP,CN` may drop the `no-resolve` Tower adds.
+    /// Only where that lookup cannot reach a domestic resolver it would not
+    /// otherwise reach: resolved through the proxy, or in follow-scheme mode
+    /// where every name is already resolved by the scheme's own DNS. Other
+    /// Clash-format clients keep it (docs/RULE_EXPORT_AUDIT.md, D01).
+    private func clashResolvesTerminalGeoIP(_ settings: RuleSchemeNetworkSettings?, target: ClientTarget, dnsGroup: String?) -> Bool {
+        guard Self.clashStrictDNSTargets.contains(target) else { return false }
+        return (settings?.dnsProtectionMode ?? .standard) == .followScheme
+            || clashResolvesThroughProxy(settings, target: target, dnsGroup: dnsGroup)
+    }
+
+    /// A group made only of nodes, so the DNS path never lands on DIRECT.
+    /// Names containing the suffix separators could not be written safely.
+    private func clashDNSProxyGroup(_ groups: [ResolvedSchemeGroup]) -> String? {
+        groups.first { group in
+            !group.nodeNames.isEmpty && Set(group.members) == Set(group.nodeNames)
+                && clashDNSSafeGroupName(group.name)
+        }?.name
+    }
+
+    /// An exported identifier, stable across app languages like the sing-box
+    /// mode names. Contains neither `#` nor `&`.
+    static let dnsProxyGroupName = "DNS 自动选择"
+
+    static func uniqueGroupName(_ base: String, avoiding used: Set<String>) -> String {
+        var name = base
+        var suffix = 2
+        while used.contains(name) { name = "\(base) \(suffix)"; suffix += 1 }
+        return name
+    }
+
+    private func clashDNSSafeGroupName(_ name: String) -> Bool {
+        !name.contains("#") && !name.contains("&")
+    }
+
+    private func clashProxiedResolvers(_ settings: RuleSchemeNetworkSettings?, group: String, target: ClientTarget) -> [String] {
+        let remote = (settings ?? .towerDefault).effectiveRemoteDNSServers
+        // A resolver that ignores ECS would answer with CDN edges near the
+        // node, and mihomo takes whichever answer arrives first.
+        let subnetAware = remote.filter(RuleSchemeNetworkSettings.supportsClientSubnet)
+        let chosen = subnetAware.isEmpty ? RuleSchemeNetworkSettings.towerDefault.remoteDNSServers.filter(RuleSchemeNetworkSettings.supportsClientSubnet) : subnetAware
+        return chosen.map { value in
+            var server = clashDNSServer(value, target: target)
+            let separator = server.contains("#") ? "&" : "#"
+            server += separator + group + "&ecs=\(SingBoxDNSPolicy.chinaClientSubnet)&ecs-override=true"
+            return server
+        }
+    }
+
+    /// Drops the `no-resolve` Tower added to a `GEOIP` rule that is the last
+    /// rule before MATCH, when `clashResolvesTerminalGeoIP` allows it. A
+    /// source that wrote `no-resolve` itself keeps it.
+    private func releasingTerminalGeoIP(_ lines: [String], sourceWroteNoResolve: Bool) -> [String] {
+        guard !sourceWroteNoResolve, let last = lines.last,
+              last.uppercased().hasPrefix("GEOIP,"), last.lowercased().hasSuffix(",no-resolve") else { return lines }
+        return lines.dropLast() + [String(last.dropLast(",no-resolve".count))]
     }
 
     private func clashScheme(
@@ -1200,7 +1693,19 @@ struct ConfigurationGenerator {
         mode: rule
         log-level: warning
         """
-        output += "\n" + clashNetworkBlock(scheme, target: target) + "\nproxies:\n"
+        // No group made only of nodes (every one also offers DIRECT, or its
+        // name cannot follow `#`): add a hidden automatic group for DNS rather
+        // than quietly resolving through the domestic servers in strict mode.
+        let inlineDisplayNames = inlineNodes.map { NodeRegionResolver.displayName(for: $0) }
+        let reusableDNSGroup = clashDNSProxyGroup(groups)
+        let dedicatedDNSGroup = reusableDNSGroup == nil
+            && Self.clashStrictDNSTargets.contains(target)
+            && (scheme.networkSettings?.dnsProtectionMode ?? .standard) != .followScheme
+            && (!inlineDisplayNames.isEmpty || !providerNames.isEmpty)
+            ? Self.uniqueGroupName(Self.dnsProxyGroupName, avoiding: Set(groups.map(\.name)).union(inlineDisplayNames))
+            : nil
+        let dnsGroup = reusableDNSGroup ?? dedicatedDNSGroup
+        output += "\n" + clashNetworkBlock(scheme.networkSettings, target: target, dnsGroup: dnsGroup) + "\nproxies:\n"
         output += "\n"
         output += inlineNodes.isEmpty ? "  []\n" : inlineNodes.map { clashNode($0, target: target) }.joined(separator: "\n") + "\n"
         output += clashProxyProviders(remoteSubscriptions, target: target)
@@ -1242,6 +1747,10 @@ struct ConfigurationGenerator {
             }
             appendNativeOptions(group, target: target, to: &output)
         }
+        if let dedicatedDNSGroup {
+            output += clashURLTestGroup(name: dedicatedDNSGroup, nodeNames: inlineDisplayNames,
+                                        providerNames: providerNames, hidden: true)
+        }
         let remoteResources = rulePlan.remoteResources
         if !remoteResources.isEmpty {
             output += "\nrule-providers:\n"
@@ -1259,27 +1768,38 @@ struct ConfigurationGenerator {
                 }
                 output += "  \(resource.identifier):\n"
                 output += "    type: http\n"
-                output += "    behavior: \(provider.behavior)\n"
-                output += "    format: \(provider.format)\n"
+                output += "    behavior: \(resource.provider?.behavior?.replacingOccurrences(of: "-text", with: "") ?? provider.behavior)\n"
+                output += "    format: \(resource.provider?.format ?? provider.format)\n"
                 output += "    url: \(yaml(resource.url.absoluteString))\n"
                 output += "    path: ./ruleset/\(resource.identifier).\(provider.fileExtension)\n"
-                output += "    interval: 86400\n"
+                let referenceInterval = resource.options.first { $0.hasPrefix("update-interval=") }.flatMap { Int($0.dropFirst("update-interval=".count)) }
+                output += "    interval: \(resource.provider?.interval ?? referenceInterval ?? 86400)\n"
             }
         }
         output += "\nrules:\n"
+        var ruleLines: [String] = []
+        var lastSourceWroteNoResolve = false
         for entry in rulePlan.entries {
             switch entry {
             case .remote(let resource):
-                let noResolve = resource.format == .clashIPCIDRMRS ? ",no-resolve" : ""
-                output += "  - RULE-SET,\(resource.identifier),\(resource.policyName)\(noResolve)\n"
+                let options = resource.options.filter { !$0.hasPrefix("update-interval=") }
+                let noResolve = options.isEmpty ? (resource.format == .clashIPCIDRMRS ? ",no-resolve" : "") : "," + options.joined(separator: ",")
+                ruleLines.append("RULE-SET,\(resource.identifier),\(resource.policyName)\(noResolve)")
+                lastSourceWroteNoResolve = true
             case .inline(let rule):
                 // The document dialect is Clash YAML for all three callers,
                 // but rule support still belongs to the selected client.
                 if let mapped = mappedRule(rule.line, policyName: rule.policyName, target: target) {
-                    output += "  - \(mapped)\n"
+                    ruleLines.append(mapped)
+                    lastSourceWroteNoResolve = rule.line.split(separator: ",")
+                        .contains { $0.trimmingCharacters(in: .whitespaces).lowercased() == "no-resolve" }
                 }
             }
         }
+        if clashResolvesTerminalGeoIP(scheme.networkSettings, target: target, dnsGroup: dnsGroup) {
+            ruleLines = releasingTerminalGeoIP(ruleLines, sourceWroteNoResolve: lastSourceWroteNoResolve)
+        }
+        for line in ruleLines { output += "  - \(line)\n" }
         if let final = rulePlan.finalGroupName { output += "  - MATCH,\(final)\n" }
         return output
     }
@@ -1368,14 +1888,16 @@ struct ConfigurationGenerator {
         for entry in rulePlan.entries {
             switch entry {
             case .remote(let resource):
-                output += "RULE-SET,\(resource.url.absoluteString),\(confName(resource.policyName)),update-interval=86400\n"
+                var options = resource.options
+                if !options.contains(where: { $0.hasPrefix("update-interval=") }) { options.append("update-interval=\(resource.provider?.interval ?? 86400)") }
+                output += (["RULE-SET", resource.url.absoluteString, confName(resource.policyName)] + options).joined(separator: ",") + "\n"
             case .inline(let rule):
                 if let mapped = mappedRule(rule.line, policyName: rule.policyName, target: target) {
                     output += mapped + "\n"
                 }
             }
         }
-        if let final = rulePlan.finalGroupName { output += "FINAL,\(confName(final))\n" }
+        if let final = rulePlan.finalGroupName { output += (["FINAL", confName(final)] + rulePlan.finalOptions).joined(separator: ",") + "\n" }
         return output
     }
 
@@ -1394,11 +1916,15 @@ struct ConfigurationGenerator {
         var filterSources: [String: Set<UUID>] = [:]
         for (index, group) in groups.enumerated() {
             let selection = remoteGroupSelection(for: group, remoteNodeNames: remoteNodeNames)
-            guard selection.includesRemoteNodes, let filter = selection.filter else { continue }
+            // A filter line is written only for the subscriptions it draws
+            // from; without one, naming the filter in the group would point
+            // at a policy the profile never defines.
+            let sources = groupSubscriptions(group, from: remoteSubscriptions)
+            guard selection.includesRemoteNodes, let filter = selection.filter, !sources.isEmpty else { continue }
             let name = "塔台筛选 \(index + 1) · \(group.name)"
             filtersByGroupName[group.name] = name
             remoteFilters.append((name, filter))
-            filterSources[name] = Set(groupSubscriptions(group, from: remoteSubscriptions).map(\.sourceID))
+            filterSources[name] = Set(sources.map(\.sourceID))
         }
         var output = schemeHeader(
             scheme,
@@ -1577,35 +2103,14 @@ struct ConfigurationGenerator {
         allow-lan: false
         mode: rule
         log-level: warning
-        ipv6: true
 
-        dns:
-          enable: true
-          enhanced-mode: fake-ip
-          fake-ip-range: 198.18.0.1/16
-          fake-ip-filter:
-            - "*.lan"
-            - "+.local"
-            - "+.msftconnecttest.com"
-            - "+.msftncsi.com"
-          default-nameserver:
-            - 223.5.5.5
-            - 119.29.29.29
-          proxy-server-nameserver:
-            - https://223.5.5.5/dns-query
-          nameserver:
-            - https://223.5.5.5/dns-query
-            - https://doh.pub/dns-query
-          fallback:
-            - https://1.1.1.1/dns-query
-            - https://dns.google/dns-query
-          fallback-filter:
-            geoip: true
-            geoip-code: CN
-
-        proxies:
         """
-        output += "\n"
+        // The automatic group lists only nodes, so DNS through it never
+        // lands on DIRECT.
+        let hasNodes = !inlineNodeNames.isEmpty || !providerNames.isEmpty
+        let dnsGroup = hasNodes && clashDNSSafeGroupName(RulePolicy.auto.configurationName)
+            ? RulePolicy.auto.configurationName : nil
+        output += clashNetworkBlock(nil, target: target, dnsGroup: dnsGroup) + "\nproxies:\n"
         output += inlineNodes.isEmpty ? "  []\n" : inlineNodes.map { clashNode($0, target: target) }.joined(separator: "\n") + "\n"
         output += clashProxyProviders(remoteSubscriptions, target: target)
         output += "\nproxy-groups:\n"
@@ -1673,21 +2178,35 @@ struct ConfigurationGenerator {
             )
         }
         output += "\nrules:\n"
+        var ruleLines: [String] = []
+        var lastSourceWroteNoResolve = false
         for assignment in preset.assignments {
             for rule in rules.lines(for: assignment) {
                 if let mapped = mappedRule(rule, policy: assignment.policy, target: target) {
-                    output += "  - \(mapped)\n"
+                    ruleLines.append(mapped)
+                    lastSourceWroteNoResolve = rule.split(separator: ",")
+                        .contains { $0.trimmingCharacters(in: .whitespaces).lowercased() == "no-resolve" }
                 }
             }
         }
         if preset.includeGeoIPCN {
-            output += "  - GEOIP,CN,DIRECT,no-resolve\n"
+            ruleLines.append("GEOIP,CN,DIRECT,no-resolve")
+            lastSourceWroteNoResolve = false
         }
+        // The last rule before MATCH: see clashResolvesTerminalGeoIP.
+        if clashResolvesTerminalGeoIP(nil, target: target, dnsGroup: dnsGroup) {
+            ruleLines = releasingTerminalGeoIP(ruleLines, sourceWroteNoResolve: lastSourceWroteNoResolve)
+        }
+        for line in ruleLines { output += "  - \(line)\n" }
         output += "  - MATCH,\(clashPolicyName(preset.finalPolicy))\n"
         return output
     }
 
-    private func clashNode(_ node: ProxyNode, target: ClientTarget) -> String {
+    private func clashNode(_ source: ProxyNode, target: ClientTarget) -> String {
+        // Stash, unlike mihomo, does not fall back to the WebSocket Host for
+        // SNI; an IP-fronted node timed out there. Writing it is harmless for
+        // the clients that would have inferred it anyway.
+        let node = source.withTransportHostAsSNI
         var values: [String] = [
             "  - name: \(yaml(NodeRegionResolver.displayName(for: node)))",
             "    type: \(node.kind.rawValue)",
@@ -1696,8 +2215,16 @@ struct ConfigurationGenerator {
         ]
         switch node.kind {
         case .shadowsocks:
-            values += ["    cipher: \(yaml(node.cipher ?? "aes-256-gcm"))", "    password: \(yaml(node.password ?? ""))", "    udp: true"]
-            if node.plugin == "v2ray-plugin" {
+            values += ["    cipher: \(yaml(node.cipher ?? "aes-256-gcm"))", "    password: \(yaml(node.password ?? ""))", "    udp: \(node.udpRelayEnabled ?? true)"]
+            if let shadowTLS = node.shadowTLS {
+                values.append("    plugin: shadow-tls")
+                if let fingerprint = node.fingerprint { values.append("    client-fingerprint: \(yaml(fingerprint))") }
+                values.append("    plugin-opts:")
+                values.append("      host: \(yaml(shadowTLS.host))")
+                values.append("      password: \(yaml(shadowTLS.password))")
+                values.append("      version: \(shadowTLS.version)")
+                if shadowTLS.skipCertificateVerification { values.append("      skip-cert-verify: true") }
+            } else if node.plugin == "v2ray-plugin" {
                 values.append("    plugin: v2ray-plugin")
                 values.append("    plugin-opts:")
                 values.append("      mode: websocket")
@@ -1744,19 +2271,16 @@ struct ConfigurationGenerator {
             values += ["    password: \(yaml(node.password ?? ""))", "    udp: true"]
             appendClashTransport(node, target: target, to: &values)
         case .hysteria2:
+            // Stash documents `auth`; mihomo and the rest read `password`.
             values += [
-                "    password: \(yaml(node.password ?? ""))",
+                "    \(target == .clash ? "auth" : "password"): \(yaml(node.password ?? ""))",
                 "    skip-cert-verify: \(node.skipCertificateVerification)",
                 "    udp: true"
             ]
             if let sni = node.sni, !sni.isEmpty { values.append("    sni: \(yaml(sni))") }
             if let ports = node.portHopping, !ports.isEmpty { values.append("    ports: \(yaml(ports))") }
             appendClashALPN(node, to: &values)
-            // Hysteria 2 calls this value `fingerprint`: it is the SHA-256
-            // certificate pin, not a browser-style uTLS ClientHello name.
-            if let fingerprint = node.certificateFingerprint, !fingerprint.isEmpty {
-                values.append("    fingerprint: \(yaml(fingerprint))")
-            }
+            appendClashCertificateFingerprint(node, target: target, to: &values)
             if let obfs = hysteria2Obfs(node) {
                 values.append("    obfs: \(yaml(obfs.type))")
                 values.append("    obfs-password: \(yaml(obfs.password))")
@@ -1767,12 +2291,13 @@ struct ConfigurationGenerator {
             // what an airport that omitted them expects.
             values += [
                 "    auth-str: \(yaml(node.password ?? ""))",
-                "    up: \(node.upMbps ?? 50)",
-                "    down: \(node.downMbps ?? 100)",
+                // Stash names the bandwidths `up-speed` / `down-speed`.
+                "    \(target == .clash ? "up-speed" : "up"): \(node.upMbps ?? 50)",
+                "    \(target == .clash ? "down-speed" : "down"): \(node.downMbps ?? 100)",
                 "    skip-cert-verify: \(node.skipCertificateVerification)"
             ]
             if let sni = node.sni, !sni.isEmpty { values.append("    sni: \(yaml(sni))") }
-            appendClashCertificateFingerprint(node, to: &values)
+            appendClashCertificateFingerprint(node, target: target, to: &values)
             if let obfs = node.obfs, !obfs.isEmpty, obfs.lowercased() != "none" {
                 values.append("    obfs: \(yaml(obfs))")
             }
@@ -1792,9 +2317,11 @@ struct ConfigurationGenerator {
             if let value = node.udpRelayMode, !value.isEmpty {
                 values.append("    udp-relay-mode: \(yaml(value))")
             }
+            // Stash reads TUIC as v4 unless told otherwise; Tower writes v5.
+            if target == .clash { values.append("    version: 5") }
             if let ports = node.portHopping, !ports.isEmpty { values.append("    ports: \(yaml(ports))") }
             appendClashALPN(node, to: &values)
-            appendClashCertificateFingerprint(node, to: &values)
+            appendClashCertificateFingerprint(node, target: target, to: &values)
             appendClashClientFingerprint(node, to: &values)
         case .wireguard:
             values += [
@@ -1829,7 +2356,7 @@ struct ConfigurationGenerator {
             if let value = node.idleSessionTimeout { values.append("    idle-session-timeout: \(value)") }
             if let value = node.minIdleSession { values.append("    min-idle-session: \(value)") }
             appendClashALPN(node, to: &values)
-            appendClashCertificateFingerprint(node, to: &values)
+            appendClashCertificateFingerprint(node, target: target, to: &values)
             if [.shadowrocket, .karing].contains(target) {
                 values.append("    tls: true")
                 appendClashReality(node, to: &values)
@@ -1855,14 +2382,72 @@ struct ConfigurationGenerator {
                 if let sni = node.sni, !sni.isEmpty { values.append("    sni: \(yaml(sni))") }
                 values.append("    skip-cert-verify: \(node.skipCertificateVerification)")
                 appendClashALPN(node, to: &values)
-                appendClashCertificateFingerprint(node, to: &values)
+                appendClashCertificateFingerprint(node, target: target, to: &values)
                 if [.shadowrocket, .karing].contains(target) { appendClashReality(node, to: &values) }
+                appendClashClientFingerprint(node, to: &values)
+            }
+        case .masque:
+            if let options = node.masque, options.mode == .keyConnectIP {
+                values += ["    private-key: \(yaml(options.privateKey ?? ""))",
+                           "    public-key: \(yaml(options.publicKey ?? ""))",
+                           "    udp: \(node.udpRelayEnabled ?? false)"]
+                if let ip = options.ipv4 { values.append("    ip: \(yaml(ip))") }
+                if let ip = options.ipv6 { values.append("    ipv6: \(yaml(ip))") }
+                if let mtu = options.mtu { values.append("    mtu: \(mtu)") }
+                let network = options.network ?? "quic"
+                values.append("    network: \(target == .clash ? (network == "quic" ? "h3" : network) : (network == "h3" ? "quic" : network))")
+                if let sni = node.sni { values.append("    sni: \(yaml(sni))") }
+                // CONNECT-IP needs a destination IP. Resolve through this node,
+                // independent of user-defined policy names and global DNS reachability.
+                // Stash shares this writer but remains gated off in writes/supports.
+                let defaultRemoteDNS = [.clash, .clashApple, .clashVerge, .clashMac,
+                                        .flClash, .mihomoParty, .clashMi].contains(target)
+                let remoteDNS = options.remoteDNSResolve ?? (defaultRemoteDNS ? true : nil)
+                if let remoteDNS { values.append("    remote-dns-resolve: \(remoteDNS)") }
+                let dns = options.dns ?? (remoteDNS == true ? ["1.1.1.1", "8.8.8.8"] : nil)
+                if let dns { values.append("    dns: [\(dns.map(yaml).joined(separator: ", "))]") }
+            }
+        case .ssh:
+            let options = node.ssh ?? SSHOptions()
+            // Stash spells the login `user`; mihomo and Shadowrocket `username`.
+            values.append("    \(target == .clash ? "user" : "username"): \(yaml(node.username ?? ""))")
+            if let password = node.password, !password.isEmpty { values.append("    password: \(yaml(password))") }
+            if let key = options.privateKey, !key.isEmpty { values.append("    private-key: \(yamlMultiline(key))") }
+            if let passphrase = options.privateKeyPassphrase, !passphrase.isEmpty {
+                values.append("    private-key-passphrase: \(yaml(passphrase))")
+            }
+            if !options.hostKeys.isEmpty { values.append("    host-key: \(yamlList(options.hostKeys))") }
+            if !options.hostKeyAlgorithms.isEmpty {
+                values.append("    host-key-algorithms: \(yamlList(options.hostKeyAlgorithms))")
+            }
+        case .trustTunnel:
+            values.append("    username: \(yaml(node.username ?? ""))")
+            values.append("    password: \(yaml(node.password ?? ""))")
+            if let sni = node.sni, !sni.isEmpty { values.append("    sni: \(yaml(sni))") }
+            values.append("    skip-cert-verify: \(node.skipCertificateVerification)")
+            appendClashALPN(node, to: &values)
+            appendClashCertificateFingerprint(node, target: target, to: &values)
+            if node.trustTunnel?.quic == true { values.append("    quic: true") }
+            if target != .clash {
+                if node.udpRelayEnabled == true { values.append("    udp: true") }
                 appendClashClientFingerprint(node, to: &values)
             }
         case .unknown:
             break
         }
         return values.joined(separator: "\n")
+    }
+
+    /// A multi-line value (an SSH private key) as one double-quoted scalar.
+    /// `yaml(_:)` folds line breaks away, which would break the key.
+    private func yamlMultiline(_ value: String) -> String {
+        let escaped = value.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\t", with: "\\t")
+        return "\"\(escaped)\""
     }
 
     /// REALITY needs the server's public key and short id; without them the
@@ -1901,31 +2486,46 @@ struct ConfigurationGenerator {
         values.append("    client-fingerprint: \(yaml(fingerprint))")
     }
 
-    private func appendClashCertificateFingerprint(_ node: ProxyNode, to values: inout [String]) {
+    private func appendClashCertificateFingerprint(_ node: ProxyNode, target: ClientTarget, to values: inout [String]) {
         guard let fingerprint = node.certificateFingerprint,
               !fingerprint.isEmpty else { return }
-        values.append("    fingerprint: \(yaml(fingerprint))")
+        // Stash has its own certificate-pin key despite sharing Clash YAML.
+        let key = target == .clash ? "server-cert-fingerprint" : "fingerprint"
+        values.append("    \(key): \(yaml(fingerprint))")
     }
 
     private func appendClashTransport(_ node: ProxyNode, target: ClientTarget, to values: inout [String]) {
         values.append("    tls: \(node.tls)")
         values.append("    skip-cert-verify: \(node.skipCertificateVerification)")
         if let sni = node.sni, !sni.isEmpty {
-            let key = target == .clash && node.kind == .trojan ? "sni" : "servername"
+            // Trojan's key is `sni` in mihomo, Stash and Shadowrocket alike;
+            // `servername` belongs to VMess/VLESS. Mihomo ignored it and sent
+            // the server address as SNI, so an IP or CDN front failed TLS.
+            let key = node.kind == .trojan ? "sni" : "servername"
             values.append("    \(key): \(yaml(sni))")
         }
-        appendClashCertificateFingerprint(node, to: &values)
+        if node.kind == .trojan { appendClashALPN(node, to: &values) }
+        appendClashCertificateFingerprint(node, target: target, to: &values)
         appendClashReality(node, to: &values)
         if node.kind == .vless, let flow = node.flow, !flow.isEmpty {
             values.append("    flow: \(yaml(flow))")
+        }
+        if node.kind == .vless, let encryption = node.vlessEncryption {
+            values.append("    encryption: \(yaml(encryption))")
         }
         appendClashClientFingerprint(node, to: &values)
         if let transport = node.transport, !transport.isEmpty, transport != "tcp" {
             values.append("    network: \(yaml(transport == "httpupgrade" ? "ws" : transport))")
             switch transport {
             case "ws", "httpupgrade":
+                // Stash takes early data as ws-opts fields, not from the path.
+                let separateEarlyData = target == .clash && transport == "ws" ? node.webSocketEarlyData : nil
                 values.append("    ws-opts:")
-                values.append("      path: \(yaml(node.exportablePath ?? "/"))")
+                values.append("      path: \(yaml((separateEarlyData != nil ? node.exportablePathWithoutEarlyData : node.exportablePath) ?? "/"))")
+                if let separateEarlyData {
+                    values.append("      max-early-data: \(separateEarlyData)")
+                    values.append("      early-data-header-name: Sec-WebSocket-Protocol")
+                }
                 if let host = node.exportableTransportHost {
                     values.append("      headers:")
                     values.append("        Host: \(yaml(host))")
@@ -2171,12 +2771,18 @@ struct ConfigurationGenerator {
         return output
     }
 
-    private func surgeNode(_ node: ProxyNode, shadowrocket: Bool) -> String {
+    private func surgeNode(_ source: ProxyNode, shadowrocket: Bool) -> String {
+        let node = source.withTransportHostAsSNI
         let name = confName(NodeRegionResolver.displayName(for: node))
         var components: [String] = []
         switch node.kind {
         case .shadowsocks:
-            components = ["ss", node.server, "\(node.port)", "encrypt-method=\(node.cipher ?? "aes-256-gcm")", "password=\(confValue(node.password ?? ""))", "udp-relay=true"]
+            components = ["ss", node.server, "\(node.port)", "encrypt-method=\(node.cipher ?? "aes-256-gcm")", "password=\(confValue(node.password ?? ""))", "udp-relay=\(node.udpRelayEnabled ?? true)"]
+            if let shadowTLS = node.shadowTLS {
+                components.append("shadow-tls-password=\(confValue(shadowTLS.password.replacingOccurrences(of: "%", with: "%25")))")
+                components.append("shadow-tls-sni=\(confValue(shadowTLS.host))")
+                components.append("shadow-tls-version=\(shadowTLS.version)")
+            }
             if shadowrocket, node.plugin == "v2ray-plugin" {
                 components.append("obfs=\(node.tls ? "wss" : "ws")")
                 appendValue(node.hostHeader, key: "obfs-host", to: &components)
@@ -2237,6 +2843,12 @@ struct ConfigurationGenerator {
                 let key = shadowrocket ? "obfsParam" : "salamander-password"
                 components.append("\(key)=\(confValue(obfs.password))")
             }
+            // Hopping servers still answer on the base port, so dropping this
+            // connected — without the hopping that keeps QUIC reachable.
+            let hopping = portHoppingEntries(node)
+            if !shadowrocket, !hopping.isEmpty {
+                components.append("port-hopping=\"\(hopping.joined(separator: ";"))\"")
+            }
             appendSurgeTLS(node, includeTLSFlag: false, to: &components)
         case .hysteria:
             // Shadowrocket only; Surge has no Hysteria 1 server type and
@@ -2291,11 +2903,80 @@ struct ConfigurationGenerator {
             components = [node.tls ? "https" : "http", node.server, "\(node.port)"]
             components += surgeCredentialPair(node)
             if node.tls { appendSurgeTLS(node, includeTLSFlag: false, to: &components) }
+        case .masque:
+            components = ["masque", confValue(node.server), "\(node.port)"]
+            appendValue(node.username, key: "username", to: &components)
+            appendValue(node.password, key: "password", to: &components)
+            appendSurgeTLS(node, includeTLSFlag: false, to: &components)
+        case .ssh:
+            // Password logins only: a key must live in [Keystore], which this
+            // profile does not write (writes(_:to:) skips key-based nodes).
+            components = ["ssh", node.server, "\(node.port)", "username=\(confValue(node.username ?? ""))"]
+            appendValue(node.password, key: "password", to: &components)
+            let hostKeys = node.ssh?.hostKeys ?? []
+            if !hostKeys.isEmpty {
+                components.append("server-fingerprint=\"\(hostKeys.joined(separator: ", "))\"")
+            }
+        case .trustTunnel:
+            components = ["trust-tunnel", node.server, "\(node.port)",
+                          "username=\(confValue(node.username ?? ""))", "password=\(confValue(node.password ?? ""))"]
+            if node.trustTunnel?.quic == true { components.append("h3=true") }
+            appendSurgeTLS(node, includeTLSFlag: false, to: &components)
         case .unknown:
             components = ["direct"]
         }
+        if !shadowrocket {
+            appendValue(certificatePin(node), key: "server-cert-fingerprint-sha256", to: &components)
+        }
         if shadowrocket, node.kind == .vless { components.append("udp-relay=true") }
         return "\(name) = \(components.joined(separator: ", "))"
+    }
+
+    /// SSH and TrustTunnel have no share-link scheme; a mihomo `proxies:`
+    /// snippet is what their subscriptions carry and what Tower re-imports.
+    func clashShareSnippet(_ node: ProxyNode) -> String {
+        "proxies:\n" + clashNode(node, target: .clashVerge) + "\n"
+    }
+
+    /// Snell has no URI form; its Surge proxy line is the portable share
+    /// format, written through the same name and value escaping as exports.
+    func snellShareLine(_ node: ProxyNode) -> String {
+        surgeNode(node, shadowrocket: false)
+    }
+
+    func masqueShareLine(_ node: ProxyNode) -> String {
+        switch node.masque?.mode {
+        case .keyConnectIP: return "proxies:\n" + clashNode(node, target: .clashVerge) + "\n"
+        case .basicConnectIP:
+            guard let endpoint = singBoxMASQUEEndpoint(node),
+                  let data = try? JSONSerialization.data(withJSONObject: ["endpoints": [endpoint]], options: [.prettyPrinted, .sortedKeys]),
+                  let text = String(data: data, encoding: .utf8) else { return "" }
+            return text
+        case nil: return surgeNode(node, shadowrocket: false)
+        }
+    }
+
+    private func singBoxMASQUEEndpoint(_ node: ProxyNode) -> [String: Any]? {
+        guard node.kind == .masque, let options = node.masque, options.mode == .basicConnectIP else { return nil }
+        var endpoint: [String: Any] = [
+            "type": "masque-client", "tag": NodeRegionResolver.displayName(for: node),
+            "server": node.server, "server_port": node.port,
+            "version": options.httpVersion ?? 3, "system": false
+        ]
+        endpoint["username"] = node.username
+        endpoint["password"] = node.password
+        endpoint["path"] = node.path
+        endpoint["mtu"] = options.mtu
+        endpoint["headers"] = options.headers
+        endpoint["disable_version_fallback"] = options.disableVersionFallback
+        if node.tls {
+            var tls: [String: Any] = ["enabled": true, "insecure": node.skipCertificateVerification]
+            tls["server_name"] = node.sni
+            tls["certificate"] = options.certificate
+            if let alpn = node.alpn { tls["alpn"] = alpn.split(separator: ",").map(String.init) }
+            endpoint["tls"] = tls
+        }
+        return endpoint
     }
 
     // Surge and Shadowrocket read username and password as positional fields.
@@ -2371,7 +3052,7 @@ struct ConfigurationGenerator {
         appendSurgeTLS(node, includeTLSFlag: includeTLSFlag, to: &values)
         if node.transport == "ws" {
             values.append("ws=true")
-            appendValue(node.exportablePath ?? "/", key: "ws-path", to: &values)
+            appendValue(node.exportablePathWithoutEarlyData ?? "/", key: "ws-path", to: &values)
             if let host = node.exportableTransportHost {
                 values.append("ws-headers=Host:\(confValue(host))")
             }
@@ -2386,6 +3067,19 @@ struct ConfigurationGenerator {
             appendValue(node.hostHeader, key: "host", to: &values)
             if transport == "xhttp" { appendValue(node.transportMode, key: "mode", to: &values) }
         }
+    }
+
+    /// Leaf-certificate SHA-256, distinct from both uTLS and public-key pins.
+    /// Intrinsically TLS protocols also cover snapshots with an old false flag.
+    private func certificatePin(_ node: ProxyNode) -> String? {
+        guard !node.usesReality,
+              [.trojan, .hysteria, .hysteria2, .tuic, .masque, .anytls].contains(node.kind)
+                || (node.tls && [.vmess, .vless, .http, .socks5, .shadowsocks].contains(node.kind)),
+              let raw = node.certificateFingerprint else { return nil }
+        let pin = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ":", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        return pin.isEmpty ? nil : pin
     }
 
     private func appendSurgeTLS(
@@ -2585,19 +3279,25 @@ struct ConfigurationGenerator {
         return output
     }
 
-    private func loonNode(_ node: ProxyNode) -> String {
+    private func loonNode(_ source: ProxyNode) -> String {
+        let node = source.withTransportHostAsSNI
         let name = confName(NodeRegionResolver.displayName(for: node))
         var values: [String]
         switch node.kind {
         case .shadowsocks:
             values = ["Shadowsocks", node.server, "\(node.port)", node.cipher ?? "aes-256-gcm", loonQuoted(node.password ?? "")]
+            if let shadowTLS = node.shadowTLS {
+                values.append("shadow-tls-password=\(confValue(shadowTLS.password))")
+                values.append("shadow-tls-sni=\(confValue(shadowTLS.host))")
+                values.append("shadow-tls-version=\(shadowTLS.version)")
+            }
             if let mode = simpleObfsMode(node) {
                 // Loon names the simple-obfs mode obfs-name; plain "obfs" is
                 // the ShadowsocksR field and means something else there.
                 values.append("obfs-name=\(mode)")
                 appendValue(node.obfsParam, key: "obfs-host", to: &values)
             }
-            values.append("udp=true")
+            values.append("udp=\(node.udpRelayEnabled ?? true)")
         case .shadowsocksR:
             values = ["ShadowsocksR", node.server, "\(node.port)", node.cipher ?? "aes-256-cfb", loonQuoted(node.password ?? ""), "protocol=\(node.protocolName ?? "origin")", "obfs=\(node.obfs ?? "plain")"]
             appendValue(node.protocolParam, key: "protocol-param", to: &values)
@@ -2626,7 +3326,7 @@ struct ConfigurationGenerator {
         case .trojan:
             values = ["trojan", node.server, "\(node.port)", loonQuoted(node.password ?? "")]
             appendValue(node.transport, key: "transport", to: &values)
-            appendValue(node.exportablePath, key: "path", to: &values)
+            appendValue(node.exportablePathWithoutEarlyData, key: "path", to: &values)
             appendValue(node.hostHeader, key: "host", to: &values)
             appendValue(node.alpn, key: "alpn", to: &values)
             if node.skipCertificateVerification { values.append("skip-cert-verify=true") }
@@ -2634,6 +3334,19 @@ struct ConfigurationGenerator {
             values.append("udp=true")
         case .hysteria2:
             values = ["Hysteria2", node.server, "\(node.port)", loonQuoted(node.password ?? "")]
+            // Without this a Salamander server drops every packet: the node
+            // imported cleanly and never connected.
+            // Bare, like Loon's documented example and its ShadowTLS password:
+            // quoted, the quotes became part of the key and every packet was
+            // dropped (confirmed on Loon 3.5.1).
+            if let obfs = hysteria2Obfs(node) {
+                values.append("salamander-password=\(obfs.password)")
+            }
+            let hopping = portHoppingEntries(node)
+            if !hopping.isEmpty {
+                // Loon's documented range separator is a colon.
+                values.append("server-ports=\(loonQuoted(hopping.map { $0.replacingOccurrences(of: "-", with: ":") }.joined(separator: ",")))")
+            }
             if node.skipCertificateVerification { values.append("skip-cert-verify=true") }
             appendValue(node.sni, key: "tls-name", to: &values)
             values += ["udp=true", "fast-open=true"]
@@ -2683,7 +3396,7 @@ struct ConfigurationGenerator {
             }
         // Loon implements neither, and writes(_:to:excluding:) filters them
         // out before generation, so this branch is defensive only.
-        case .hysteria, .tuic, .snell, .unknown:
+        case .hysteria, .tuic, .snell, .masque, .ssh, .trustTunnel, .unknown:
             values = ["Direct"]
         }
         // Confirmed in Loon on device: these TLS protocols also accept
@@ -2693,7 +3406,9 @@ struct ConfigurationGenerator {
             appendValue(node.sni, key: "sni", to: &values)
             values.append("public-key=\(loonQuoted(node.realityPublicKey ?? ""))")
             appendValue(node.realityShortID, key: "short-id", to: &values)
+            appendValue(loonTLSProfile(node), key: "tls-profile", to: &values)
         }
+        appendValue(certificatePin(node), key: "tls-cert-sha256", to: &values)
         return "\(name) = \(values.joined(separator: ","))"
     }
 
@@ -2710,17 +3425,29 @@ struct ConfigurationGenerator {
         return [simple ? username : loonQuoted(username), loonQuoted(password)]
     }
 
+    /// Loon's Reality fingerprint (`tls-profile`, nsloon.app/docs/Node). Only
+    /// the browser names common to Loon and Clash are passed through.
+    private func loonTLSProfile(_ node: ProxyNode) -> String? {
+        guard let fingerprint = node.fingerprint?.lowercased(),
+              ["chrome", "firefox", "safari", "edge", "ios"].contains(fingerprint) else { return nil }
+        return fingerprint
+    }
+
     private func appendLoonTransportAndTLS(_ node: ProxyNode, to values: inout [String]) {
         if node.usesReality {
             values.append("public-key=\"\(confValue(node.realityPublicKey ?? ""))\"")
             appendValue(node.realityShortID, key: "short-id", to: &values)
+            appendValue(loonTLSProfile(node), key: "tls-profile", to: &values)
         }
         if let flow = node.flow, !flow.isEmpty { values.append("flow=\(confValue(flow))") }
-        appendValue(node.exportablePath, key: "path", to: &values)
+        appendValue(node.exportablePathWithoutEarlyData, key: "path", to: &values)
         appendValue(node.exportableTransportHost, key: "host", to: &values)
         values.append("over-tls=\(node.tls)")
         appendValue(node.sni, key: "tls-name", to: &values)
         if node.skipCertificateVerification { values.append("skip-cert-verify=true") }
+        // Loon leaves UDP off unless asked, so VMess and VLESS nodes silently
+        // sent no UDP through the proxy while SS and Trojan did.
+        values.append("udp=\(node.udpRelayEnabled ?? true)")
     }
 
     private func quanX(
@@ -2849,13 +3576,14 @@ struct ConfigurationGenerator {
         return values
     }
 
-    private func quanXNode(_ node: ProxyNode) -> String {
+    private func quanXNode(_ source: ProxyNode) -> String {
+        let node = source.withTransportHostAsSNI
         var values = [node.endpoint]
         let prefix: String
         switch node.kind {
         case .shadowsocks:
             prefix = "shadowsocks"
-            values += ["method=\(node.cipher ?? "aes-256-gcm")", "password=\(confValue(node.password ?? ""))", "udp-relay=true"]
+            values += ["method=\(node.cipher ?? "aes-256-gcm")", "password=\(confValue(node.password ?? ""))", "udp-relay=\(node.udpRelayEnabled ?? true)"]
             if node.plugin == "v2ray-plugin" {
                 values.append("obfs=\(node.tls ? "wss" : "ws")")
                 appendValue(node.hostHeader, key: "obfs-host", to: &values)
@@ -2912,7 +3640,7 @@ struct ConfigurationGenerator {
 
         // Quantumult X implements none of these, and writes(_:to:excluding:)
         // filters them out before generation, so this is defensive only.
-        case .hysteria, .hysteria2, .tuic, .wireguard, .snell, .unknown:
+        case .hysteria, .hysteria2, .tuic, .wireguard, .snell, .masque, .ssh, .trustTunnel, .unknown:
             prefix = "http"
         }
         if [.socks5, .http].contains(node.kind), node.tls {
@@ -2921,6 +3649,11 @@ struct ConfigurationGenerator {
         }
         if node.tls || [.trojan, .anytls].contains(node.kind) {
             appendQuanXTLS(node, to: &values)
+        }
+        // Quantumult X relays UDP only when a server line asks for it; these
+        // proxies relayed no UDP at all while Shadowsocks and AnyTLS did.
+        if [.vmess, .vless, .trojan, .socks5, .shadowsocksR].contains(node.kind) {
+            values.append("udp-relay=\(node.udpRelayEnabled ?? true)")
         }
         values.append("tag=\(confName(NodeRegionResolver.displayName(for: node)))")
         return "\(prefix)=\(values.joined(separator: ", "))"
@@ -2933,10 +3666,10 @@ struct ConfigurationGenerator {
                 ? node.exportableTransportHost
                 : (node.hostHeader ?? node.sni)
             appendValue(transportHost, key: "obfs-host", to: &values)
-            appendValue(node.exportablePath ?? "/", key: "obfs-uri", to: &values)
-        } else if node.kind == .vmess, node.transport?.lowercased() == "http" {
+            appendValue(node.exportablePathWithoutEarlyData ?? "/", key: "obfs-uri", to: &values)
+        } else if [.vmess, .vless].contains(node.kind), node.transport?.lowercased() == "http" {
             values.append("obfs=http")
-            appendValue(node.hostHeader, key: "obfs-host", to: &values)
+            appendValue(node.kind == .vless ? node.exportableTransportHost : node.hostHeader, key: "obfs-host", to: &values)
             appendValue(node.exportablePath ?? "/", key: "obfs-uri", to: &values)
         } else if node.tls {
             values.append("obfs=over-tls")
@@ -2954,6 +3687,7 @@ struct ConfigurationGenerator {
                 let bytes = protocols.flatMap { [UInt8($0.utf8.count)] + Array($0.utf8) }
                 values.append("tls-alpn=\(bytes.map { String(format: "%02x", $0) }.joined())")
             }
+            appendValue(certificatePin(node), key: "tls-cert-sha256", to: &values)
             if node.skipCertificateVerification { values.append("tls-verification=false") }
         }
         if node.kind == .vless, let flow = node.flow, !flow.isEmpty {
@@ -2973,6 +3707,17 @@ struct ConfigurationGenerator {
     /// takes every other node in the file down with it. sing-box is the same.
     /// Without the password the node could not have connected either way, so
     /// the obfs layer is dropped rather than half-written.
+    /// Hysteria 2 port-hopping entries, from mihomo's `443,5000-6000` form
+    /// (share links' `mport` uses the same shape). Each client spells the
+    /// list differently, but every entry is a port or a `low-high` range.
+    func portHoppingEntries(_ node: ProxyNode) -> [String] {
+        guard node.kind == .hysteria2 else { return [] }
+        return (node.portHopping ?? "")
+            .split(whereSeparator: { $0 == "," || $0 == ";" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
     func hysteria2Obfs(_ node: ProxyNode) -> (type: String, password: String)? {
         guard node.kind == .hysteria2,
               let type = node.obfs?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -3017,6 +3762,16 @@ struct ConfigurationGenerator {
     /// names come from the imported file rather than from `RulePolicy`.
     private func mappedRule(_ rule: String, policyName: String, target: ClientTarget) -> String? {
         let policyName = [.surge, .surgeMac, .loon, .quanx].contains(target) ? confName(policyName) : policyName
+        if RoutingRuleCapabilities.compiledTargets.contains(target) {
+            return RoutingRuleCapabilities.render(rule, policy: policyName, target: target)
+        }
+        // Quantumult X is the only client left on this path. It has no
+        // logical rules, and no source-address rule: dropping mihomo's `src`
+        // would turn "from this device" into "to this address".
+        if let condition = RoutingRuleSyntax.condition(rule),
+           condition.children != nil || condition.options.contains(where: { $0.lowercased() == "src" }) {
+            return nil
+        }
         var parts = rule.split(separator: ",", omittingEmptySubsequences: false).map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines)
         }
@@ -3027,7 +3782,7 @@ struct ConfigurationGenerator {
         // Clash/Mihomo does not implement Surge's URL-REGEX dialect. These
         // expressions may inspect the URL path, so converting them to a domain
         // rule would silently change their meaning; omit them for Clash only.
-        if target.usesClashFormat, ruleType == "URL-REGEX" {
+        if target.usesClashFormat, target != .clash, ruleType == "URL-REGEX" {
             return nil
         }
 
@@ -3074,13 +3829,18 @@ struct ConfigurationGenerator {
             parts.insert(policyName, at: parts.count - 1)
         } else {
             parts.append(policyName)
-            if ruleType == "GEOIP" {
+            let surgeIPRule = [.surge, .surgeMac].contains(target)
+                && ["IP-CIDR", "IP-CIDR6", "IP6-CIDR", "IP-ASN"].contains(ruleType)
+            if ruleType == "GEOIP" || surgeIPRule {
                 // A GEOIP rule above later domain rules otherwise makes the
                 // client resolve the domain locally just to decide whether it
                 // matches — and the domains that reach it are the ones no rule
                 // list covered. Every built-in preset already writes the flag
                 // for all seven clients; an imported scheme must not route
-                // differently on Stash than it does on Surge.
+                // differently on Stash than it does on Surge. Surge also
+                // needs this for inline IP/ASN rules: imported service lists
+                // can place their IP ranges before another list's domains.
+                // Keep policy order while avoiding that premature DNS lookup.
                 parts.append("no-resolve")
             }
         }
@@ -3252,6 +4012,13 @@ struct ConfigurationGenerator {
     // Node names come from subscription remarks, which are untrusted text. A
     // newline would end the proxy line early and "#" or ";" would turn the rest
     // of it into a comment in the Surge, Loon and Quantumult X formats.
+    /// sing-box `plugin_opts` is a SIP003 option string: a `;` inside a
+    /// value (a WebSocket path like `/foo;bar`) must be backslash-escaped.
+    private func sip003Value(_ value: String) -> String {
+        value.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: ";", with: "\\;")
+    }
+
     private func confName(_ value: String) -> String {
         collapsingLineBreaks(value)
             .replacingOccurrences(of: "=", with: "-")
@@ -3405,8 +4172,13 @@ extension ConfigurationGenerator {
             }
             return outbound
         }
-        outbounds += nodes.filter { target != .singBox || $0.kind != .wireguard }
-            .compactMap(singBoxOutbound)
+        // Hiddify lists every outbound as a choice; without §hide§ the
+        // ShadowTLS helper appeared there and failed its latency test.
+        outbounds += singBoxNodeOutbounds(
+            nodes.filter { target != .singBox || $0.kind != .wireguard },
+            reservedTags: Set(outbounds.compactMap { $0["tag"] as? String }),
+            hideHelpers: target == .hiddify
+        )
         outbounds.append(["tag": Self.singBoxDirectTag, "type": "direct"])
 
         var configuration: [String: Any] = [
@@ -3435,8 +4207,16 @@ extension ConfigurationGenerator {
         ]
 
         if target == .singBox {
-            let endpoints = nodes.compactMap(singBoxWireGuardEndpoint)
+            let endpoints = nodes.compactMap { singBoxWireGuardEndpoint($0) ?? singBoxMASQUEEndpoint($0) }
             if !endpoints.isEmpty { configuration["endpoints"] = endpoints }
+        }
+
+        if target == .singBox {
+            SingBoxDNSPolicy.apply(to: &configuration, nodeTags: nodeTags,
+                preferredProxy: RulePolicy.select.configurationName,
+                domainRules: singBoxRules(preset: preset), protection: .standard, ipv6Enabled: false,
+                chinaResolverHint: true)
+            attachLocalRuleSets(to: &configuration)
         }
 
         guard let data = try? JSONSerialization.data(
@@ -3459,6 +4239,18 @@ extension ConfigurationGenerator {
     /// `route.default_domain_resolver`. User DNS goes to the remote resolver
     /// through a real proxy outbound, otherwise a successful but polluted
     /// carrier answer can still send every connection to the wrong address.
+    /// Adds the inline country and ASN rule sets that route or DNS rules
+    /// refer to, once each, next to any remote rule sets.
+    private func attachLocalRuleSets(to configuration: inout [String: Any]) {
+        guard var route = configuration["route"] as? [String: Any] else { return }
+        let definitions = RoutingRuleCapabilities.localRuleSetDefinitions(
+            referencedIn: [route["rules"] ?? [], (configuration["dns"] as? [String: Any])?["rules"] ?? []]
+        )
+        guard !definitions.isEmpty else { return }
+        route["rule_set"] = (route["rule_set"] as? [[String: Any]] ?? []) + definitions
+        configuration["route"] = route
+    }
+
     private func singBoxDNS(remoteDetour: String?) -> [String: Any] {
         var remote: [String: Any] = [
             "type": "https",
@@ -3502,42 +4294,32 @@ extension ConfigurationGenerator {
         var servers: [[String: Any]] = schemePlainDNS(scheme).enumerated().map { index, address in
             ["type": "udp", "tag": index == 0 ? "bootstrap" : "bootstrap-\(index + 1)", "server": address]
         }
-        var localServers: [[String: Any]] = []
-        for value in schemeEncryptedDNS(scheme) {
-            guard let url = URLComponents(string: value),
-                  let type = url.scheme?.lowercased(), ["https", "tls", "quic"].contains(type),
-                  let rawHost = url.host, !rawHost.isEmpty else { continue }
-            let host = rawHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-            let index = localServers.count
-            var server: [String: Any] = [
-                "type": type,
-                "tag": index == 0 ? "local" : "local-\(index + 1)",
-                "server": host,
-                "server_port": url.port ?? (type == "https" ? 443 : 853),
-                "tls": ["enabled": true, "server_name": host]
-            ]
-            if RuleSchemeNetworkSettings.normalizedPlainDNSServer(host) == nil {
-                server["domain_resolver"] = "bootstrap"
-            }
-            if type == "https" {
-                let path = url.percentEncodedPath.isEmpty ? "/dns-query" : url.percentEncodedPath
-                server["path"] = path + (url.percentEncodedQuery.map { "?" + $0 } ?? "")
-            }
-            localServers.append(server)
+        var localServers = schemeEncryptedDNS(scheme).compactMap { value in
+            singBoxResolver(value, domainResolver: "bootstrap")
         }
         // Defend legacy snapshots containing invalid resolver URLs as well as
         // freshly validated settings. The bootstrap is still a literal address.
         if localServers.isEmpty {
-            localServers = [["type": "https", "tag": "local", "server": "223.5.5.5", "path": "/dns-query"]]
+            localServers = [["type": "https", "server": "223.5.5.5", "path": "/dns-query"]]
         }
+        for index in localServers.indices { localServers[index]["tag"] = index == 0 ? "local" : "local-\(index + 1)" }
         servers += localServers
         if let remoteDetour {
-            servers += localServers.enumerated().map { index, local in
-                var remote = local
-                remote["tag"] = index == 0 ? "remote" : "remote-\(index + 1)"
-                remote["detour"] = remoteDetour
-                return remote
+            // Remote resolvers are the user's own list, not copies of the
+            // domestic ones: a domestic resolver reached through the proxy
+            // still answers blocked names with forged addresses.
+            let remote = (scheme.networkSettings ?? .towerDefault).effectiveRemoteDNSServers
+            var remoteServers = remote.compactMap { singBoxResolver($0, domainResolver: "local") }
+            if remoteServers.isEmpty {
+                remoteServers = RuleSchemeNetworkSettings.towerDefault.remoteDNSServers.compactMap {
+                    singBoxResolver($0, domainResolver: "local")
+                }
             }
+            for index in remoteServers.indices {
+                remoteServers[index]["tag"] = index == 0 ? "remote" : "remote-\(index + 1)"
+                remoteServers[index]["detour"] = remoteDetour
+            }
+            servers += remoteServers
         }
         return [
             "servers": servers,
@@ -3546,6 +4328,41 @@ extension ConfigurationGenerator {
             "reverse_mapping": true
         ]
     }
+
+    /// The user's first remote resolver that honours ECS, so the Chinese
+    /// lookup goes where they asked. Without one, Google's DoH is used for
+    /// this lookup only; the configured remote list still answers the rest.
+    private func singBoxClientSubnetResolver(_ scheme: RuleScheme) -> [String: Any]? {
+        let remote = (scheme.networkSettings ?? .towerDefault).effectiveRemoteDNSServers
+        return remote.first(where: RuleSchemeNetworkSettings.supportsClientSubnet)
+            .flatMap { singBoxResolver($0, domainResolver: "local") }
+    }
+
+    /// One encrypted resolver URL as a sing-box DNS server, without a tag.
+    private func singBoxResolver(_ value: String, domainResolver: String) -> [String: Any]? {
+        guard let url = URLComponents(string: value),
+              let type = url.scheme?.lowercased(), ["https", "h3", "tls", "quic"].contains(type),
+              let rawHost = url.host, !rawHost.isEmpty else { return nil }
+        let host = rawHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        var server: [String: Any] = [
+            "type": type,
+            "server": host,
+            "server_port": url.port ?? (["https", "h3"].contains(type) ? 443 : 853),
+            "tls": ["enabled": true, "server_name": Self.singBoxResolverServerNames[host] ?? host]
+        ]
+        if RuleSchemeNetworkSettings.normalizedPlainDNSServer(host) == nil {
+            server["domain_resolver"] = domainResolver
+        }
+        if ["https", "h3"].contains(type) {
+            let path = url.percentEncodedPath.isEmpty ? "/dns-query" : url.percentEncodedPath
+            server["path"] = path + (url.percentEncodedQuery.map { "?" + $0 } ?? "")
+        }
+        return server
+    }
+
+    /// Resolvers reached by address whose certificate is better matched by
+    /// name. Tower wrote Google's DoH this way before the lists were split.
+    private static let singBoxResolverServerNames = ["8.8.8.8": "dns.google", "8.8.4.4": "dns.google"]
 
     /// Non-final route actions must run before destination rules. Sniffing
     /// recovers HTTP Host/TLS SNI from TUN connections so domain rules can
@@ -3619,8 +4436,10 @@ extension ConfigurationGenerator {
             }
             result.append(rule)
         }
+        // The other clients write GEOIP,CN here, not the private ranges.
         if preset.includeGeoIPCN {
-            result.append(["ip_is_private": true, "outbound": Self.singBoxDirectTag])
+            let cidrs = IPCountryDatabase.cidrs(forCountry: "CN")
+            if !cidrs.isEmpty { result.append(["ip_cidr": cidrs, "outbound": Self.singBoxDirectTag]) }
         }
         return result
     }
@@ -3668,6 +4487,32 @@ extension ConfigurationGenerator {
         return endpoint
     }
 
+    private func singBoxNodeOutbounds(_ nodes: [ProxyNode], reservedTags: Set<String>, hideHelpers: Bool = false) -> [[String: Any]] {
+        var occupied = reservedTags.union(nodes.map { NodeRegionResolver.displayName(for: $0) })
+        occupied.formUnion([Self.singBoxDirectTag, Self.singBoxRejectTag])
+        var result = [[String: Any]]()
+        for node in nodes {
+            guard var outbound = singBoxOutbound(node) else { continue }
+            if let shadowTLS = node.shadowTLS {
+                var tag = (hideHelpers ? "§hide§" : "") + "tower-shadowtls-\(result.count)"
+                while occupied.contains(tag) { tag += "-" }
+                occupied.insert(tag)
+                outbound["detour"] = tag
+                outbound["network"] = "tcp"
+                var tls: [String: Any] = ["enabled": true, "server_name": shadowTLS.host,
+                                          "insecure": shadowTLS.skipCertificateVerification]
+                if let fingerprint = node.fingerprint {
+                    tls["utls"] = ["enabled": true, "fingerprint": fingerprint]
+                }
+                result.append(["type": "shadowtls", "tag": tag, "server": node.server,
+                               "server_port": node.port, "version": shadowTLS.version,
+                               "password": shadowTLS.password, "tls": tls])
+            }
+            result.append(outbound)
+        }
+        return result
+    }
+
     /// A protocol outbound; current WireGuard endpoints are emitted separately.
     func singBoxOutbound(_ node: ProxyNode) -> [String: Any]? {
         var outbound: [String: Any] = [
@@ -3679,6 +4524,7 @@ extension ConfigurationGenerator {
         switch node.kind {
         case .shadowsocks:
             outbound["type"] = "shadowsocks"
+            if node.udpRelayEnabled == false { outbound["network"] = "tcp" }
             outbound["method"] = node.cipher ?? "aes-256-gcm"
             outbound["password"] = node.password ?? ""
             if node.plugin == "v2ray-plugin" {
@@ -3686,13 +4532,13 @@ extension ConfigurationGenerator {
                 var options = ["mode=websocket"]
                 if let mux = node.pluginMux { options.append("mux=\(mux ? "1" : "0")") }
                 if node.tls { options.append("tls") }
-                if let host = node.hostHeader, !host.isEmpty { options.append("host=\(host)") }
-                if let path = node.exportablePath { options.append("path=\(path)") }
+                if let host = node.hostHeader, !host.isEmpty { options.append("host=\(sip003Value(host))") }
+                if let path = node.exportablePath { options.append("path=\(sip003Value(path))") }
                 outbound["plugin_opts"] = options.joined(separator: ";")
             } else if let mode = simpleObfsMode(node) {
                 outbound["plugin"] = "obfs-local"
                 var options = ["obfs=\(mode)"]
-                if let host = node.obfsParam, !host.isEmpty { options.append("obfs-host=\(host)") }
+                if let host = node.obfsParam, !host.isEmpty { options.append("obfs-host=\(sip003Value(host))") }
                 outbound["plugin_opts"] = options.joined(separator: ";")
             }
         case .shadowsocksR:
@@ -3720,6 +4566,12 @@ extension ConfigurationGenerator {
             outbound["password"] = node.password ?? ""
             if let obfs = hysteria2Obfs(node) {
                 outbound["obfs"] = ["type": obfs.type, "password": obfs.password]
+            }
+            let hopping = portHoppingEntries(node)
+            if !hopping.isEmpty {
+                outbound["server_ports"] = hopping.map { entry in
+                    entry.contains("-") ? entry.replacingOccurrences(of: "-", with: ":") : "\(entry):\(entry)"
+                }
             }
         case .hysteria:
             outbound["type"] = "hysteria"
@@ -3777,7 +4629,19 @@ extension ConfigurationGenerator {
             outbound["type"] = "http"
             if let user = node.username, !user.isEmpty { outbound["username"] = user }
             if let password = node.password, !password.isEmpty { outbound["password"] = password }
-        case .unknown:
+        case .ssh:
+            let options = node.ssh ?? SSHOptions()
+            outbound["type"] = "ssh"
+            outbound["user"] = node.username ?? ""
+            if let password = node.password, !password.isEmpty { outbound["password"] = password }
+            if let key = options.privateKey, !key.isEmpty { outbound["private_key"] = key }
+            if let passphrase = options.privateKeyPassphrase, !passphrase.isEmpty {
+                outbound["private_key_passphrase"] = passphrase
+            }
+            if !options.hostKeys.isEmpty { outbound["host_key"] = options.hostKeys }
+            if !options.hostKeyAlgorithms.isEmpty { outbound["host_key_algorithms"] = options.hostKeyAlgorithms }
+        // Official sing-box has no TrustTunnel outbound (only Hiddify's fork).
+        case .masque, .trustTunnel, .unknown:
             return nil
         }
 
@@ -3811,9 +4675,18 @@ extension ConfigurationGenerator {
             tls["reality"] = reality
             // REALITY needs uTLS; sing-box rejects the pair otherwise.
             tls["utls"] = ["enabled": true, "fingerprint": node.fingerprint ?? "chrome"]
+        } else if let fingerprint = node.fingerprint?.lowercased(), Self.singBoxUTLSFingerprints.contains(fingerprint) {
+            // The client fingerprint was dropped for every non-Reality node,
+            // so sing-box sent Go's own TLS ClientHello instead.
+            tls["utls"] = ["enabled": true, "fingerprint": fingerprint]
         }
         return tls
     }
+
+    /// sing-box's uTLS names (configuration/shared/tls, `utls.fingerprint`).
+    private static let singBoxUTLSFingerprints: Set<String> = [
+        "chrome", "firefox", "edge", "safari", "360", "qq", "ios", "android", "random", "randomized"
+    ]
 
     private func singBoxTransport(_ node: ProxyNode) -> [String: Any]? {
         // Only these outbound schemas accept V2Ray transport. Shadowsocks
@@ -3823,7 +4696,11 @@ extension ConfigurationGenerator {
         switch transport {
         case "ws":
             var websocket: [String: Any] = ["type": "ws"]
-            if let path = node.exportablePath { websocket["path"] = path }
+            if let path = node.exportablePathWithoutEarlyData { websocket["path"] = path }
+            if let earlyData = node.webSocketEarlyData {
+                websocket["max_early_data"] = earlyData
+                websocket["early_data_header_name"] = "Sec-WebSocket-Protocol"
+            }
             if let host = node.exportableTransportHost { websocket["headers"] = ["Host": host] }
             return websocket
         case "grpc":
@@ -3867,7 +4744,8 @@ extension ConfigurationGenerator {
         groups: [ResolvedSchemeGroup],
         nodes: [ProxyNode],
         rulePlan: RuleSetEmissionPlanner.Plan,
-        target: ClientTarget
+        target: ClientTarget,
+        dnsDomainRules: [[String: Any]] = []
     ) -> String {
         let finalGroup = rulePlan.finalGroupName ?? groups.first?.name ?? Self.singBoxDirectTag
         var outbounds: [[String: Any]] = groups.map { group in
@@ -3887,8 +4765,13 @@ extension ConfigurationGenerator {
             }
             return outbound
         }
-        outbounds += nodes.filter { target != .singBox || $0.kind != .wireguard }
-            .compactMap(singBoxOutbound)
+        // Hiddify lists every outbound as a choice; without §hide§ the
+        // ShadowTLS helper appeared there and failed its latency test.
+        outbounds += singBoxNodeOutbounds(
+            nodes.filter { target != .singBox || $0.kind != .wireguard },
+            reservedTags: Set(outbounds.compactMap { $0["tag"] as? String }),
+            hideHelpers: target == .hiddify
+        )
 
         // A route-level `action: reject` is sufficient for direct blocking
         // rules, but selectors cannot reference an action. Imported schemes
@@ -3943,9 +4826,17 @@ extension ConfigurationGenerator {
             case .inline(let inline):
                 let parts = inline.line.split(separator: ",", omittingEmptySubsequences: false)
                     .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                guard parts.count >= 2,
-                      let field = Self.singBoxRuleFields[parts[0].uppercased()],
-                      !parts[1].isEmpty else { continue }
+                guard parts.count >= 2 else { continue }
+                guard let field = Self.singBoxRuleFields[parts[0].uppercased()], !parts[1].isEmpty,
+                      !parts.contains("src") else {
+                    flushPending()
+                    if var rule = RoutingRuleCapabilities.singBoxCondition(inline.line, localRuleSets: target == .singBox) {
+                        if inline.policyName.uppercased() == "REJECT" { rule["action"] = "reject" }
+                        else { rule["outbound"] = inline.policyName }
+                        rules.append(rule)
+                    }
+                    continue
+                }
                 if pendingGroup != inline.policyName {
                     flushPending()
                     pendingGroup = inline.policyName
@@ -4019,8 +4910,19 @@ extension ConfigurationGenerator {
         }
 
         if target == .singBox {
-            let endpoints = nodes.compactMap(singBoxWireGuardEndpoint)
+            let endpoints = nodes.compactMap { singBoxWireGuardEndpoint($0) ?? singBoxMASQUEEndpoint($0) }
             if !endpoints.isEmpty { configuration["endpoints"] = endpoints }
+        }
+
+        if target == .singBox {
+            SingBoxDNSPolicy.apply(to: &configuration,
+                nodeTags: nodes.map { NodeRegionResolver.displayName(for: $0) },
+                preferredProxy: remoteDetour, domainRules: dnsDomainRules,
+                protection: schemeDNSProtectionMode(scheme),
+                ipv6Enabled: scheme.networkSettings?.ipv6Enabled ?? false,
+                chinaResolverHint: true,
+                chinaResolver: singBoxClientSubnetResolver(scheme))
+            attachLocalRuleSets(to: &configuration)
         }
 
         guard let data = try? JSONSerialization.data(
@@ -4290,43 +5192,78 @@ extension ConfigurationGenerator {
     }
 
     /// One rule per entry: Egern's `match` takes a single value, so a rule list
-    /// is one mapping each rather than an array per policy.
+    /// is one mapping each rather than an array per policy. Logical rules nest
+    /// the same mappings under `match` (egernapp.com/docs/configuration/rules).
     private func egernRule(_ rule: String, policy: String) -> String? {
-        let parts = rule.split(separator: ",", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        guard parts.count >= 2,
-              let matcher = Self.egernRuleMatchers[parts[0].uppercased()],
-              !parts[1].isEmpty else { return nil }
-
-        // Egern spells the flag as a neighbouring key rather than a trailing
-        // field, which is why it used to be dropped here. GEOIP always skips
-        // resolution, matching the built-in presets and the other six clients;
-        // an IP rule keeps whatever the source file asked for.
-        let isIPMatcher = matcher == "geoip" || matcher == "ip_cidr"
-        let skipsResolution = isIPMatcher
-            && (parts[0].uppercased() == "GEOIP"
-                || parts.dropFirst().contains { $0.lowercased() == "no-resolve" })
-
-        var line = "  - \(matcher):\n      match: \(yaml(parts[1]))\n"
-        if skipsResolution { line += "      no_resolve: true\n" }
-        return line + "      policy: \(yaml(policy))\n"
+        guard let condition = RoutingRuleSyntax.condition(rule),
+              let rendered = egernCondition(condition, indent: 6, topLevel: true) else { return nil }
+        return "  - \(rendered.key):\n" + rendered.lines + "      policy: \(yaml(policy))\n"
     }
 
-    private static let egernRuleMatchers: [String: String] = [
-        "DOMAIN": "domain",
-        "DOMAIN-SUFFIX": "domain_suffix",
-        "DOMAIN-KEYWORD": "domain_keyword",
-        "IP-CIDR": "ip_cidr",
-        "IP-CIDR6": "ip_cidr",
-        "IP6-CIDR": "ip_cidr",
-        "GEOIP": "geoip",
-        "URL-REGEX": "url_regex",
-        "DEST-PORT": "dest_port",
-        "PROTOCOL": "protocol"
-    ]
+    /// The rule key and the lines under it, indented by `indent`.
+    private func egernCondition(
+        _ condition: RoutingRuleSyntax.Condition,
+        indent: Int,
+        topLevel: Bool = false
+    ) -> (key: String, lines: String)? {
+        let pad = String(repeating: " ", count: indent)
+        // Egern has no source-address rules; dropping `src` would invert the rule.
+        guard !condition.options.contains(where: { $0.lowercased() == "src" }) else { return nil }
+        if let children = condition.children {
+            let key = condition.type.lowercased()
+            if key == "not" {
+                // `not` takes one mapping, not a list.
+                guard children.count == 1,
+                      let child = egernCondition(children[0], indent: indent + 4) else { return nil }
+                return (key, "\(pad)match:\n\(pad)  \(child.key):\n\(child.lines)")
+            }
+            var lines = "\(pad)match:\n"
+            for child in children {
+                guard let rendered = egernCondition(child, indent: indent + 6) else { return nil }
+                lines += "\(pad)  - \(rendered.key):\n\(rendered.lines)"
+            }
+            return (key, lines)
+        }
+
+        var value = RoutingRuleSyntax.unquote(condition.value)
+        let key: String
+        switch condition.type {
+        case "DOMAIN": key = "domain"
+        case "DOMAIN-SUFFIX": key = "domain_suffix"
+        case "DOMAIN-KEYWORD": key = "domain_keyword"
+        case "DOMAIN-REGEX": key = "domain_regex"
+        case "DOMAIN-WILDCARD": key = "domain_wildcard"
+        // ip_cidr is IPv4 only; Egern spells IPv6 ranges ip_cidr6.
+        case "IP-CIDR", "IP-CIDR6", "IP6-CIDR": key = value.contains(":") ? "ip_cidr6" : "ip_cidr"
+        case "GEOIP": key = "geoip"
+        case "IP-ASN": key = "asn"
+        case "URL-REGEX": key = "url_regex"
+        case "USER-AGENT": key = "user_agent"
+        case "DEST-PORT", "DST-PORT":
+            guard let ranges = RoutingRuleCapabilities.portRanges(value) else { return nil }
+            key = "dest_port"
+            value = ranges.joined(separator: ",")
+        case "PROTOCOL", "NETWORK":
+            guard ["tcp", "udp", "http", "https", "quic", "stun"].contains(value.lowercased()) else { return nil }
+            key = "protocol"
+            value = value.lowercased()
+        default: return nil
+        }
+        var lines = "\(pad)match: \(yaml(value))\n"
+        // GEOIP always skips resolution, matching the other clients; an IP
+        // rule keeps whatever the source asked for. Egern documents the flag
+        // for top-level IP rules only.
+        let skipsResolution = condition.type == "GEOIP"
+            || condition.options.contains { $0.lowercased() == "no-resolve" }
+        if topLevel, ["geoip", "ip_cidr", "ip_cidr6", "asn"].contains(key), skipsResolution {
+            lines += "\(pad)no_resolve: true\n"
+        }
+        return (key, lines)
+    }
 
     /// One `- <type>:` entry with the snake_case keys Egern uses.
-    func egernProxy(_ node: ProxyNode) -> String? {
+    func egernProxy(_ source: ProxyNode) -> String? {
+        let node = source.withTransportHostAsSNI
         var body: [String] = ["      name: \(yaml(NodeRegionResolver.displayName(for: node)))"]
         func endpoint() {
             body.append("      server: \(yaml(node.server))")
@@ -4342,6 +5279,11 @@ extension ConfigurationGenerator {
             body.append("      method: \(yaml(cipher == "chacha20-ietf-poly1305" ? "chacha20-poly1305" : cipher))")
             body.append("      password: \(yaml(node.password ?? ""))")
             endpoint()
+            if let shadowTLS = node.shadowTLS {
+                body.append("      shadow_tls:")
+                body.append("        password: \(yaml(shadowTLS.password))")
+                body.append("        sni: \(yaml(shadowTLS.host))")
+            }
             if let mode = simpleObfsMode(node) {
                 body.append("      obfs: \(yaml(mode))")
                 if let host = node.obfsParam, !host.isEmpty {
@@ -4360,6 +5302,8 @@ extension ConfigurationGenerator {
             endpoint()
             body.append("      auth: \(yaml(node.password ?? ""))")
             if let sni = node.sni, !sni.isEmpty { body.append("      sni: \(yaml(sni))") }
+            let hopping = portHoppingEntries(node)
+            if !hopping.isEmpty { body.append("      port_hopping: \(yaml(hopping.joined(separator: ",")))") }
         case .tuic:
             type = "tuic"
             endpoint()
@@ -4409,12 +5353,23 @@ extension ConfigurationGenerator {
             if let password = node.password, !password.isEmpty {
                 body.append("      password: \(yaml(password))")
             }
-        case .hysteria, .shadowsocksR, .unknown:
+        case .ssh:
+            type = "ssh"
+            endpoint()
+            body.append("      username: \(yaml(node.username ?? ""))")
+            if let password = node.password, !password.isEmpty { body.append("      password: \(yaml(password))") }
+            if let key = node.ssh?.privateKey, !key.isEmpty { body.append("      private_key: \(yamlMultiline(key))") }
+            let hostKeys = node.ssh?.hostKeys ?? []
+            if !hostKeys.isEmpty { body.append("      host_keys: \(yamlList(hostKeys))") }
+        case .hysteria, .shadowsocksR, .masque, .trustTunnel, .unknown:
             // supports(_:) filters these out; this keeps the switch total.
             return nil
         }
 
-        body.append("      udp_relay: true")
+        // Egern's SSH has neither UDP relay (no datagram channel) nor TLS.
+        if node.kind != .ssh {
+            body.append("      udp_relay: \(node.kind == .shadowsocks ? node.udpRelayEnabled ?? true : true)")
+        }
         if node.usesReality, ![.vmess, .vless].contains(node.kind) {
             body.append("      reality:")
             body.append("        public_key: \(yaml(node.realityPublicKey ?? ""))")
@@ -4422,7 +5377,7 @@ extension ConfigurationGenerator {
                 body.append("        short_id: \(yaml(shortID))")
             }
         }
-        if ![.shadowsocks, .vmess, .vless].contains(node.kind) {
+        if ![.shadowsocks, .vmess, .vless, .ssh].contains(node.kind) {
             body.append("      skip_tls_verify: \(node.skipCertificateVerification ? "true" : "false")")
             if let fingerprint = node.certificateFingerprint, !fingerprint.isEmpty {
                 body.append("      fingerprint_sha256: \(yaml(fingerprint))")
@@ -4449,7 +5404,7 @@ extension ConfigurationGenerator {
     /// node negotiates TLS.
     private func egernTransport(_ node: ProxyNode) -> [String]? {
         if node.kind == .trojan, node.transport == "ws" {
-            var lines = ["      websocket:", "        path: \(yaml(node.exportablePath ?? "/"))"]
+            var lines = ["      websocket:", "        path: \(yaml(node.exportablePathWithoutEarlyData ?? "/"))"]
             if let host = node.exportableTransportHost { lines.append("        host: \(yaml(host))") }
             return lines
         }
@@ -4468,7 +5423,7 @@ extension ConfigurationGenerator {
             }
         case "ws":
             lines.append("        \(node.tls ? "wss" : "ws"):")
-            if let path = node.exportablePath { lines.append("          path: \(yaml(path))") }
+            if let path = node.exportablePathWithoutEarlyData { lines.append("          path: \(yaml(path))") }
             if let host = node.exportableTransportHost {
                 lines.append("          headers:")
                 lines.append("            Host: \(yaml(host))")
@@ -4495,6 +5450,11 @@ extension ConfigurationGenerator {
                 lines.append("          service_name: \(yaml(service.hasPrefix("/") ? String(service.dropFirst()) : service))")
             }
             if let sni = node.sni, !sni.isEmpty { lines.append("          sni: \(yaml(sni))") }
+            if node.usesReality {
+                lines.append("          reality:")
+                lines.append("            public_key: \(yaml(node.realityPublicKey ?? ""))")
+                if let shortID = node.realityShortID { lines.append("            short_id: \(yaml(shortID))") }
+            }
         default:
             return nil
         }

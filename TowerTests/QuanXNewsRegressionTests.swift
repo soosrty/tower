@@ -184,26 +184,32 @@ final class QuanXNewsRegressionTests: XCTestCase {
         XCTAssertTrue(result.content.contains("    tls: true"))
     }
 
-    func testKaringYAMLPreservesRealityAndTLS() throws {
-        for kind: ProxyKind in [.anytls, .socks5, .http, .shadowsocks] {
+    func testKaringYAMLPreservesRealityOnlyWhereItConnects() throws {
+        var anytls = ProxyNode(kind: .anytls, name: "TLS Fixture", server: "proxy.example.com", port: 443,
+                               password: "fixture", tls: true, sni: "tls.example.com", alpn: "http/1.1", rawURI: "")
+        anytls.realityPublicKey = "k4Uxez0sjl8bKaZH2Vgi8-WDFshML51QkxKFLWFIONk"
+        anytls.realityShortID = "0123456789abcdef"
+        let result = ConfigurationGenerator().generate(nodes: [anytls], preset: RulePreset.builtIns[0], target: .karing)
+        XCTAssertEqual(result.supportedNodeCount, 1)
+        XCTAssertTrue(result.content.contains("    reality-opts:"))
+        XCTAssertTrue(result.content.contains("      short-id: \"0123456789abcdef\""))
+        let parsed = try XCTUnwrap(SubscriptionParser().parse(data: Data(result.content.utf8)).nodes.first)
+        XCTAssertEqual(parsed.realityPublicKey, anytls.realityPublicKey)
+
+        // Karing's sing-box core has no SOCKS TLS and no native SS TLS, and its
+        // users saw SOCKS5/HTTP Reality fail: these are skipped, not written.
+        for kind: ProxyKind in [.socks5, .http, .shadowsocks] {
             var node = ProxyNode(kind: kind, name: "TLS Fixture", server: "proxy.example.com", port: 443,
                                  cipher: "aes-128-gcm", password: "fixture", tls: true,
                                  sni: "tls.example.com", alpn: "http/1.1", rawURI: "")
-            node.realityPublicKey = "k4Uxez0sjl8bKaZH2Vgi8-WDFshML51QkxKFLWFIONk"
-            node.realityShortID = "0123456789abcdef"
-            let result = ConfigurationGenerator().generate(nodes: [node], preset: RulePreset.builtIns[0], target: .karing)
-            XCTAssertEqual(result.supportedNodeCount, 1, kind.rawValue)
-            XCTAssertTrue(result.content.contains("    reality-opts:"), kind.rawValue)
-            XCTAssertTrue(result.content.contains("      short-id: \"0123456789abcdef\""), kind.rawValue)
-            let parsed = try XCTUnwrap(SubscriptionParser().parse(data: Data(result.content.utf8)).nodes.first)
-            XCTAssertEqual(parsed.realityPublicKey, node.realityPublicKey, kind.rawValue)
-            XCTAssertEqual(parsed.sni, node.sni, kind.rawValue)
-            XCTAssertTrue(parsed.tls, kind.rawValue)
+            if kind != .shadowsocks {
+                node.realityPublicKey = anytls.realityPublicKey
+                node.realityShortID = anytls.realityShortID
+            }
+            let skipped = ConfigurationGenerator().generate(nodes: [node], preset: RulePreset.builtIns[0], target: .karing)
+            XCTAssertEqual(skipped.supportedNodeCount, 0, kind.rawValue)
+            XCTAssertEqual(skipped.skippedNodeCount, 1, kind.rawValue)
         }
-        let ss = ProxyNode(kind: .shadowsocks, name: "SS TLS", server: "proxy.example.com", port: 443,
-                           cipher: "aes-128-gcm", password: "fixture", tls: true, sni: "tls.example.com", rawURI: "")
-        let result = ConfigurationGenerator().generate(nodes: [ss], preset: RulePreset.builtIns[0], target: .karing)
-        XCTAssertTrue(result.content.contains("    tls: true"))
     }
 
     func testOptionalAllProtocolLabExport() throws {

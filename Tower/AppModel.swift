@@ -1,16 +1,19 @@
 import Foundation
 import Combine
+import os
 
 enum RuleGroupRenameError: LocalizedError {
     case emptyName
     case missingGroup
     case duplicateName
+    case invalidNodeGroupName
 
     var errorDescription: String? {
         switch self {
         case .emptyName: String(localized: "规则名称不能为空。")
         case .missingGroup: String(localized: "找不到要修改的规则。")
         case .duplicateName: String(localized: "已经存在同名规则。")
+        case .invalidNodeGroupName: String(localized: "请使用其他名称，避开内置策略名、逗号和换行。")
         }
     }
 }
@@ -39,17 +42,80 @@ final class AppModel: ObservableObject {
 
     // Defaults so `apply(_:)` can be an instance method: a class cannot call
     // one until every stored property is initialised.
-    @Published var subscriptions: [SubscriptionSource] = []
+    @Published var subscriptions: [SubscriptionSource] = [] {
+        didSet { nodeSelectionCache = nil }
+    }
     @Published var nodes: [ProxyNode] = [] {
-        didSet { countryResolutionNodeServers = nil }
+        didSet {
+            countryResolutionNodeServers = nil
+            nodeSelectionCache = nil
+        }
     }
     private var countryResolutionNodeServers: [UUID: String]?
 
     @Published var selectedPresetID: String = AppModel.defaultRuleSchemeID
-    @Published var selectedTarget: ClientTarget = .surge
+    /// The client being viewed. A device-local preference: remembered in
+    /// UserDefaults, never saved to the snapshot or synced — browsing clients
+    /// used to write the whole state and schedule an iCloud sync.
+    @Published var selectedTarget: ClientTarget = .surge {
+        didSet {
+            guard !isDemoMode, oldValue != selectedTarget else { return }
+            UserDefaults.standard.set(selectedTarget.rawValue, forKey: clientSelectionKey)
+        }
+    }
+    /// What snapshots carry for older builds: the value loaded, not the browsing.
+    private var snapshotSelectedTarget: ClientTarget = .surge
     @Published var isReplayingMacOnboarding = false
-    @Published var selectedTab: AppTab = .subscriptions
+    @Published var selectedTab: AppTab = .subscriptions {
+        didSet {
+            pendingRulesNavigation?.cancel()
+            pendingRulesNavigation = nil
+            isRulesNavigationPending = false
+        }
+    }
+    @Published private var isRulesNavigationPending = false
+    private var pendingRulesNavigation: Task<Void, Never>?
+
+    /// A cold rules page must have its final statistics before it is visible.
+    /// Keep the current tab interactive while the shared background work finishes.
+    var tabSelection: AppTab {
+        get {
+            _ = isRulesNavigationPending
+            return selectedTab
+        }
+        set {
+            pendingRulesNavigation?.cancel()
+            pendingRulesNavigation = nil
+            isRulesNavigationPending = false
+            guard newValue == .rules, !isRulesPagePrepared else {
+                selectedTab = newValue
+                return
+            }
+            isRulesNavigationPending = true
+            pendingRulesNavigation = Task { [weak self] in
+                guard let self else { return }
+                while !Task.isCancelled && !self.isRulesPagePrepared {
+                    await self.prepareRulesPage()
+                }
+                guard !Task.isCancelled else { return }
+                self.selectedTab = .rules
+            }
+        }
+    }
     @Published var refreshingSourceIDs: Set<UUID> = []
+    @Published var subscriptionRefreshProgress: SubscriptionRefreshProgress?
+    private var presentedSubscriptionRefreshTask: Task<Void, Never>?
+
+    struct SubscriptionRefreshProgress {
+        let id = UUID()
+        let sourceIDs: Set<UUID>
+        /// A card's own refresh button: its spinner is the whole presentation.
+        var isSingleSource = false
+        var completedIDs: Set<UUID> = []
+        var title: String {
+            String(localized: "正在刷新订阅（\(completedIDs.count)/\(sourceIDs.count)）")
+        }
+    }
     @Published var nodeLatencies: [UUID: NodeLatencyMeasurement] = [:]
     @Published var latencyTestingNodeIDs: Set<UUID> = []
     @Published var selectedLatencyTestMode: NodeLatencyTestMode = .automatic
@@ -102,7 +168,9 @@ final class AppModel: ObservableObject {
         fullExportDestinationOrder.filter { !isExportDestinationVisible($0) }
     }
     @Published var appendSubscriptionNameToNodes = false
-    @Published var filterSubscriptionInfoNodes = false
+    @Published var filterSubscriptionInfoNodes = false {
+        didSet { nodeSelectionCache = nil }
+    }
     /// Refresh enabled subscriptions when the app opens. Off by default like
     /// every other feature here that reaches the network — the promise the app
     /// makes on first launch is that it goes online when you say so.
@@ -110,7 +178,7 @@ final class AppModel: ObservableObject {
     private var lastAutoRefreshAt: Date?
     @Published var configurationName = TowerBrand.localizedName
     @Published var preferRuleSets = false
-    private var preferRuleSetsWasExplicitlySet = false
+    @Published private var preferRuleSetsWasExplicitlySet = false
     /// Off by default because enabling it places credential-bearing airport
     /// URLs in the profile handed to another app.
     @Published var embedRemoteSubscriptionLinks = false
@@ -129,12 +197,25 @@ final class AppModel: ObservableObject {
     /// Missing means follow the source and show its emoji. Only explicit
     /// overrides are persisted so newly imported schemes retain their design.
     @Published var ruleGroupEmojisEnabled: [String: Bool] = [:]
-    @Published var excludedNodeIDs: Set<UUID> = []
+    @Published var excludedNodeIDs: Set<UUID> = [] {
+        didSet { nodeSelectionCache = nil }
+    }
+    var nodeExportNameFilter: NodeExportNameFilter? {
+        didSet { nodeSelectionCache = nil }
+    }
     /// User-owned rule contents are kept independently from the schemes in
     /// which they are currently active.
     @Published var localRuleSets: [LocalRuleSet] = []
     /// Per-scheme placement, routing and enablement for local and catalog rules.
     @Published var customRuleFlows: [CustomRuleFlow] = []
+    /// Tailnets written into complete profiles. Synced; their auth keys are not.
+    @Published var tailnets: [TailnetConnection] = []
+    /// Which tailnets have an auth key in this device's Keychain. Observed so
+    /// the editor can say so without reading the key back into the view.
+    @Published private(set) var tailnetsWithAuthKey: Set<UUID> = []
+    private var tailnetAuthKeys: any TailnetAuthKeyStoring = InMemoryTailnetAuthKeyStore()
+    /// Bumped on every key change so cached profiles are rebuilt.
+    private var tailnetAuthKeyRevision = 0
     @Published var importingSchemeIDs: Set<String> = []
     @Published private(set) var isImportingScheme = false
     private var ruleOperationGeneration = UUID()
@@ -146,6 +227,11 @@ final class AppModel: ObservableObject {
     @Published var excludedKinds: [ClientTarget: Set<ProxyKind>] = [:]
 
     private let persistence: PersistenceStore
+    @Published var cloudSyncIssue: String?
+    @Published var cloudRecoveryCopies: [CloudRecoveryCopy] = []
+    @Published var isLoadingCloudRecoveryCopies = false
+    private var cloudRecoveryLoadID = UUID()
+    private var performedForegroundOpenWork = false
     private let cloudSync: any CloudSnapshotSyncing
     private var cloudSyncGeneration = UUID()
     /// Off until the user turns it on. Enabling it is the moment subscription
@@ -155,6 +241,22 @@ final class AppModel: ObservableObject {
     @Published private(set) var isCloudSyncing = false
     @Published private(set) var isRemovingCloudSnapshot = false
     @Published private(set) var lastCloudSyncAt: Date?
+    /// `CloudSnapshotMerge.signature` of what this device last agreed with
+    /// iCloud. An edit whose signature matches has nothing to sync.
+    private var lastSyncedCloudSignature: Data?
+    /// Returning to the foreground checks iCloud at most this often; edits
+    /// still upload on their own and 立即同步 always runs.
+    private let cloudForegroundCheckInterval: TimeInterval
+    /// Groups a burst of edits (reordering, several toggles) into one sync.
+    private static let cloudUploadDelay: Duration = .seconds(5)
+    /// After a failed sync, edits wait this long before retrying on their own,
+    /// so a stuck iCloud download is not re-attempted after every save.
+    private static let cloudFailureBackoff: TimeInterval = 600
+    private var lastCloudSyncFailureAt: Date?
+    private var compactedLocalBackups = false
+    /// Why and how each sync ran, never what was synced: no names, links or
+    /// credentials. Visible in Console and in Instruments' os_log table.
+    private static let cloudLog = Logger(subsystem: "com.jzb.tower", category: "CloudSync")
     private var cloudUploadTask: Task<Void, Never>?
     /// When the state now in memory was last edited. Readable so a test can
     /// confirm a launch restores it: dropping it is what let an older iCloud
@@ -175,9 +277,126 @@ final class AppModel: ObservableObject {
     /// Latency probes and DNS lookups both run in small batches so expanding a
     /// large subscription cannot flood the network stack or stall the main actor.
     private static let resolutionBatchSize = 8
-    private static let resolvedHostCountryCodeTTL: TimeInterval = 3600
+    /// Matches the lookup service: a resolved host is good for a day.
+    private static let resolvedHostCountryCodeTTL: TimeInterval = 86_400
+    /// A node with no country is asked again after this, not every 30 s.
+    private static let unresolvedCountryRetryInterval: TimeInterval = 600
     private var generationCache = ConfigurationCache()
     private(set) var configurationGenerationCount = 0
+
+    // Snapshot comparisons reuse Array/Dictionary copy-on-write storage. Cache hits
+    // still read every observable input, so SwiftUI never loses invalidations.
+    private struct RequestInputs: Equatable {
+        let nodes: [ProxyNode]
+        let sources: [SubscriptionSource]
+        let excludedNodes: Set<UUID>
+        let nameFilter: NodeExportNameFilter?
+        let countryCodes: [UUID: String]
+        let schemes: [RuleScheme]
+        let groups: [String: Set<String>]
+        let customizations: [String: RuleSchemeCustomization]
+        let emojis: [String: Bool]
+        let flows: [CustomRuleFlow]
+        let tailnets: [TailnetConnection]
+        let tailnetKeyRevision: Int
+        let excludedKinds: [ClientTarget: Set<ProxyKind>]
+        let presetID: String
+        let name: String
+        let appendName: Bool
+        let filterInfo: Bool
+        let ruleSets: Bool
+        let remoteLinks: Bool
+        let rulesRevision: Int
+    }
+    private struct RequestVariant: Hashable {
+        let target: ClientTarget
+        let mode: ExportContentMode
+        let supportedKinds: Set<ProxyKind>?
+    }
+    private var requestInputs: RequestInputs?
+    private var requestCache: [RequestVariant: ConfigurationRequest] = [:]
+    private(set) var configurationRequestPreparationCount = 0
+
+    private struct NodeSelectionInputs: Equatable {
+        let nodes: [ProxyNode]
+        let sources: [SubscriptionSource]
+        let excluded: Set<UUID>
+        let filterInfo: Bool
+        let nameFilter: NodeExportNameFilter?
+    }
+    private struct NodeSelection {
+        let available: [ProxyNode]
+        let enabled: [ProxyNode]
+        let local: [ProxyNode]
+        let counts: [UUID: Int]
+        let nameMatchedIDs: Set<UUID>
+        let nameFilterError: String?
+        /// `enabled`'s ids, so callers testing many nodes do set lookups.
+        let enabledIDs: Set<UUID>
+    }
+    private var nodeSelectionCache: (NodeSelectionInputs, NodeSelection)?
+    private var nodeSelection: NodeSelection {
+        let inputs = NodeSelectionInputs(nodes: nodes, sources: subscriptions,
+                                         excluded: excludedNodeIDs, filterInfo: filterSubscriptionInfoNodes,
+                                         nameFilter: nodeExportNameFilter)
+        // Inputs above remain observable, but validity is maintained by their
+        // setters, avoiding repeated collection comparisons while rendering rows.
+        if let cached = nodeSelectionCache { return cached.1 }
+        let enabledSources = Set(inputs.sources.filter(\.isEnabled).map(\.id))
+        var available: [ProxyNode] = [], local: [ProxyNode] = []
+        var counts: [UUID: Int] = [:]
+        for node in inputs.nodes {
+            if node.isLocal { local.append(node) }
+            guard !inputs.filterInfo || node.isSubscriptionMetadata != true else { continue }
+            if let source = node.sourceID { counts[source, default: 0] += 1 }
+            guard node.sourceID == nil || enabledSources.contains(node.sourceID!) else { continue }
+            available.append(node)
+        }
+        var nameMatchedIDs = Set(available.map(\.id))
+        var nameFilterError: String?
+        if let filter = inputs.nameFilter {
+            (nameMatchedIDs, nameFilterError) = nodeNameMatches(for: filter, in: available)
+        }
+        let enabled = available.filter { nameMatchedIDs.contains($0.id) && !inputs.excluded.contains($0.id) }
+        let result = NodeSelection(available: available, enabled: enabled, local: local,
+                                   counts: counts, nameMatchedIDs: nameMatchedIDs,
+                                   nameFilterError: nameFilterError,
+                                   enabledIDs: Set(enabled.map(\.id)))
+        nodeSelectionCache = (inputs, result)
+        return result
+    }
+
+    // Name matching depends only on the filter and the available names. Ticking
+    // a node's checkbox invalidates the selection above, but must not rerun a
+    // regular expression over every node on the main actor.
+    private struct NodeNameMatchInputs: Equatable {
+        let filter: NodeExportNameFilter
+        let ids: [UUID]
+        let names: [String]
+    }
+    private var nodeNameMatchCache: (NodeNameMatchInputs, Set<UUID>, String?)?
+    private(set) var nodeNameFilterEvaluationCount = 0
+
+    private func nodeNameMatches(for filter: NodeExportNameFilter, in available: [ProxyNode]) -> (Set<UUID>, String?) {
+        let inputs = NodeNameMatchInputs(filter: filter, ids: available.map(\.id), names: available.map(\.name))
+        if let cached = nodeNameMatchCache, cached.0 == inputs { return (cached.1, cached.2) }
+        nodeNameFilterEvaluationCount += 1
+        let result: (Set<UUID>, String?)
+        do {
+            let indices = try NodeNameFilterMatcher.preview(
+                filter.pattern, candidates: inputs.names.map { [$0] },
+                caseInsensitive: filter.ignoresCase
+            )
+            result = (Set(indices.map { inputs.ids[$0] }), nil)
+        } catch {
+            // A malformed or expensive expression must never silently
+            // broaden an export to every node.
+            result = ([], error.localizedDescription)
+        }
+        nodeNameMatchCache = (inputs, result.0, result.1)
+        return result
+    }
+    private var countryCountCache: ([ProxyNode], [UUID: String], Int)?
 
     private struct SubscriptionRefreshBatch {
         let id: UUID
@@ -193,7 +412,63 @@ final class AppModel: ObservableObject {
     /// schemes and re-reading imported lists whenever only the selected id
     /// changes makes a simple mode switch block the main actor.
     private var schemeRuleCountCache: [String: Int] = [:]
-    @Published private var ruleSchemePresentationRevision = 0
+    /// What the cached rule counts were computed from. A count only depends on
+    /// a scheme's rule lists; toggling a node or editing a subscription used to
+    /// clear every count and re-read (and, for domain sets, re-transform)
+    /// every list on the rules screen — 100–160 ms per save on device.
+    private struct RuleCountInputs: Equatable {
+        let schemes: [RuleScheme]
+        let customizations: [String: RuleSchemeCustomization]
+        let flows: [CustomRuleFlow]
+        let localRuleSets: [LocalRuleSet]
+    }
+    private var ruleCountInputs: RuleCountInputs?
+    /// What the materialized and customizable schemes are built from. Every
+    /// save used to drop both caches, so any toggle rebuilt every scheme card
+    /// on the rules screen and the export request, re-reading all rule lists:
+    /// 160–340 ms per save on device (2026-09-27).
+    private struct RulePresentationInputs: Equatable {
+        let counts: RuleCountInputs
+        let selectedGroups: [String: Set<String>]
+        let emojis: [String: Bool]
+    }
+    private var rulePresentationInputs: RulePresentationInputs?
+
+    private func currentRulePresentationInputs() -> RulePresentationInputs {
+        RulePresentationInputs(
+            counts: RuleCountInputs(schemes: importedSchemes, customizations: ruleSchemeCustomizations,
+                                    flows: customRuleFlows, localRuleSets: localRuleSets),
+            selectedGroups: selectedRuleGroups,
+            emojis: ruleGroupEmojisEnabled
+        )
+    }
+
+    /// Call where the rule caches were just emptied for the current state
+    /// (load, applying a snapshot), so the next unrelated save keeps them.
+    private var clientSelectionKey: String {
+        "selectedClientTarget.\(clientPlatform == .mac ? "mac" : "phone").\(persistence.identifier)"
+    }
+
+    private var savedClientSelection: ClientTarget? {
+        UserDefaults.standard.string(forKey: clientSelectionKey).flatMap(ClientTarget.init(rawValue:))
+    }
+
+    private func recordRuleInputs() {
+        let presentation = currentRulePresentationInputs()
+        rulePresentationInputs = presentation
+        ruleCountInputs = presentation.counts
+    }
+    @Published private(set) var ruleSchemePresentationRevision = 0
+    @Published private var preparedRulesPageRevision: Int?
+    private typealias PreparedRulesPage = (
+        [String: RuleScheme], [String: RuleScheme], [String: Int],
+        [String: RuleSchemePageSummary], [String: Int]
+    )
+    private var rulesPagePreparation: (revision: Int, task: Task<PreparedRulesPage, Error>)?
+
+    var isRulesPagePrepared: Bool { preparedRulesPageRevision == ruleSchemePresentationRevision }
+    @Published private(set) var rulesPageSummaries: [String: RuleSchemePageSummary] = [:]
+    @Published private(set) var rulesPagePresetCounts: [String: Int] = [:]
     private var customizableSchemeCache: [String: RuleScheme] = [:]
     private var materializedSchemeCache: [String: RuleScheme] = [:]
     /// Test-visible instrumentation proving that selection-only renders reuse
@@ -213,6 +488,8 @@ final class AppModel: ObservableObject {
     private var resolvedHostCountryCodeUpdatedAt: [String: Date] = [:]
     private var lanSharingGeneration = UUID()
     private var lanSubscriptionServer: LANSubscriptionServer?
+    private let lanBackgroundLease: LANSharingBackgroundLease
+    private var lanSharingOutsideForeground = false
     private let persistencePolicy: PersistencePolicy
     private var pendingPersistenceUpdatedAt: Date?
     private var persistTask: Task<Void, Never>?
@@ -233,14 +510,19 @@ final class AppModel: ObservableObject {
         ipCountryLookupService: IPCountryLookupService = IPCountryLookupService(),
         reminderScheduler: (any SubscriptionReminderScheduling)? = nil,
         persistencePolicy: PersistencePolicy = .immediate,
+        cloudForegroundCheckInterval: TimeInterval = 600,
         arguments: [String] = ProcessInfo.processInfo.arguments,
-        clientPlatform: ClientPlatform = .current
+        clientPlatform: ClientPlatform = .current,
+        lanBackgroundLease: LANSharingBackgroundLease? = nil,
+        tailnetAuthKeys: (any TailnetAuthKeyStoring)? = nil
     ) {
+        self.lanBackgroundLease = lanBackgroundLease ?? LANSharingBackgroundLease()
         self.clientPlatform = clientPlatform
         self.clientOrder = clientPlatform.defaultOrder
         self.visibleClientTargets = clientPlatform.defaultVisibleTargets
         self.lanSharingOrderIndex = clientPlatform == .mac ? 1 : ExportDestinationOrder.defaultLANSharingIndex
         self.persistencePolicy = persistencePolicy
+        self.cloudForegroundCheckInterval = cloudForegroundCheckInterval
         #if DEBUG
         // UI tests get a disposable, restartable fixture, never the user's store.
         if let value = ProcessInfo.processInfo.environment["TOWER_UI_TEST_RUN"], let id = UUID(uuidString: value) {
@@ -257,13 +539,18 @@ final class AppModel: ObservableObject {
                                    "🇧🇷 巴西", "🇲🇽 墨西哥", "🇦🇷 阿根廷", "🇿🇦 南非", "🇹🇷 土耳其", "🇦🇪 阿联酋"]
                     let sourceCount = min(16, max(1, count / 30))
                     snapshot.subscriptions = (0..<sourceCount).map { index in
-                        SubscriptionSource(
+                        let usage = SubscriptionUsage(
+                            uploadBytes: Int64(index + 1) * 1_073_741_824,
+                            downloadBytes: Int64(index + 1) * 4_294_967_296,
+                            totalBytes: 214_748_364_800,
+                            expiresAt: Date.now.addingTimeInterval(Double(index + 7) * 86_400)
+                        )
+                        return SubscriptionSource(
                             name: index == 0 ? "云帆机场" : "测试订阅 \(index + 1)",
-                            urlString: "https://example.invalid/performance/\(index)", lastUpdatedAt: .now,
-                            usage: SubscriptionUsage(uploadBytes: Int64(index + 1) * 1_073_741_824,
-                                                     downloadBytes: Int64(index + 1) * 4_294_967_296,
-                                                     totalBytes: 214_748_364_800,
-                                                     expiresAt: .now.addingTimeInterval(Double(index + 7) * 86_400)))
+                            urlString: "https://example.invalid/performance/\(index)",
+                            lastUpdatedAt: Date.now,
+                            usage: usage
+                        )
                     }
                     let kinds: [ProxyKind] = [.shadowsocks, .trojan, .vmess, .vless, .hysteria2, .anytls]
                     snapshot.nodes = (0..<count).map { index in
@@ -286,8 +573,29 @@ final class AppModel: ObservableObject {
         #else
         self.persistence = persistence
         #endif
+        #if DEBUG
+        if let run = ProcessInfo.processInfo.environment["TOWER_UI_TEST_RUN"], let id = UUID(uuidString: run),
+           ProcessInfo.processInfo.environment["TOWER_UI_TEST_RULES_SYNC"] == "1" {
+            self.cloudSync = CloudSyncStore(fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("tower-rules-sync-\(id.uuidString)/cloud.json"))
+        } else if arguments.contains("--demo"), arguments.contains("--showcase") {
+            self.cloudSync = ShowcaseCloudSync()
+        } else {
+            self.cloudSync = cloudSync
+        }
+        #else
         self.cloudSync = cloudSync
+        #endif
+        #if DEBUG
+        if let run = ProcessInfo.processInfo.environment["TOWER_UI_TEST_RUN"], UUID(uuidString: run) != nil,
+           ProcessInfo.processInfo.environment["TOWER_REFRESH_UI_TEST"] == "1" {
+            self.subscriptionService = RefreshPresentationTestFetcher(nodes: Self.demoSnapshot.nodes)
+        } else {
+            self.subscriptionService = subscriptionService
+        }
+        #else
         self.subscriptionService = subscriptionService
+        #endif
         self.ruleRepository = ruleRepository
         self.downloadStore = downloadStore
         // The repository resolves imported rule lists through the same store the
@@ -299,15 +607,32 @@ final class AppModel: ObservableObject {
         self.ipCountryLookupService = ipCountryLookupService
         self.reminderScheduler = reminderScheduler ?? SubscriptionReminderScheduler()
         self.isDemoMode = arguments.contains("--demo")
+        // Demo and UI-test runs must never read or write the user's Keychain.
+        let usesDisposableStore = isDemoMode || ProcessInfo.processInfo.environment["TOWER_UI_TEST_RUN"] != nil
+        self.tailnetAuthKeys = tailnetAuthKeys
+            ?? (usesDisposableStore ? InMemoryTailnetAuthKeyStore() : TailnetAuthKeyStore())
+
+        #if DEBUG
+        let isShowcase = isDemoMode && arguments.contains("--showcase")
+        #endif
 
         if isDemoMode {
-            let demo = Self.demoSnapshot
+            var demo = Self.demoSnapshot
+            #if DEBUG
+            if isShowcase { demo = Self.showcaseSnapshot }
+            #endif
             subscriptions = demo.subscriptions
             nodes = demo.nodes
             selectedPresetID = demo.selectedPresetID
             selectedTarget = demo.selectedTarget
         } else if let snapshot = try? self.persistence.load() {
             apply(snapshot)
+        }
+        // Nothing has been built from rules yet, so the caches follow these.
+        recordRuleInputs()
+        // Without a snapshot to apply, still restore this device's last client.
+        if !isDemoMode, let saved = savedClientSelection, visibleClientTargets.contains(saved) {
+            selectedTarget = saved
         }
 
 
@@ -318,7 +643,10 @@ final class AppModel: ObservableObject {
         }
 
         if isDemoMode {
-            let demoMilliseconds = [36, 72, 94]
+            var demoMilliseconds = [36, 72, 94]
+            #if DEBUG
+            if isShowcase { demoMilliseconds = Self.showcaseLatencies }
+            #endif
             for (node, milliseconds) in zip(nodes, demoMilliseconds) {
                 nodeLatencies[node.id] = .success(milliseconds: milliseconds, method: .icmp)
             }
@@ -329,12 +657,34 @@ final class AppModel: ObservableObject {
             selectedTab = tab
         }
 
+        #if DEBUG
+        startRulesSyncUIFixtureIfRequested()
+        #endif
+
         if renewalRemindersEnabled {
             Task { [weak self] in
                 await self?.synchronizeRenewalReminders(showFailure: false)
             }
         }
+
+        #if DEBUG
+        // After the reminder sync above, so showcase switches schedule nothing.
+        if isShowcase { applyShowcaseSettings() }
+        #endif
     }
+
+    #if DEBUG
+    /// Settings as a configured user would have them, for App Store screenshots.
+    /// Demo mode already keeps cloud sync, reminders and refresh from running.
+    private func applyShowcaseSettings() {
+        tailnets = Self.showcaseTailnets
+        renewalRemindersEnabled = true
+        autoRefreshOnOpen = true
+        iCloudSyncEnabled = true
+        // Just before the 9:41 the screenshot status bars show.
+        lastCloudSyncAt = Calendar.current.date(bySettingHour: 9, minute: 38, second: 0, of: .now)
+    }
+    #endif
 
     var selectedPreset: RulePreset {
         RulePreset.builtIns.first(where: { $0.id == selectedPresetID }) ?? RulePreset.builtIns[0]
@@ -361,6 +711,7 @@ final class AppModel: ObservableObject {
     }
 
     func ruleCount(for scheme: RuleScheme) -> Int {
+        _ = ruleSchemePresentationRevision
         if let cached = schemeRuleCountCache[scheme.id] { return cached }
         let count = effectiveScheme(scheme).rulesets.reduce(0) {
             $0 + schemeRepository.lines(for: $1.resource).count
@@ -411,12 +762,8 @@ final class AppModel: ObservableObject {
         if let cached = customizableSchemeCache[scheme.id] {
             return cached
         }
-        let customized = scheme.customized(
-            enabledRuleGroupNames: nil,
-            customRuleFlows: customRuleFlows,
-            groupCustomization: ruleSchemeCustomizations[scheme.id],
-            resolvedRuleLines: resolvedRuleLines(for: scheme)
-        )
+        let input = rulePresentation(for: scheme)
+        let customized = input.materialize(preview: true, resolvedLines: input.resolveLines(using: schemeRepository))
         ruleSchemeMaterializationCount += 1
         customizableSchemeCache[scheme.id] = customized
         return customized
@@ -426,7 +773,7 @@ final class AppModel: ObservableObject {
         customizableScheme(for: scheme).groups
     }
 
-    func updateRuleGroup(_ group: RuleSchemeGroup, for scheme: RuleScheme) {
+    func updateRuleGroup(_ group: RuleSchemeGroup, for scheme: RuleScheme, sourceNodePatterns: [String]? = nil) {
         var customization = ruleSchemeCustomizations[scheme.id]
             ?? RuleSchemeCustomization(schemeID: scheme.id)
         if customization.groupOrder.isEmpty {
@@ -438,7 +785,8 @@ final class AppModel: ObservableObject {
         customization.groupOverrides[group.name] = RuleSchemeGroupOverride(
             kind: group.kind,
             members: group.members,
-            resetsSourceOptions: resetsOptions ? true : nil
+            resetsSourceOptions: resetsOptions ? true : nil,
+            sourceNodePatterns: sourceNodePatterns ?? customization.groupOverrides[group.name]?.sourceNodePatterns
         )
         ruleSchemeCustomizations[scheme.id] = customization
         persist()
@@ -507,19 +855,18 @@ final class AppModel: ObservableObject {
         }
         customization.groupRenames = renames.isEmpty ? nil : renames
         customization.groupOrder = customization.groupOrder.map { $0 == oldName ? newName : $0 }
-        customization.rulePriorityOrder = customization.rulePriorityOrder?.map { $0 == oldName ? newName : $0 }
+        customization.matchingOrder = customization.matchingOrder?.map { $0 == oldName ? newName : $0 }
 
         if let existingOverride = customization.groupOverrides.removeValue(forKey: oldName) {
             customization.groupOverrides[newName] = existingOverride
         }
         customization.groupOverrides = customization.groupOverrides.mapValues { override in
-            RuleSchemeGroupOverride(
-                kind: override.kind,
-                members: override.members?.map { member in
-                    guard case .reference(let name) = member, name == oldName else { return member }
-                    return .reference(newName)
-                }
-            )
+            var renamed = override
+            renamed.members = override.members?.map { member in
+                guard case .reference(let name) = member, name == oldName else { return member }
+                return .reference(newName)
+            }
+            return renamed
         }
         if let removedNames = customization.removedGroupNames {
             customization.removedGroupNames = Set(
@@ -553,18 +900,103 @@ final class AppModel: ObservableObject {
         setRuleGroupOrder(names, for: scheme)
     }
 
+    static let rulePriorityResetNoticeKey = "didRestoreRulePriority-issue40"
+
     func setRuleGroupOrder(_ names: [String], for scheme: RuleScheme) {
         var seen = Set<String>()
         let uniqueNames = names.filter { seen.insert($0).inserted }
         guard !uniqueNames.isEmpty else { return }
         var customization = ruleSchemeCustomizations[scheme.id]
             ?? RuleSchemeCustomization(schemeID: scheme.id)
-        guard customization.groupOrder != uniqueNames
-            || customization.rulePriorityOrder != uniqueNames else { return }
+        // Display order only. Rule matching keeps the source order (issue #40).
+        guard customization.groupOrder != uniqueNames else { return }
         customization.groupOrder = uniqueNames
-        customization.rulePriorityOrder = uniqueNames
         ruleSchemeCustomizations[scheme.id] = customization
         persist()
+    }
+
+    /// Groups that own rules, in the order an exported configuration
+    /// reaches them.
+    func matchingRuleGroupNames(for scheme: RuleScheme) -> [String] {
+        let names = Set(customizableRuleGroups(for: scheme).map(\.name))
+        return RuleScheme.matchingGroupNames(of: customizableScheme(for: scheme).rulesets)
+            .filter(names.contains)
+    }
+
+    func setMatchingOrder(_ names: [String], for scheme: RuleScheme) {
+        var seen = Set<String>()
+        let unique = names.filter { seen.insert($0).inserted }
+        guard unique != matchingRuleGroupNames(for: scheme) else { return }
+        var customization = ruleSchemeCustomizations[scheme.id]
+            ?? RuleSchemeCustomization(schemeID: scheme.id)
+        customization.matchingOrder = unique
+        ruleSchemeCustomizations[scheme.id] = customization
+        persist()
+    }
+
+    /// Where a dragged group should match after it was dragged past other
+    /// groups in the client-ordered list. Dragged down past groups it used to
+    /// beat, it now matches right after the last of them to match; dragged
+    /// up past groups that used to beat it, right before the first of them.
+    /// Dragging up never lowers a group's priority and dragging down never
+    /// raises it, so a drag that already agrees with matching changes
+    /// nothing. Only the dragged group moves; a group without rules, or one
+    /// that passed no rule group, returns the order as is.
+    func matchingOrderAfterDragging(_ name: String, from previousDisplay: [String], to displayOrder: [String],
+                                    in scheme: RuleScheme) -> [String] {
+        let current = matchingRuleGroupNames(for: scheme)
+        guard let position = current.firstIndex(of: name),
+              let oldIndex = previousDisplay.firstIndex(of: name),
+              let newIndex = displayOrder.firstIndex(of: name), oldIndex != newIndex else { return current }
+        let movedDown = newIndex > oldIndex
+        let passed = Set(movedDown
+            ? displayOrder[oldIndex..<newIndex]
+            : displayOrder[(newIndex + 1)...oldIndex]).subtracting([name])
+        let positions = passed.compactMap { current.firstIndex(of: $0) }
+        var order = current
+        if movedDown {
+            guard let anchor = positions.filter({ $0 > position }).max() else { return current }
+            let anchorName = current[anchor]
+            order.remove(at: position)
+            order.insert(name, at: (order.firstIndex(of: anchorName) ?? order.endIndex - 1) + 1)
+        } else {
+            guard let anchor = positions.filter({ $0 < position }).min() else { return current }
+            let anchorName = current[anchor]
+            order.remove(at: position)
+            order.insert(name, at: order.firstIndex(of: anchorName) ?? 0)
+        }
+        return order
+    }
+
+    /// Sites that a reorder hands from one group to another: for every pair
+    /// of groups whose order flipped, the domains both of them match. The
+    /// earlier group used to win them; now the other one does.
+    func matchingOrderConflicts(from old: [String], to new: [String], in scheme: RuleScheme) -> [RuleOrderConflict] {
+        let newIndex = Dictionary(new.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        var flipped: [(winner: String, loser: String)] = []
+        for (i, earlier) in old.enumerated() {
+            for later in old[(i + 1)...] {
+                guard let a = newIndex[earlier], let b = newIndex[later], b < a else { continue }
+                flipped.append((later, earlier))
+            }
+        }
+        guard !flipped.isEmpty else { return [] }
+        var linesByGroup: [String: [String]] = [:]
+        for ruleset in customizableScheme(for: scheme).rulesets where ruleset.origin != .supplement {
+            linesByGroup[ruleset.groupName, default: []].append(contentsOf: ruleLines(for: ruleset))
+        }
+        var matchers: [String: RuleGroupDomainMatcher] = [:]
+        func matcher(_ name: String) -> RuleGroupDomainMatcher {
+            if let cached = matchers[name] { return cached }
+            let built = RuleGroupDomainMatcher(lines: linesByGroup[name] ?? [])
+            matchers[name] = built
+            return built
+        }
+        return flipped.compactMap { pair in
+            let shared = RuleGroupDomainMatcher.sharedHosts(matcher(pair.loser), matcher(pair.winner))
+            guard !shared.isEmpty else { return nil }
+            return RuleOrderConflict(from: pair.loser, to: pair.winner, domains: shared)
+        }
     }
 
     func resetRuleCustomization(for scheme: RuleScheme) {
@@ -700,6 +1132,84 @@ final class AppModel: ObservableObject {
         persist()
     }
 
+    // MARK: - Tailnets
+
+    enum TailnetAuthKeyChange: Equatable {
+        case keep
+        case set(String)
+        case remove
+    }
+
+    func hasTailnetAuthKey(_ id: UUID) -> Bool { tailnetsWithAuthKey.contains(id) }
+
+    /// Read only when the editor opens, so the field can show the saved key
+    /// (masked until the user reveals it) and be edited in place.
+    func tailnetAuthKey(for id: UUID) -> String? { tailnetAuthKeys.authKey(for: id) }
+
+    /// Inserts or replaces a tailnet. The key is written first so a Keychain
+    /// failure leaves the saved connection untouched.
+    func saveTailnet(_ connection: TailnetConnection, authKey: TailnetAuthKeyChange) throws {
+        switch authKey {
+        case .keep: break
+        case .set(let key):
+            try tailnetAuthKeys.setAuthKey(key, for: connection.id)
+            tailnetsWithAuthKey.insert(connection.id)
+            tailnetAuthKeyRevision += 1
+        case .remove:
+            try tailnetAuthKeys.setAuthKey(nil, for: connection.id)
+            tailnetsWithAuthKey.remove(connection.id)
+            tailnetAuthKeyRevision += 1
+        }
+        if let index = tailnets.firstIndex(where: { $0.id == connection.id }) {
+            tailnets[index] = connection
+        } else {
+            tailnets.append(connection)
+        }
+        persist(invalidateRuleCounts: false)
+    }
+
+    func setTailnetEnabled(_ id: UUID, _ enabled: Bool) {
+        guard let index = tailnets.firstIndex(where: { $0.id == id }), tailnets[index].isEnabled != enabled else { return }
+        tailnets[index].isEnabled = enabled
+        persist(invalidateRuleCounts: false)
+    }
+
+    func deleteTailnet(_ id: UUID) {
+        try? tailnetAuthKeys.setAuthKey(nil, for: id)
+        tailnetsWithAuthKey.remove(id)
+        tailnetAuthKeyRevision += 1
+        tailnets.removeAll { $0.id == id }
+        persist(invalidateRuleCounts: false)
+    }
+
+    /// A tailnet deleted on another device takes its key on this one with it;
+    /// otherwise a secret nobody can see would stay in the Keychain.
+    private func reconcileTailnetAuthKeys() {
+        let ids = Set(tailnets.map(\.id))
+        for orphan in tailnetAuthKeys.storedIDs().subtracting(ids) {
+            try? tailnetAuthKeys.setAuthKey(nil, for: orphan)
+        }
+        tailnetsWithAuthKey = Set(ids.filter { tailnetAuthKeys.authKey(for: $0) != nil })
+        tailnetAuthKeyRevision += 1
+    }
+
+    /// Previews and screenshots should not show a key that can add machines
+    /// to someone's tailnet. Same length, so nothing else in the text moves.
+    func maskingTailnetAuthKeys(in content: String) -> String {
+        var masked = content
+        for id in tailnetsWithAuthKey {
+            guard let key = tailnetAuthKeys.authKey(for: id), !key.isEmpty else { continue }
+            masked = masked.replacingOccurrences(of: key, with: String(repeating: "•", count: key.count))
+        }
+        return masked
+    }
+
+    private func currentTailnetExports() -> [TailnetExport] {
+        tailnets.filter(\.isEnabled).map {
+            TailnetExport(connection: $0, authKey: tailnetAuthKeys.authKey(for: $0.id))
+        }
+    }
+
     func customRuleFlows(for scheme: RuleScheme) -> [CustomRuleFlow] {
         customRuleFlows.filter { $0.schemeID == scheme.id }
     }
@@ -718,6 +1228,11 @@ final class AppModel: ObservableObject {
     /// to a scheme before it can affect generated configurations.
     func saveLocalRuleSet(_ ruleSet: LocalRuleSet) async throws {
         try Task.checkCancellation()
+        if ruleSet.remoteRuleURL == nil {
+            let document = LocalRoutingRuleDocument(ruleSet.rulesText)
+            if let error = document.firstError { throw error }
+            guard !document.entries.isEmpty else { throw LocalRoutingRuleDocument.InvalidLine(number: 1) }
+        }
         let generation = ruleOperationGeneration
         let token = UUID()
         localRuleSaveTokens[ruleSet.id] = token
@@ -850,17 +1365,17 @@ final class AppModel: ObservableObject {
         }
         guard var customization = ruleSchemeCustomizations[schemeID] else { return }
         customization.groupOrder = customization.groupOrder.map { $0 == oldName ? newName : $0 }
+        customization.matchingOrder = customization.matchingOrder?.map { $0 == oldName ? newName : $0 }
         if let oldOverride = customization.groupOverrides.removeValue(forKey: oldName) {
             customization.groupOverrides[newName] = oldOverride
         }
         customization.groupOverrides = customization.groupOverrides.mapValues { override in
-            RuleSchemeGroupOverride(
-                kind: override.kind,
-                members: override.members?.map { member in
-                    guard case .reference(let name) = member, name == oldName else { return member }
-                    return .reference(newName)
-                }
-            )
+            var renamed = override
+            renamed.members = override.members?.map { member in
+                guard case .reference(let name) = member, name == oldName else { return member }
+                return .reference(newName)
+            }
+            return renamed
         }
         if var removed = customization.removedGroupNames, removed.remove(oldName) != nil {
             removed.insert(newName)
@@ -899,10 +1414,16 @@ final class AppModel: ObservableObject {
                 ?? customRuleFlows.endIndex
             customRuleFlows.insert(flow, at: insertion)
         }
-        if let groupName = flow.generatedPolicyGroup?.name {
+        // Catalog entries can reuse a group from the original scheme instead
+        // of generating one. Explicitly re-adding either kind restores that
+        // target only; unrelated deletion markers remain intact.
+        if let groupName = flow.generatedPolicyGroup?.name
+            ?? (flow.catalogID != nil ? flow.policyName : nil) {
             var customization = ruleSchemeCustomizations[flow.schemeID]
                 ?? RuleSchemeCustomization(schemeID: flow.schemeID)
+            let visibleName = customization.renamedGroupName(groupName)
             customization.removedGroupNames?.remove(groupName)
+            customization.removedGroupNames?.remove(visibleName)
             ruleSchemeCustomizations[flow.schemeID] = customization
         }
         persist()
@@ -938,6 +1459,11 @@ final class AppModel: ObservableObject {
 
         var removed = customization.removedGroupNames ?? []
         removed.insert(groupName)
+        if customization.addedNodeGroups?.contains(where: { $0.name == sourceName }) == true {
+            customization.addedNodeGroups?.removeAll { $0.name == sourceName }
+            removed.insert(sourceName)
+            customization.groupOverrides[sourceName] = nil
+        }
         customization.removedGroupNames = removed
         customization.groupRenames?[sourceName] = nil
         if customization.groupRenames?.isEmpty == true {
@@ -947,7 +1473,7 @@ final class AppModel: ObservableObject {
             customization.groupOrder = customizableRuleGroups(for: scheme).map(\.name)
         }
         customization.groupOrder.removeAll { $0 == groupName }
-        customization.rulePriorityOrder?.removeAll { $0 == groupName }
+        customization.matchingOrder?.removeAll { $0 == groupName }
         customization.groupOverrides[groupName] = nil
         ruleSchemeCustomizations[scheme.id] = customization
 
@@ -956,6 +1482,39 @@ final class AppModel: ObservableObject {
             selectedRuleGroups[scheme.id] = selected
         }
         persist()
+    }
+
+    @discardableResult
+    func createNodeFilterGroup(name: String, pattern: String, kind: RuleSchemeGroup.Kind, for scheme: RuleScheme) throws -> RuleSchemeGroup {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw RuleGroupRenameError.emptyName }
+        guard !RoutingBuiltinPolicies.names.contains(name.uppercased()),
+              !name.contains(where: { $0.isNewline || ",=`".contains($0) }) else {
+            throw RuleGroupRenameError.invalidNodeGroupName
+        }
+        let existingNames = customizableRuleGroups(for: scheme).map(\.name)
+            + scheme.routingTargetGroupNames()
+            + (ruleSchemeCustomizations[scheme.id]?.groupRenames?.keys.map { $0 } ?? [])
+        guard !existingNames.contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) else {
+            throw RuleGroupRenameError.duplicateName
+        }
+        guard [.select, .urlTest, .fallback].contains(kind) else { throw NodeNameFilterMatcher.Failure.invalid }
+        _ = try NodeNameFilterMatcher.preview(pattern, candidates: [], caseInsensitive: true)
+        let group = RuleSchemeGroup(name: name, kind: kind, members: [.nodePattern(pattern)],
+                                   testURLString: "http://www.gstatic.com/generate_204", interval: 300, tolerance: 50,
+                                   isCustomNodeFilter: true)
+        var customization = ruleSchemeCustomizations[scheme.id] ?? RuleSchemeCustomization(schemeID: scheme.id)
+        // Reusing a previously deleted name must not revive stale memberships.
+        if customization.removedGroupNames?.contains(name) == true {
+            for key in customization.groupOverrides.keys {
+                customization.groupOverrides[key]?.members?.removeAll { $0 == .reference(name) }
+            }
+            customization.removedGroupNames?.remove(name)
+        }
+        customization.addedNodeGroups = (customization.addedNodeGroups ?? []) + [group]
+        ruleSchemeCustomizations[scheme.id] = customization
+        persist()
+        return group
     }
 
     /// Installs a maintained catalog rule only after its payload is available
@@ -1012,46 +1571,212 @@ final class AppModel: ObservableObject {
         persist()
     }
 
+    // MARK: Group supplements (issue #45)
+
+    private func supplementFlowIndex(forSourceGroup sourceName: String, schemeID: String) -> Int? {
+        customRuleFlows.firstIndex {
+            $0.schemeID == schemeID && $0.isGroupSupplement == true && $0.policyName == sourceName
+        }
+    }
+
+    /// Domains and IP ranges the user attached to this group, in the order added.
+    func supplementRules(forGroup visibleName: String, in scheme: RuleScheme) -> [SupplementRule] {
+        let sourceName = sourceRuleGroupName(visibleName, for: scheme)
+        return supplementFlowIndex(forSourceGroup: sourceName, schemeID: scheme.id)
+            .map { customRuleFlows[$0].supplementRules } ?? []
+    }
+
+    /// Adds a condition to one group. The same condition attached to another
+    /// group of this scheme moves here, so the user never has two answers for
+    /// one site. Returns the group it was moved from, if any.
+    @discardableResult
+    func addSupplementRule(_ rule: SupplementRule, toGroup visibleName: String, in scheme: RuleScheme) -> String? {
+        let key = rule.line.lowercased()
+        var movedFrom: String?
+        for index in customRuleFlows.indices
+        where customRuleFlows[index].schemeID == scheme.id && customRuleFlows[index].isGroupSupplement == true {
+            let rules = customRuleFlows[index].supplementRules
+            guard rules.contains(where: { $0.line.lowercased() == key }) else { continue }
+            let owner = ruleSchemeCustomizations[scheme.id]?.renamedGroupName(customRuleFlows[index].policyName)
+                ?? customRuleFlows[index].policyName
+            if owner == visibleName { return nil }
+            movedFrom = owner
+            customRuleFlows[index].rulesText = rules.filter { $0.line.lowercased() != key }
+                .map(\.line).joined(separator: "\n")
+        }
+        customRuleFlows.removeAll {
+            $0.schemeID == scheme.id && $0.isGroupSupplement == true && $0.supplementRules.isEmpty
+        }
+
+        let sourceName = sourceRuleGroupName(visibleName, for: scheme)
+        if let index = supplementFlowIndex(forSourceGroup: sourceName, schemeID: scheme.id) {
+            let rules = customRuleFlows[index].supplementRules + [rule]
+            customRuleFlows[index].rulesText = rules.map(\.line).joined(separator: "\n")
+            customRuleFlows[index].isEnabled = true
+        } else {
+            customRuleFlows.append(
+                .groupSupplement(schemeID: scheme.id, groupName: sourceName, rules: [rule])
+            )
+        }
+        persist()
+        return movedFrom
+    }
+
+    func removeSupplementRule(_ rule: SupplementRule, fromGroup visibleName: String, in scheme: RuleScheme) {
+        let sourceName = sourceRuleGroupName(visibleName, for: scheme)
+        guard let index = supplementFlowIndex(forSourceGroup: sourceName, schemeID: scheme.id) else { return }
+        let remaining = customRuleFlows[index].supplementRules.filter { $0 != rule }
+        if remaining.isEmpty {
+            customRuleFlows.remove(at: index)
+        } else {
+            customRuleFlows[index].rulesText = remaining.map(\.line).joined(separator: "\n")
+        }
+        persist()
+    }
+
+    /// Every rule list and inline rule that sends traffic to this group, in
+    /// matching order, without the user's own supplements.
+    func ruleSources(forGroup visibleName: String, in scheme: RuleScheme) -> [RuleSchemeRuleset] {
+        customizableScheme(for: scheme).rulesets.filter {
+            $0.groupName == visibleName && $0.origin != .supplement
+        }
+    }
+
+    /// The order an exported configuration evaluates rules in.
+    func exportedRuleOrder(for scheme: RuleScheme) -> [RuleSchemeRuleset] {
+        materializedScheme(scheme).rulesets
+    }
+
+    /// Conditions behind one ruleset, as a client would read them.
+    func ruleLines(for ruleset: RuleSchemeRuleset) -> [String] {
+        guard !ruleset.isBinaryRuleSet else { return [] }
+        return RuleResourceContent.normalized(
+            schemeRepository.lines(for: ruleset.resource),
+            behavior: ruleset.provider?.behavior
+        )
+    }
+
+    /// Where a site would go with this scheme's exported rules.
+    func probeRule(host: String, in scheme: RuleScheme) -> (result: RuleMatchProbe.Result, rulesets: [RuleSchemeRuleset]) {
+        let rulesets = exportedRuleOrder(for: scheme)
+        let result = RuleMatchProbe.probe(
+            host: host,
+            rulesets: rulesets,
+            lines: { self.ruleLines(for: $0) },
+            country: { [ipCountryLookupService] in ipCountryLookupService.countryCode(forLiteralAddress: $0) }
+        )
+        return (result, rulesets)
+    }
+
     private func materializedScheme(_ scheme: RuleScheme) -> RuleScheme {
         _ = ruleSchemePresentationRevision
         if let cached = materializedSchemeCache[scheme.id] {
             return cached
         }
-        let customization = ruleSchemeCustomizations[scheme.id]
-        let fixed = Set(scheme.protectedRuleGroupNames)
-            .intersection(scheme.selectableRuleGroupNames)
-            .map { customization?.renamedGroupName($0) ?? $0 }
-        let enabledGroups = selectedRuleGroups[scheme.id].map { $0.union(fixed) }
-        let materialized = scheme.customized(
-            enabledRuleGroupNames: enabledGroups,
-            customRuleFlows: customRuleFlows,
-            groupCustomization: customization,
-            resolvedRuleLines: resolvedRuleLines(for: scheme)
-        )
+        let input = rulePresentation(for: scheme)
+        let materialized = input.materialize(preview: false, resolvedLines: input.resolveLines(using: schemeRepository))
         ruleSchemeMaterializationCount += 1
         materializedSchemeCache[scheme.id] = materialized
         return materialized
     }
 
     private func invalidateRuleSchemePresentationCaches() {
+        rulesPagePreparation?.task.cancel()
+        rulesPagePreparation = nil
         customizableSchemeCache.removeAll(keepingCapacity: true)
         materializedSchemeCache.removeAll(keepingCapacity: true)
+        schemeRuleCountCache.removeAll(keepingCapacity: true)
         // Cache hits must still participate in SwiftUI observation. Otherwise
         // a rule removed from the model can remain in the editor's visible draft.
         ruleSchemePresentationRevision &+= 1
     }
 
-    private func resolvedRuleLines(for scheme: RuleScheme) -> [URL: [String]] {
-        let customURLs = customRuleFlows.compactMap { flow -> URL? in
-            guard flow.schemeID == scheme.id, flow.isEnabled else { return nil }
-            return flow.remoteRuleURL
+    private func rulePresentation(for scheme: RuleScheme) -> RuleSchemePresentation {
+        RuleSchemePresentation(scheme: scheme, customization: ruleSchemeCustomizations[scheme.id],
+                               flows: customRuleFlows, selectedGroups: selectedRuleGroups[scheme.id])
+    }
+
+    #if DEBUG
+    /// Reproduce a sync finishing after statistics have already become visible.
+    /// The matching initializer branch injects a disposable local cloud store.
+    private func startRulesSyncUIFixtureIfRequested() {
+        let environment = ProcessInfo.processInfo.environment
+        guard UUID(uuidString: environment["TOWER_UI_TEST_RUN"] ?? "") != nil,
+              environment["TOWER_UI_TEST_RULES_SYNC"] == "1" else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            while self.selectedTab != .rules {
+                do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+            }
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            self.iCloudSyncEnabled = true
+            await self.synchronizeWithCloud()
+            print("Rules sync UI fixture completed: success=\(self.cloudSyncIssue == nil)")
         }
-        var seen = Set<URL>()
-        return Dictionary(uniqueKeysWithValues: (scheme.remoteRulesetURLs + customURLs).compactMap {
-            url in
-            guard seen.insert(url).inserted else { return nil }
-            return (url, schemeRepository.lines(for: .remote(url)))
-        })
+    }
+    #endif
+
+    /// Cards read display-only summaries, never trigger file parsing. Keep the
+    /// previous summaries visible until a still-current snapshot can replace them.
+    func prepareRulesPage() async {
+        guard !Task.isCancelled, !isRulesPagePrepared else { return }
+        let revision = ruleSchemePresentationRevision
+        let task: Task<PreparedRulesPage, Error>
+        if let preparation = rulesPagePreparation, preparation.revision == revision {
+            task = preparation.task
+        } else {
+            let inputs = ruleSchemes.map { rulePresentation(for: $0) }
+            let repository = schemeRepository
+            let legacyPreset = selectedScheme == nil ? selectedPreset : nil
+            let presetRepository = ruleRepository
+            task = Task.detached(priority: .userInitiated) {
+                #if DEBUG
+                // Expose the cold preparation interval only to isolated UI tests.
+                let environment = ProcessInfo.processInfo.environment
+                if UUID(uuidString: environment["TOWER_UI_TEST_RUN"] ?? "") != nil,
+                   environment["TOWER_UI_TEST_SLOW_RULES"] == "1" {
+                    try await Task.sleep(for: .seconds(8))
+                }
+                #endif
+                var previews: [String: RuleScheme] = [:]
+                var effective: [String: RuleScheme] = [:]
+                var counts: [String: Int] = [:]
+                var summaries: [String: RuleSchemePageSummary] = [:]
+                for input in inputs {
+                    try Task.checkCancellation()
+                    let lines = input.resolveLines(using: repository)
+                    let preview = input.materialize(preview: true, resolvedLines: lines)
+                    let scheme = input.selectedGroups == nil
+                        ? preview : input.materialize(preview: false, resolvedLines: lines)
+                    previews[input.scheme.id] = preview
+                    effective[input.scheme.id] = scheme
+                    let count = scheme.rulesets.reduce(0) {
+                        $0 + repository.lines(for: $1.resource).count
+                    }
+                    counts[input.scheme.id] = count
+                    summaries[input.scheme.id] = RuleSchemePageSummary(
+                        preview: preview, count: count,
+                        isReady: scheme.remoteRulesetURLs.allSatisfy { repository.hasLocalRules(for: $0) }
+                    )
+                }
+                let presetCounts = legacyPreset.map { [$0.id: presetRepository.count(for: $0)] } ?? [:]
+                return (previews, effective, counts, summaries, presetCounts)
+            }
+            rulesPagePreparation = (revision, task)
+        }
+        // One caller disappearing must not cancel preparation needed by another.
+        // Input invalidation cancels the shared worker instead.
+        let result = try? await task.value
+        guard let result, !Task.isCancelled, revision == ruleSchemePresentationRevision,
+              !isRulesPagePrepared else { return }
+        customizableSchemeCache = result.0
+        materializedSchemeCache = result.1
+        schemeRuleCountCache = result.2
+        rulesPageSummaries = result.3
+        rulesPagePresetCounts = result.4
+        ruleSchemeMaterializationCount += result.0.count * 2
+        preparedRulesPageRevision = revision
+        rulesPagePreparation = nil
     }
 
     func effectiveScheme(_ scheme: RuleScheme) -> RuleScheme {
@@ -1062,10 +1787,7 @@ final class AppModel: ObservableObject {
     /// True once every list a scheme references is available locally.
     func isSchemeReady(_ scheme: RuleScheme) -> Bool {
         let effectiveURLs = effectiveScheme(scheme).remoteRulesetURLs
-        let bundledURLs = scheme.isBundled ? Set(scheme.remoteRulesetURLs) : []
-        return effectiveURLs.allSatisfy { url in
-            bundledURLs.contains(url) || downloadStore.hasCachedRules(for: url)
-        }
+        return effectiveURLs.allSatisfy { schemeRepository.hasLocalRules(for: $0) }
     }
 
     func selectScheme(_ scheme: RuleScheme) {
@@ -1081,7 +1803,15 @@ final class AppModel: ObservableObject {
         isImportingScheme = false
     }
 
-    func importScheme(name: String, urlString: String) async throws {
+    func importScheme(name: String, urlString: String, originalRulesetURLs: Set<URL> = [], progress: RuleImportProgressHandler? = nil) async throws {
+        try await importScheme { try await self.schemeImportService.importScheme(from: urlString, name: name, originalRulesetURLs: originalRulesetURLs, progress: progress) }
+    }
+
+    func importScheme(name: String, text: String, fileName: String? = nil, originalRulesetURLs: Set<URL> = [], progress: RuleImportProgressHandler? = nil) async throws {
+        try await importScheme { try await self.schemeImportService.importScheme(text: text, name: name, fileName: fileName, originalRulesetURLs: originalRulesetURLs, progress: progress) }
+    }
+
+    private func importScheme(load: () async throws -> RuleImportResult) async throws {
         try Task.checkCancellation()
         guard !isImportingScheme else { throw CancellationError() }
         let generation = ruleOperationGeneration
@@ -1090,7 +1820,7 @@ final class AppModel: ObservableObject {
         isImportingScheme = true
         defer { if ruleImportToken == token { cancelRuleImport() } }
 
-        let result = try await schemeImportService.importScheme(from: urlString, name: name)
+        let result = try await load()
         try Task.checkCancellation()
         guard ruleOperationGeneration == generation, ruleImportToken == token else { throw CancellationError() }
         importedSchemes.append(result.scheme)
@@ -1187,11 +1917,7 @@ final class AppModel: ObservableObject {
     /// Nodes whose parent subscription is enabled, before the user's per-node
     /// export selection is applied. The filter screen and map use this list.
     var availableNodes: [ProxyNode] {
-        let enabledSourceIDs = Set(subscriptions.filter(\.isEnabled).map(\.id))
-        return nodes.filter { node in
-            let sourceIsEnabled = node.sourceID == nil || enabledSourceIDs.contains(node.sourceID!)
-            return sourceIsEnabled && isVisibleUnderInfoFilter(node)
-        }
+        nodeSelection.available
     }
 
     /// The single answer to "does this node count as a node right now".
@@ -1208,13 +1934,18 @@ final class AppModel: ObservableObject {
 
     /// The single source of truth used by every configuration generator.
     var enabledNodes: [ProxyNode] {
-        availableNodes.filter { !excludedNodeIDs.contains($0.id) }
+        nodeSelection.enabled
     }
 
-    var localNodes: [ProxyNode] { nodes.filter(\.isLocal) }
+    var localNodes: [ProxyNode] { nodeSelection.local }
     var enabledSubscriptionCount: Int { subscriptions.filter(\.isEnabled).count }
     var coveredCountryCount: Int {
-        Set(enabledNodes.compactMap(countryCode(for:))).count
+        let enabled = enabledNodes
+        let codes = nodeIPCountryCodes
+        if let cached = countryCountCache, cached.0 == enabled, cached.1 == codes { return cached.2 }
+        let count = Set(enabled.compactMap { NodeRegionResolver.countryCode(for: $0) ?? codes[$0.id] }).count
+        countryCountCache = (enabled, codes, count)
+        return count
     }
     var currentRuleCount: Int { ruleRepository.count(for: selectedPreset) }
 
@@ -1230,9 +1961,7 @@ final class AppModel: ObservableObject {
     /// for the whole array to count it — copying every matching node, with all
     /// its string fields, for every card, on every redraw of the screen.
     func nodeCount(for source: SubscriptionSource) -> Int {
-        nodes.count {
-            $0.sourceID == source.id && isVisibleUnderInfoFilter($0)
-        }
+        nodeSelection.counts[source.id] ?? 0
     }
 
     func nodeForPresentation(_ node: ProxyNode) -> ProxyNode {
@@ -1316,7 +2045,37 @@ final class AppModel: ObservableObject {
     }
 
     func isNodeIncluded(_ node: ProxyNode) -> Bool {
-        !excludedNodeIDs.contains(node.id)
+        !excludedNodeIDs.contains(node.id) && isNodeAllowedByName(node)
+    }
+
+    func isNodeAllowedByName(_ node: ProxyNode) -> Bool {
+        nodeExportNameFilter == nil || nodeSelection.nameMatchedIDs.contains(node.id)
+    }
+
+    var nodeExportNameFilterError: String? { nodeSelection.nameFilterError }
+
+    /// Ids of available nodes every export includes. For screens that test
+    /// hundreds of nodes per redraw: one set lookup instead of a selection
+    /// walk per node.
+    var includedNodeIDs: Set<UUID> { nodeSelection.enabledIDs }
+
+    /// Ids the export name condition allows, or `nil` when there is none.
+    var nodeNameAllowedIDs: Set<UUID>? {
+        nodeExportNameFilter == nil ? nil : nodeSelection.nameMatchedIDs
+    }
+
+    func setNodeExportNameFilter(_ filter: NodeExportNameFilter?) throws {
+        // Saving an emptied editor removes the condition, just like Clear.
+        let filter = filter.flatMap { $0.pattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+        if let filter {
+            _ = try NodeNameFilterMatcher.preview(
+                filter.pattern, candidates: availableNodes.map { [$0.name] },
+                caseInsensitive: filter.ignoresCase
+            )
+        }
+        guard nodeExportNameFilter != filter else { return }
+        nodeExportNameFilter = filter
+        persist()
     }
 
     func setNode(_ node: ProxyNode, included: Bool) {
@@ -1434,20 +2193,30 @@ final class AppModel: ObservableObject {
         // DNS-backed hosts can move. Re-resolve after one hour rather than
         // pinning a hostname to the first country this install ever saw.
         var unresolved: [ProxyNode] = []
+        // Batched: one observable change per collection, not one per node
+        // (~200 ms on device when a large subscription reappears).
+        var cachedCountryCodes = nodeIPCountryCodes
+        var cachedCompletedIDs = countryResolutionCompletedNodeIDs
+        var reusedCachedAnswers = false
         for node in candidates {
             let host = node.server.lowercased()
             if let code = resolvedHostCountryCodes[host],
                Self.isResolvedHostCountryCodeFresh(
                    updatedAt: resolvedHostCountryCodeUpdatedAt[host]
                ) {
-                nodeIPCountryCodes[node.id] = code
-                countryResolutionCompletedNodeIDs.insert(node.id)
+                cachedCountryCodes[node.id] = code
+                cachedCompletedIDs.insert(node.id)
                 countryResolutionDates[node.id] = resolvedHostCountryCodeUpdatedAt[host]
+                reusedCachedAnswers = true
             } else {
                 resolvedHostCountryCodes[host] = nil
                 resolvedHostCountryCodeUpdatedAt[host] = nil
                 unresolved.append(node)
             }
+        }
+        if reusedCachedAnswers {
+            nodeIPCountryCodes = cachedCountryCodes
+            countryResolutionCompletedNodeIDs = cachedCompletedIDs
         }
         guard !unresolved.isEmpty else { return }
 
@@ -1494,13 +2263,46 @@ final class AppModel: ObservableObject {
 
         // Written once at the end rather than per batch: this is a cache, and
         // losing it to a crash costs one round of lookups, not user data.
-        if learnedAnything { persist(invalidateRuleCounts: false) }
+        if learnedAnything { persistLocalCache() }
+    }
+
+    /// Fills in every country Tower already knows without a lookup: literal
+    /// IP addresses straight from the offline database, host names from a
+    /// fresh cached answer. Rows used to learn these only once they scrolled
+    /// into view, so the same list showed flags for some nodes and protocol
+    /// icons for others until each resolution landed.
+    func seedKnownCountries(for candidates: [ProxyNode]) {
+        var countryCodes = nodeIPCountryCodes
+        var completedIDs = countryResolutionCompletedNodeIDs
+        var seeded = false
+        for node in candidates where countryCodes[node.id] == nil {
+            let host = node.server.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if let code = ipCountryLookupService.countryCode(forLiteralAddress: host) {
+                countryCodes[node.id] = code
+                countryResolutionDates[node.id] = .now
+            } else if let code = resolvedHostCountryCodes[host],
+                      Self.isResolvedHostCountryCodeFresh(updatedAt: resolvedHostCountryCodeUpdatedAt[host]) {
+                countryCodes[node.id] = code
+                countryResolutionDates[node.id] = resolvedHostCountryCodeUpdatedAt[host]
+            } else {
+                continue
+            }
+            completedIDs.insert(node.id)
+            seeded = true
+        }
+        // One published change per collection, not one per node.
+        if seeded {
+            nodeIPCountryCodes = countryCodes
+            countryResolutionCompletedNodeIDs = completedIDs
+        }
     }
 
     private func hasFreshCountryResolution(for node: ProxyNode) -> Bool {
         guard countryResolutionCompletedNodeIDs.contains(node.id),
               let date = countryResolutionDates[node.id] else { return false }
-        let ttl: TimeInterval = nodeIPCountryCodes[node.id] == nil ? 30 : Self.resolvedHostCountryCodeTTL
+        let ttl: TimeInterval = nodeIPCountryCodes[node.id] == nil
+            ? Self.unresolvedCountryRetryInterval
+            : Self.resolvedHostCountryCodeTTL
         return Date.now.timeIntervalSince(date) < ttl
     }
 
@@ -1517,7 +2319,9 @@ final class AppModel: ObservableObject {
         let organizations = await ipCountryLookupService.organizations(forHost: node.server)
         guard !Task.isCancelled, generation == countryResolutionGeneration,
               nodes.contains(where: { $0.id == node.id && $0.server == node.server }) else { return }
-        nodeNetworkOrganizations[node.id] = organizations
+        if nodeNetworkOrganizations[node.id] != organizations {
+            nodeNetworkOrganizations[node.id] = organizations
+        }
         await resolveIPCountries(for: [node])
     }
 
@@ -1630,7 +2434,7 @@ final class AppModel: ObservableObject {
     private static func decodeExportContentModes(_ values: [String: String]?) -> [ClientTarget: ExportContentMode] {
         (values ?? [:]).reduce(into: [:]) { result, entry in
             guard let target = ClientTarget(rawValue: entry.key),
-                  target.supportsNodesOnlyImport,
+                  target.supportsNodesOnlyExport,
                   let mode = ExportContentMode(rawValue: entry.value),
                   mode == .nodesOnly else { return }
             result[target] = mode
@@ -1639,7 +2443,7 @@ final class AppModel: ObservableObject {
 
     private static func encodeExportContentModes(_ values: [ClientTarget: ExportContentMode]) -> [String: String]? {
         let encoded = values.reduce(into: [String: String]()) { result, entry in
-            guard entry.key.supportsNodesOnlyImport, entry.value == .nodesOnly else { return }
+            guard entry.key.supportsNodesOnlyExport, entry.value == .nodesOnly else { return }
             result[entry.key.rawValue] = entry.value.rawValue
         }
         return encoded.isEmpty ? nil : encoded
@@ -1746,6 +2550,7 @@ final class AppModel: ObservableObject {
         }
 
         subscriptions.append(contentsOf: stagedSources)
+        seedKnownCountries(for: stagedNodes)
         nodes.append(contentsOf: stagedNodes)
         persist()
         await synchronizeRenewalReminders(showFailure: false)
@@ -1871,6 +2676,9 @@ final class AppModel: ObservableObject {
     private func finishSourceUpdate(_ ticket: UUID, sourceID: UUID) {
         guard sourceUpdates.accepts(ticket, for: sourceID) else { return }
         refreshingSourceIDs.remove(sourceID)
+        if subscriptionRefreshProgress?.sourceIDs.contains(sourceID) == true {
+            subscriptionRefreshProgress?.completedIDs.insert(sourceID)
+        }
         sourceUpdates.finish(ticket, for: sourceID)
     }
 
@@ -1879,6 +2687,29 @@ final class AppModel: ObservableObject {
     /// Node ids are regenerated by every parse, so the export selection has to
     /// be carried across by identity and the diagnostics keyed by the old ids
     /// have to go — nothing can read them again.
+    /// Drops per-node runtime state for removed nodes with one mutation per
+    /// observable collection. Clearing them inside a per-node loop published
+    /// a change per node per collection: ~300 ms on device for one refresh.
+    private func forgetRuntimeState(of ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        var latencies = nodeLatencies
+        var organizations = nodeNetworkOrganizations
+        var countryCodes = nodeIPCountryCodes
+        for id in ids {
+            latencies[id] = nil
+            organizations[id] = nil
+            countryCodes[id] = nil
+            countryResolutionDates[id] = nil
+        }
+        // Removal only shrinks: an unchanged count means nothing to publish.
+        if latencies.count != nodeLatencies.count { nodeLatencies = latencies }
+        if organizations.count != nodeNetworkOrganizations.count { nodeNetworkOrganizations = organizations }
+        if countryCodes.count != nodeIPCountryCodes.count { nodeIPCountryCodes = countryCodes }
+        if !countryResolutionCompletedNodeIDs.isDisjoint(with: ids) {
+            countryResolutionCompletedNodeIDs.subtract(ids)
+        }
+    }
+
     private func replaceNodes(ofSource sourceID: UUID, with refreshed: [ProxyNode]) {
         let replacedNodes = nodes.filter { $0.sourceID == sourceID }
         let replacedNodeIDs = Set(replacedNodes.map(\.id))
@@ -1890,26 +2721,73 @@ final class AppModel: ObservableObject {
 
         nodes.removeAll { $0.sourceID == sourceID }
         excludedNodeIDs.subtract(replacedNodeIDs)
-        for id in replacedNodeIDs {
-            nodeLatencies[id] = nil
-            nodeNetworkOrganizations[id] = nil
-            countryResolutionDates[id] = nil
-            nodeIPCountryCodes[id] = nil
-            countryResolutionCompletedNodeIDs.remove(id)
-        }
+        forgetRuntimeState(of: replacedNodeIDs)
         let replacements = Self.carryingOverCountryOverrides(previous: replacedNodes, refreshed: refreshed)
-        // Refresh creates new IDs. Seed their fresh host results before publishing
+        // Refresh creates new IDs. Seed their known answers before publishing
         // the nodes so rows never briefly fall back to protocol icons.
-        for node in replacements {
-            let host = node.server.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard let code = resolvedHostCountryCodes[host],
-                  Self.isResolvedHostCountryCodeFresh(updatedAt: resolvedHostCountryCodeUpdatedAt[host]) else { continue }
-            nodeIPCountryCodes[node.id] = code
-            countryResolutionDates[node.id] = resolvedHostCountryCodeUpdatedAt[host]
-            countryResolutionCompletedNodeIDs.insert(node.id)
-        }
+        seedKnownCountries(for: replacements)
         nodes.append(contentsOf: replacements)
         excludedNodeIDs.formUnion(carriedExclusions)
+    }
+
+    /// Foreground refresh owns its lifetime independently of the pull gesture.
+    /// Background auto-refresh uses the existing non-modal entry points.
+    func startSubscriptionRefresh(sourceIDs: [UUID], singleSource: Bool = false) {
+        let requestedIDs = Set(sourceIDs)
+        let sources = subscriptions.filter { requestedIDs.contains($0.id) }
+        guard !sources.isEmpty else { return }
+        if let current = subscriptionRefreshProgress {
+            // Refreshing no longer blocks the app, so another request can
+            // arrive while one runs. A running batch never restarts; sources it
+            // does not cover refresh on their own, like a card's button.
+            guard !singleSource, current.isSingleSource else {
+                for source in sources where !current.sourceIDs.contains(source.id) {
+                    Task { [weak self] in _ = await self?.updateSubscription(id: source.id) }
+                }
+                return
+            }
+            // A pull while only one card refreshes: the batch takes over the
+            // presentation and joins that card's in-flight request.
+        }
+        let progress = SubscriptionRefreshProgress(
+            sourceIDs: Set(sources.map(\.id)).union(subscriptionRefreshProgress?.sourceIDs ?? []),
+            isSingleSource: singleSource
+        )
+        subscriptionRefreshProgress = progress
+        presentedSubscriptionRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            if singleSource, let source = sources.first {
+                await updateSubscription(id: source.id)
+            } else {
+                await refreshSubscriptions(sources)
+            }
+            guard subscriptionRefreshProgress?.id == progress.id else { return }
+            subscriptionRefreshProgress = nil
+            presentedSubscriptionRefreshTask = nil
+        }
+    }
+
+    func cancelSubscriptionRefresh() {
+        guard let progress = subscriptionRefreshProgress else { return }
+        presentedSubscriptionRefreshTask?.cancel()
+        presentedSubscriptionRefreshTask = nil
+        var cancelledIDs = progress.sourceIDs
+        if let batch = subscriptionRefreshBatch, !batch.sourceIDs.isDisjoint(with: cancelledIDs) {
+            batch.task.cancel()
+            cancelledIDs.formUnion(batch.sourceIDs)
+            subscriptionRefreshBatch = nil
+        }
+        for id in cancelledIDs {
+            sourceUpdates.invalidate(id)
+            sourceRefreshOperations.removeValue(forKey: id)?.task.cancel()
+            refreshingSourceIDs.remove(id)
+        }
+        subscriptionRefreshProgress = nil
+        // A batch delays persistence until the end. Keep successes already applied,
+        // while invalidated tickets reject any response that arrives after cancel.
+        sortNodesToMatchSubscriptionOrder()
+        persist()
+        Task { [weak self] in await self?.synchronizeRenewalReminders(showFailure: false) }
     }
 
     /// Match pressing each subscription's manual update button while keeping
@@ -1961,6 +2839,7 @@ final class AppModel: ObservableObject {
     private func coordinateSubscriptionRefresh(sourceIDs: [UUID]) async {
         var pendingIDs = sourceIDs
         while !pendingIDs.isEmpty {
+            guard !Task.isCancelled else { return }
             if let active = subscriptionRefreshBatch {
                 let coveredIDs = Set(pendingIDs).intersection(active.sourceIDs)
                 await active.task.value
@@ -2072,6 +2951,7 @@ final class AppModel: ObservableObject {
 
     func addLocalNode(name: String, uri: String) throws {
         let result = try LocalNodeImporter().parse(uri, preferredName: name)
+        seedKnownCountries(for: result.nodes)
         nodes.append(contentsOf: result.nodes)
         persist()
         showToast(String(localized: "节点已保存在本机"), symbol: "checkmark.circle.fill")
@@ -2080,6 +2960,7 @@ final class AppModel: ObservableObject {
     @discardableResult
     func addLocalNodes(name: String, content: String) throws -> Int {
         let result = try LocalNodeImporter().parse(content, preferredName: name)
+        seedKnownCountries(for: result.nodes)
         nodes.append(contentsOf: result.nodes)
         persist()
         showToast(importSummary(String(localized: "已添加"), result: result), symbol: "checkmark.circle.fill")
@@ -2087,7 +2968,9 @@ final class AppModel: ObservableObject {
     }
 
     func addManualNode(_ draft: ManualNodeDraft) throws {
-        nodes.append(try draft.makeNode())
+        let node = try draft.makeNode()
+        seedKnownCountries(for: [node])
+        nodes.append(node)
         persist()
         showToast(String(localized: "节点已保存在本机"), symbol: "checkmark.circle.fill")
     }
@@ -2163,6 +3046,7 @@ final class AppModel: ObservableObject {
         nodeLatencies[node.id] = nil
         nodeIPCountryCodes[node.id] = nil
         countryResolutionCompletedNodeIDs.remove(node.id)
+        seedKnownCountries(for: [updated])
         persist()
         showToast(String(localized: "节点已保存在本机"), symbol: "checkmark.circle.fill")
     }
@@ -2186,13 +3070,7 @@ final class AppModel: ObservableObject {
         let removedNodeIDs = Set(nodes.filter { $0.sourceID == source.id }.map(\.id))
         nodes.removeAll { $0.sourceID == source.id }
         excludedNodeIDs.subtract(removedNodeIDs)
-        for id in removedNodeIDs {
-            nodeLatencies[id] = nil
-            nodeNetworkOrganizations[id] = nil
-            countryResolutionDates[id] = nil
-            nodeIPCountryCodes[id] = nil
-            countryResolutionCompletedNodeIDs.remove(id)
-        }
+        forgetRuntimeState(of: removedNodeIDs)
         persist()
         Task { [weak self] in
             await self?.synchronizeRenewalReminders(showFailure: false)
@@ -2221,13 +3099,7 @@ final class AppModel: ObservableObject {
         subscriptions.removeAll { selectedSourceIDs.contains($0.id) }
         nodes.removeAll { node in node.sourceID.map(selectedSourceIDs.contains) == true }
         excludedNodeIDs.subtract(removedNodeIDs)
-        for id in removedNodeIDs {
-            nodeLatencies[id] = nil
-            nodeNetworkOrganizations[id] = nil
-            countryResolutionDates[id] = nil
-            nodeIPCountryCodes[id] = nil
-            countryResolutionCompletedNodeIDs.remove(id)
-        }
+        forgetRuntimeState(of: removedNodeIDs)
         persist()
         Task { [weak self] in
             await self?.synchronizeRenewalReminders(showFailure: false)
@@ -2252,13 +3124,7 @@ final class AppModel: ObservableObject {
 
         nodes.removeAll { selectedNodeIDs.contains($0.id) }
         excludedNodeIDs.subtract(selectedNodeIDs)
-        for id in selectedNodeIDs {
-            nodeLatencies[id] = nil
-            nodeNetworkOrganizations[id] = nil
-            countryResolutionDates[id] = nil
-            nodeIPCountryCodes[id] = nil
-            countryResolutionCompletedNodeIDs.remove(id)
-        }
+        forgetRuntimeState(of: selectedNodeIDs)
         persist()
     }
 
@@ -2290,10 +3156,12 @@ final class AppModel: ObservableObject {
         persist()
     }
 
+    /// Browsing clients is not an edit: the choice is not saved or synced on
+    /// its own, only when it first reveals a hidden client.
     func selectTarget(_ target: ClientTarget) {
-        visibleClientTargets.insert(target)
+        let revealed = visibleClientTargets.insert(target).inserted
         selectedTarget = target
-        persist()
+        if revealed { persist() }
     }
 
     func setClient(_ target: ClientTarget, isVisible: Bool) {
@@ -2488,10 +3356,34 @@ final class AppModel: ObservableObject {
         return result.named(request.name)
     }
 
-    func configuration(for request: ConfigurationRequest) async -> GeneratedConfiguration {
+    /// Read an already generated result without starting work during view updates.
+    /// Requests for the clients on either side of the selected one in the
+    /// picker that are not cached yet. Preparing them while the export page is
+    /// idle turns the next swipe into a cache hit: the status header updates
+    /// in the same frame instead of showing a busy state.
+    func adjacentUncachedExportRequests() -> [ConfigurationRequest] {
+        let clients = exportDestinationOrder.compactMap { destination -> ClientTarget? in
+            if case .client(let target) = destination { return target }
+            return nil
+        }
+        guard let index = clients.firstIndex(of: selectedTarget) else { return [] }
+        return [index + 1, index - 1]
+            .filter(clients.indices.contains)
+            .map { configurationRequest(target: clients[$0]) }
+            .filter { cachedConfiguration(for: $0) == nil }
+    }
+
+    func cachedConfiguration(for request: ConfigurationRequest) -> GeneratedConfiguration? {
+        generationCache[request.key]?.named(request.name)
+    }
+
+    func configuration(
+        for request: ConfigurationRequest,
+        priority: TaskPriority = .userInitiated
+    ) async -> GeneratedConfiguration {
         if let cached = generationCache[request.key] { return cached.named(request.name) }
         configurationGenerationCount += 1
-        let worker = Task.detached(priority: .userInitiated) { request.generate() }
+        let worker = Task.detached(priority: priority) { request.generate() }
         let result = await withTaskCancellationHandler {
             await worker.value
         } onCancel: {
@@ -2506,13 +3398,40 @@ final class AppModel: ObservableObject {
         contentMode: ExportContentMode? = nil,
         supportedKindsOverride: Set<ProxyKind>? = nil
     ) -> ConfigurationRequest {
+        let inputs = RequestInputs(nodes: nodes, sources: subscriptions, excludedNodes: excludedNodeIDs,
+            nameFilter: nodeExportNameFilter,
+            countryCodes: nodeIPCountryCodes, schemes: importedSchemes, groups: selectedRuleGroups,
+            customizations: ruleSchemeCustomizations, emojis: ruleGroupEmojisEnabled, flows: customRuleFlows,
+            tailnets: tailnets, tailnetKeyRevision: tailnetAuthKeyRevision,
+            excludedKinds: excludedKinds, presetID: selectedPresetID, name: configurationName,
+            appendName: appendSubscriptionNameToNodes, filterInfo: filterSubscriptionInfoNodes,
+            ruleSets: preferRuleSets, remoteLinks: embedRemoteSubscriptionLinks, rulesRevision: ruleSchemePresentationRevision)
+        if requestInputs != inputs {
+            requestInputs = inputs
+            requestCache.removeAll(keepingCapacity: true)
+        }
+        let variant = RequestVariant(target: target ?? selectedTarget,
+            mode: contentMode ?? exportContentMode(for: target ?? selectedTarget), supportedKinds: supportedKindsOverride)
+        if let cached = requestCache[variant] { return cached }
+        configurationRequestPreparationCount += 1
+        let request = prepareConfigurationRequest(target: variant.target, contentMode: variant.mode,
+                                                   supportedKindsOverride: supportedKindsOverride)
+        // Only the latest supported-kinds variant per client/mode is retained.
+        requestCache = requestCache.filter { $0.key.target != variant.target || $0.key.mode != variant.mode }
+        requestCache[variant] = request
+        return request
+    }
+
+    private func prepareConfigurationRequest(
+        target: ClientTarget, contentMode: ExportContentMode, supportedKindsOverride: Set<ProxyKind>?
+    ) -> ConfigurationRequest {
         let ruleRepository = self.ruleRepository
         let schemeRepository = self.schemeRepository
         let configurationName = self.configurationName
         let preferRuleSets = self.preferRuleSets
         let selectedPreset = self.selectedPreset
-        let resolvedTarget = target ?? selectedTarget
-        let resolvedMode = contentMode ?? exportContentMode(for: resolvedTarget)
+        let resolvedTarget = target
+        let resolvedMode = contentMode
         let currentNodes = enabledNodes.map(nodeForPresentation)
         let excluded = excludedKinds[resolvedTarget] ?? []
         let supportedKindsHash = supportedKindsOverride?
@@ -2553,6 +3472,7 @@ final class AppModel: ObservableObject {
             .joined(separator: "|")
             .hashValue
         let scheme = selectedScheme.map(effectiveScheme)
+        let tailnetExports = currentTailnetExports()
         let remoteSubscriptions = embeddedRemoteSubscriptions(for: resolvedTarget, contentMode: resolvedMode)
         let sourceURLHashes = Dictionary(subscriptions.filter(\.isEnabled).map {
             ($0.id, RuleSchemeParser.sourceURLHash($0.urlString))
@@ -2566,7 +3486,8 @@ final class AppModel: ObservableObject {
             presetID: scheme?.id ?? selectedPreset.id,
             nodesHash: currentNodes.hashValue,
             countryCodesHash: countryCodesHash,
-            rulesHash: scheme?.hashValue ?? selectedPreset.hashValue,
+            // Tailnets change the profile without touching nodes or rules.
+            rulesHash: (scheme?.hashValue ?? selectedPreset.hashValue) &+ 31 &* tailnetExports.hashValue,
             // Without this, toggling a protocol would keep serving the cached
             // configuration for that client.
             excludedHash: excludedHash,
@@ -2600,7 +3521,7 @@ final class AppModel: ObservableObject {
                     supportedKindsOverride: supportedKindsOverride
                 )
             }
-            return generated
+            return TailnetConfigurationWriter().apply(tailnetExports, to: generated)
         }
     }
 
@@ -2610,10 +3531,9 @@ final class AppModel: ObservableObject {
         !enabledNodes.isEmpty || !embeddedRemoteSubscriptions(for: .clash, contentMode: .fullConfiguration).isEmpty
     }
 
-    /// Starts a foreground LAN endpoint. iOS may suspend all networking after
-    /// Tower leaves the foreground, so the export destination card communicates
-    /// that Tower must remain open while a desktop client refreshes.
-    func startLANSharing() async {
+    /// Starts an opt-in LAN endpoint. iOS background execution is best effort;
+    /// the system expiration handler closes it when the granted time runs out.
+    func startLANSharing(listenerEnvironment: LANSubscriptionListenerEnvironment = .wifi) async {
         guard !isLANSharingStarting, !isLANSharingActive else { return }
         guard hasExportableSources else {
             showToast(String(localized: "请先添加一个可用节点"), symbol: "exclamationmark.triangle.fill")
@@ -2623,13 +3543,21 @@ final class AppModel: ObservableObject {
         let generation = UUID()
         lanSharingGeneration = generation
         isLANSharingStarting = true
+        if lanSharingOutsideForeground { retainLANSharingInBackground() }
+        guard lanSharingGeneration == generation else { return }
         defer { if lanSharingGeneration == generation { isLANSharingStarting = false } }
 
         let server = LANSubscriptionServer(
             token: lanSharingToken,
+            listenerEnvironment: listenerEnvironment,
             exactClientConfiguration: { [weak self] target in
                 self?.configuration(target: target, contentMode: .fullConfiguration)
                     ?? GeneratedConfiguration(target: target, content: "", supportedNodeCount: 0, skippedNodeCount: 0, ruleCount: 0)
+            },
+            nodeConfiguration: { [weak self] target in
+                self?.configuration(target: target, contentMode: .nodesOnly)
+                    ?? GeneratedConfiguration(target: target, content: "", supportedNodeCount: 0,
+                        skippedNodeCount: 0, ruleCount: 0, contentMode: .nodesOnly)
             }
         ) { [weak self] format in
             guard let self else {
@@ -2656,6 +3584,7 @@ final class AppModel: ObservableObject {
                 server.stop()
                 lanSubscriptionServer = nil
                 lanSharingURL = nil
+                lanBackgroundLease.finish()
                 return
             }
             lanSharingURL = startedURL
@@ -2665,11 +3594,29 @@ final class AppModel: ObservableObject {
             guard lanSharingGeneration == generation else { return }
             lanSubscriptionServer = nil
             lanSharingURL = nil
+            lanBackgroundLease.finish()
             showToast(error.localizedDescription, symbol: "exclamationmark.triangle.fill")
         }
     }
 
+    func lanSharingWillLeaveForeground() {
+        guard clientPlatform != .mac else { return }
+        lanSharingOutsideForeground = true
+        retainLANSharingInBackground()
+    }
+
+    func lanSharingDidBecomeActive() {
+        lanSharingOutsideForeground = false
+        lanBackgroundLease.finish()
+    }
+
+    private func retainLANSharingInBackground() {
+        guard isLANSharingActive || isLANSharingStarting else { return }
+        lanBackgroundLease.retainUntilExpiration { [weak self] in self?.stopLANSharing() }
+    }
+
     func stopLANSharing() {
+        lanBackgroundLease.finish()
         lanSharingGeneration = UUID()
         isLANSharingStarting = false
         lanSubscriptionServer?.stop()
@@ -2684,7 +3631,14 @@ final class AppModel: ObservableObject {
         showToast(String(localized: "访问密钥已更换，旧链接已失效"), symbol: "key.fill")
     }
 
-    func lanSubscriptionURL(target: ClientTarget?) -> URL? {
+    func lanSubscriptionURL(target: ClientTarget?, contentMode: ExportContentMode = .fullConfiguration) -> URL? {
+        if contentMode == .nodesOnly {
+            guard let target, target.copiesAggregatedSubscription(mode: contentMode),
+                  let activeURL = lanSharingURL, let host = activeURL.host,
+                  let port = activeURL.port else { return nil }
+            return try? LANSubscriptionURLBuilder.make(host: host, port: UInt16(port),
+                token: lanSharingToken, target: target.rawValue, contentMode: contentMode)
+        }
         guard let url = lanSubscriptionURL(format: target.flatMap { LANSubscriptionFormat(target: $0) }) else { return nil }
         guard let target, [.surgeMac, .clashMac].contains(target),
               var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
@@ -2799,12 +3753,23 @@ final class AppModel: ObservableObject {
             return
         }
 
+        do { try persistence.clearRecoveryData() }
+        catch {
+            showToast(error.localizedDescription, symbol: "exclamationmark.icloud.fill")
+            return
+        }
+        cloudRecoveryCopies = []
+        cloudSyncIssue = nil
+
         let cachedRuleURLs = Set(
             importedSchemes.flatMap(\.remoteRulesetURLs)
                 + localRuleSets.compactMap(\.remoteRuleURL)
                 + customRuleFlows.compactMap(\.remoteRuleURL)
         )
 
+        presentedSubscriptionRefreshTask?.cancel()
+        presentedSubscriptionRefreshTask = nil
+        subscriptionRefreshProgress = nil
         subscriptionRefreshBatch?.task.cancel()
         subscriptionRefreshBatch = nil
         for operation in sourceRefreshOperations.values {
@@ -2817,6 +3782,7 @@ final class AppModel: ObservableObject {
         cloudUploadTask = nil
         discardPendingLocalWrite()
 
+        lanBackgroundLease.finish()
         lanSharingGeneration = UUID()
         lanSubscriptionServer?.stop()
         lanSubscriptionServer = nil
@@ -2827,6 +3793,8 @@ final class AppModel: ObservableObject {
         iCloudSyncEnabled = false
         CloudSyncPreference.setEnabled(false)
         lastCloudSyncAt = nil
+        lastSyncedCloudSignature = nil
+        UserDefaults.standard.removeObject(forKey: clientSelectionKey)
 
         apply(
             AppSnapshot(
@@ -2895,6 +3863,9 @@ final class AppModel: ObservableObject {
             CloudSyncPreference.setEnabled(false)
             cloudUploadTask?.cancel()
             cloudUploadTask = nil
+            // Re-enabling must check iCloud again, not trust an old agreement.
+            lastSyncedCloudSignature = nil
+            lastCloudSyncAt = nil
             showToast(String(localized: "已关闭 iCloud 同步"), symbol: "icloud.slash")
         }
     }
@@ -2912,18 +3883,52 @@ final class AppModel: ObservableObject {
         defer { isRemovingCloudSnapshot = false }
         do {
             try await cloudSync.removeRemoteSnapshot()
+            try persistence.clearCloudBaseline()
+            cloudRecoveryCopies = []
+            cloudSyncIssue = nil
             lastCloudSyncAt = nil
+            lastSyncedCloudSignature = nil
             showToast(String(localized: "已删除 iCloud 上的副本"), symbol: "icloud.slash")
         } catch {
             showToast(error.localizedDescription, symbol: "exclamationmark.icloud.fill")
         }
     }
 
-    /// Pulls whichever copy is newer, then makes sure iCloud holds it.
+    /// Merge both devices against the last shared baseline, preserving conflicts.
+    /// Launch and scene activation can arrive sequentially. Claim the foreground
+    /// session before awaiting; reset only on background, not transient inactivity.
+    func performForegroundOpenWork() async {
+        guard !performedForegroundOpenWork else { return }
+        performedForegroundOpenWork = true
+        if !compactedLocalBackups, !isDemoMode {
+            compactedLocalBackups = true
+            // Older builds kept ten uncompressed, often near-identical copies;
+            // reading them trims to the current limit and drops duplicates.
+            let persistence = persistence
+            Task.detached(priority: .utility) { _ = try? persistence.recoveryCopies() }
+        }
+        // Checking on every return to the app downloaded and merged the whole
+        // history even for a glance at another app. Local edits upload on
+        // their own; this only picks up other devices' changes.
+        if let lastCloudSyncAt, Date.now.timeIntervalSince(lastCloudSyncAt) < cloudForegroundCheckInterval {
+            Self.cloudLog.info("sync: foreground check skipped, checked recently")
+        } else {
+            if iCloudSyncEnabled { Self.cloudLog.notice("sync: start reason=foreground") }
+            await synchronizeWithCloud()
+        }
+        guard !Task.isCancelled else { return }
+        await refreshOnOpenIfEnabled()
+    }
+
+    func didEnterBackground() {
+        performedForegroundOpenWork = false
+    }
+
     func synchronizeWithCloud(showResult: Bool = false) async {
         guard iCloudSyncEnabled, !isDemoMode, !isCloudSyncing else { return }
         let generation = cloudSyncGeneration
         var synchronizedEditAt = lastLocalEditAt
+        var needsAnotherSync = false
         isCloudSyncing = true
         defer {
             isCloudSyncing = false
@@ -2931,7 +3936,7 @@ final class AppModel: ObservableObject {
                 // A new enable action arrived while the old download owned
                 // the sync slot. Retry under the new authorization generation.
                 Task { [weak self] in await self?.synchronizeWithCloud() }
-            } else if iCloudSyncEnabled, lastLocalEditAt != synchronizedEditAt {
+            } else if iCloudSyncEnabled, needsAnotherSync || lastLocalEditAt != synchronizedEditAt {
                 scheduleCloudUpload(currentSnapshot(updatedAt: lastLocalEditAt ?? .distantPast))
             }
         }
@@ -2949,28 +3954,84 @@ final class AppModel: ObservableObject {
             // Downloading suspends the actor. Compare against the current
             // edits, not the snapshot from before the network request.
             let local = currentSnapshot(updatedAt: lastLocalEditAt ?? .distantPast)
-            switch CloudSyncResolution.resolve(local: local.updatedAt, remote: remote?.updatedAt) {
-            case .takeRemote:
-                if let remote {
-                    discardPendingLocalWrite()
-                    apply(remote)
-                    lastLocalEditAt = remote.updatedAt
-                    synchronizedEditAt = remote.updatedAt
-                    try persistence.save(remote)
-                    if showResult {
-                        showToast(String(localized: "已从 iCloud 取回配置"), symbol: "icloud.and.arrow.down")
-                    }
-                }
-            case .keepLocal:
-                try await cloudSync.upload(local)
-                guard !Task.isCancelled, iCloudSyncEnabled, cloudSyncGeneration == generation else { return }
-                synchronizedEditAt = local.updatedAt
-                if showResult {
-                    showToast(String(localized: "已同步到 iCloud"), symbol: "icloud.and.arrow.up")
-                }
+            let persistence = self.persistence
+            // Reading the baseline, the three-way merge, the equality checks
+            // and backups all round-trip whole snapshots through JSON. On the
+            // main actor that was a 160–230 ms stall about two seconds after
+            // most edits (device trace, 2026-09-27). None of it touches UI.
+            let (merged, publishes) = try await Task.detached(priority: .userInitiated) {
+                let baseline = try persistence.cloudBaseline()
+                let merged = try remote.map { try CloudSnapshotMerge.merge(local: local, remote: $0, base: baseline) } ?? local
+                // A backup failure stops the transaction before either copy is
+                // replaced. Only a change the user would recognise is backed up.
+                if !CloudSnapshotMerge.sameContent(local, merged) { try persistence.backup(local) }
+                // Refresh status and caches alone are not worth a new iCloud
+                // version: they filled the ten-version history in minutes.
+                let publishes = remote.map { !CloudSnapshotMerge.sameContent(merged, $0) } ?? true
+                return (merged, publishes)
+            }.value
+            guard !Task.isCancelled, iCloudSyncEnabled, cloudSyncGeneration == generation else { return }
+            // The baseline must be exactly what iCloud holds. Recording the
+            // unpublished merge instead would make the next three-way merge
+            // read iCloud's older fetched nodes as a remote edit and revert them.
+            let cloudContent: AppSnapshot
+            if publishes || remote == nil {
+                try await cloudSync.commit(merged, replacing: remote)
+                cloudContent = merged
+            } else {
+                cloudContent = remote!
+                // Nothing new to publish; still trim versions beyond the limit
+                // (older builds kept ten, many differing only in status).
+                try? await cloudSync.compact()
             }
+            guard !Task.isCancelled, iCloudSyncEnabled, cloudSyncGeneration == generation else { return }
+            let latestEditAt = lastLocalEditAt
+            let latest = currentSnapshot(updatedAt: latestEditAt ?? .distantPast)
+            var adoption = try await Task.detached(priority: .userInitiated) {
+                try CloudSnapshotMerge.adoption(latest: latest, local: local, merged: merged,
+                                                cloudContent: cloudContent, persistence: persistence)
+            }.value
+            guard !Task.isCancelled, iCloudSyncEnabled, cloudSyncGeneration == generation else { return }
+            if lastLocalEditAt != latestEditAt {
+                // Edited while that ran: redo this last step against the newest
+                // state on the main actor, so nothing changed in the window is
+                // overwritten by an adoption computed without it.
+                let newest = currentSnapshot(updatedAt: lastLocalEditAt ?? .distantPast)
+                adoption = try CloudSnapshotMerge.adoption(latest: newest, local: local, merged: merged,
+                                                           cloudContent: cloudContent, persistence: persistence)
+            }
+            discardPendingLocalWrite()
+            try persistence.write(adoption.adoptedData)
+            try persistence.writeCloudBaseline(adoption.baselineData)
+            let adopted = adoption.adopted
+            apply(adopted)
+            // Compare later edits with what this device itself produces after
+            // applying, not with the merge result: applying can normalise
+            // (orders, platform preferences, defaults), and a mismatch made
+            // every later save look like an edit and sync again.
+            let settled = currentSnapshot(updatedAt: lastLocalEditAt ?? .now)
+            let settledSignature = await Task.detached(priority: .utility) {
+                CloudSnapshotMerge.signature(settled)
+            }.value
+            if settledSignature != adoption.signature {
+                Self.cloudLog.notice("sync: applied state normalised; tracking the applied signature")
+            }
+            lastSyncedCloudSignature = settledSignature
+            lastCloudSyncFailureAt = nil
+            synchronizedEditAt = merged.updatedAt
+            needsAnotherSync = adoption.needsAnotherSync
+            cloudSyncIssue = nil
+            Self.cloudLog.notice("sync: done published=\(publishes, privacy: .public) moreToSync=\(adoption.needsAnotherSync, privacy: .public)")
+            if showResult { showToast(String(localized: "已同步到 iCloud"), symbol: "icloud") }
             lastCloudSyncAt = .now
         } catch {
+            if !Self.isCancellationError(error) {
+                lastCloudSyncFailureAt = .now
+                Self.cloudLog.error("sync: failed \(String(describing: error), privacy: .public)")
+            }
+            if !Self.isCancellationError(error), iCloudSyncEnabled, cloudSyncGeneration == generation {
+                cloudSyncIssue = error.localizedDescription
+            }
             if showResult, !Self.isCancellationError(error), iCloudSyncEnabled, cloudSyncGeneration == generation {
                 showToast(error.localizedDescription, symbol: "exclamationmark.icloud.fill")
             }
@@ -2983,26 +4044,106 @@ final class AppModel: ObservableObject {
         pendingPersistenceUpdatedAt = nil
     }
 
+    /// Whether this device holds a user decision iCloud has not seen yet.
+    func hasUnsyncedCloudChanges() async -> Bool {
+        let snapshot = currentSnapshot(updatedAt: lastLocalEditAt ?? .now)
+        let signature = await Task.detached(priority: .utility) { CloudSnapshotMerge.signature(snapshot) }.value
+        return signature == nil || signature != lastSyncedCloudSignature
+    }
+
     /// Uploads after edits settle, so a burst of changes costs one write.
     private func scheduleCloudUpload(_ snapshot: AppSnapshot) {
         lastLocalEditAt = snapshot.updatedAt
         guard iCloudSyncEnabled, !isCloudSyncing else { return }
         cloudUploadTask?.cancel()
         cloudUploadTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(2))
+            try? await Task.sleep(for: Self.cloudUploadDelay)
             guard !Task.isCancelled, let self, self.iCloudSyncEnabled else { return }
             // A foreground sync owns the download/compare/upload transaction.
             // It will pick up edits made during its download itself.
             guard !self.isCloudSyncing else { return }
-            do {
-                try await self.cloudSync.upload(snapshot)
-                self.lastCloudSyncAt = .now
-            } catch {
-                // Silent: an edit should not raise an alert because iCloud was
-                // briefly unreachable. The next edit, or a foreground sync,
-                // retries with newer content anyway.
+            // Refreshing, resolving countries and similar automatic writes
+            // also save; only a change the user made is worth a sync.
+            let signature = await Task.detached(priority: .utility) {
+                CloudSnapshotMerge.signature(snapshot)
+            }.value
+            guard !Task.isCancelled else { return }
+            self.cloudUploadTask = nil
+            if let signature, signature == self.lastSyncedCloudSignature {
+                Self.cloudLog.info("sync: skipped, no user change since last sync")
+                return
             }
+            if let failedAt = self.lastCloudSyncFailureAt,
+               Date.now.timeIntervalSince(failedAt) < Self.cloudFailureBackoff {
+                Self.cloudLog.notice("sync: skipped, backing off after a failure")
+                return
+            }
+            Self.cloudLog.notice("sync: start reason=edit hasBaseline=\(self.lastSyncedCloudSignature != nil, privacy: .public)")
+            await self.synchronizeWithCloud()
         }
+    }
+
+    func loadCloudRecoveryCopies() async {
+        let loadID = UUID()
+        cloudRecoveryLoadID = loadID
+        isLoadingCloudRecoveryCopies = true
+        defer {
+            if cloudRecoveryLoadID == loadID { isLoadingCloudRecoveryCopies = false }
+        }
+        // Do not publish partial history: deduplication can replace a local
+        // row with a cloud version carrying a different modification date.
+        let current = CloudRecoveryCopy(id: "current-local", snapshot: currentSnapshot(updatedAt: lastLocalEditAt ?? .distantPast))
+        let store = persistence
+        let local = await Task.detached(priority: .userInitiated) {
+            (try? store.recoveryCopies()) ?? []
+        }.value
+        guard !Task.isCancelled, cloudRecoveryLoadID == loadID else { return }
+        var remote: [CloudRecoveryCopy] = []
+        do {
+            remote = try await cloudSync.recoveryCopies()
+        } catch {
+            guard !Task.isCancelled, cloudRecoveryLoadID == loadID else { return }
+            cloudSyncIssue = error.localizedDescription
+        }
+        let history = local + remote
+        let copies = await Task.detached(priority: .userInitiated) {
+            Array(CloudRecoveryCopy.unique([current] + history.sorted {
+                let left = $0.snapshot.updatedAt ?? .distantPast
+                let right = $1.snapshot.updatedAt ?? .distantPast
+                return left == right ? $0.id < $1.id : left > right
+            }).prefix(CloudSnapshotJournal.retentionLimit))
+        }.value
+        guard !Task.isCancelled, cloudRecoveryLoadID == loadID else { return }
+        cloudRecoveryCopies = copies
+    }
+
+    /// Explicit selection is the only operation allowed to resolve conflicting
+    /// branches by replacing their content. All prior commits remain recoverable.
+    func restoreCloudCopy(_ copy: CloudRecoveryCopy) async {
+        guard !isCloudSyncing, !isRemovingCloudSnapshot else { return }
+        let generation = cloudSyncGeneration
+        let syncWasEnabled = iCloudSyncEnabled
+        isCloudSyncing = true
+        cloudUploadTask?.cancel(); cloudUploadTask = nil
+        defer { isCloudSyncing = false }
+        do {
+            let original = currentSnapshot(updatedAt: lastLocalEditAt ?? .distantPast)
+            try persistence.backup(original)
+            var restored = copy.snapshot
+            restored.updatedAt = .now
+            if syncWasEnabled { try await cloudSync.resolveConflict(with: restored) }
+            guard cloudSyncGeneration == generation, !Task.isCancelled else { return }
+            // An edit while recovery was awaiting iCloud is kept, never discarded.
+            guard CloudSnapshotMerge.equal(original, currentSnapshot(updatedAt: lastLocalEditAt ?? .distantPast)) else {
+                throw CloudSyncError.conflict
+            }
+            discardPendingLocalWrite()
+            try persistence.save(restored)
+            if iCloudSyncEnabled { try persistence.saveCloudBaseline(restored) }
+            else { try persistence.clearCloudBaseline() }
+            apply(restored)
+            cloudSyncIssue = nil
+        } catch { cloudSyncIssue = error.localizedDescription }
     }
 
     /// Puts a snapshot into effect, wherever it came from.
@@ -3010,6 +4151,8 @@ final class AppModel: ObservableObject {
     /// Shared by launch and by an iCloud pull so a synced snapshot cannot be
     /// applied differently from a local one.
     private func apply(_ snapshot: AppSnapshot) {
+        let previousRuleInputs = currentRulePresentationInputs()
+        let previousPresetID = selectedPresetID
         cancelLatencyTests()
         ruleOperationGeneration = UUID()
         cancelRuleImport()
@@ -3023,14 +4166,15 @@ final class AppModel: ObservableObject {
         countryResolutionDates.removeAll()
         nodeNetworkOrganizations.removeAll()
         countryResolutionInFlightNodeIDs.removeAll()
+        presentedSubscriptionRefreshTask?.cancel()
+        presentedSubscriptionRefreshTask = nil
+        subscriptionRefreshProgress = nil
         subscriptionRefreshBatch?.task.cancel()
         subscriptionRefreshBatch = nil
         sourceUpdates.invalidateAll()
         for operation in sourceRefreshOperations.values { operation.task.cancel() }
         sourceRefreshOperations.removeAll()
         refreshingSourceIDs.removeAll()
-        schemeRuleCountCache.removeAll(keepingCapacity: true)
-        invalidateRuleSchemePresentationCaches()
         // The moment this snapshot's edits became current. Without it a launch
         // left `lastLocalEditAt` nil, so the next foreground sync compared
         // `.distantPast` against iCloud and took the remote copy unconditionally
@@ -3054,9 +4198,24 @@ final class AppModel: ObservableObject {
             RuleSchemeParser().restoringLegacySmartGroups(in: $0)
         }
         selectedRuleGroups = snapshot.selectedRuleGroups?.mapValues(Set.init) ?? [:]
-        ruleSchemeCustomizations = snapshot.ruleSchemeCustomizations ?? [:]
+        var customizations = snapshot.ruleSchemeCustomizations ?? [:]
+        // Issue #40: dragging a group used to rewrite rule priority from the
+        // display order. Drop it so routing follows the source again, and say
+        // so once per device; an older build syncing it back is cleared too.
+        let hadRulePriority = customizations.values.contains { $0.rulePriorityOrder != nil }
+        for key in customizations.keys { customizations[key]?.rulePriorityOrder = nil }
+        ruleSchemeCustomizations = customizations
+        if hadRulePriority, !UserDefaults.standard.bool(forKey: Self.rulePriorityResetNoticeKey) {
+            UserDefaults.standard.set(true, forKey: Self.rulePriorityResetNoticeKey)
+            showToast(
+                String(localized: "规则匹配顺序已恢复为方案原始顺序。"),
+                symbol: "arrow.uturn.backward.circle.fill",
+                tone: .success
+            )
+        }
         ruleGroupEmojisEnabled = snapshot.ruleGroupEmojisEnabled ?? [:]
         excludedNodeIDs = Set(snapshot.excludedNodeIDs ?? [])
+        nodeExportNameFilter = snapshot.nodeExportNameFilter
         let catalogMigratedFlows = migrateLegacyCatalogRuleFlows(snapshot.customRuleFlows ?? [])
         let localMigration = migrateLocalRuleSets(
             snapshot.localRuleSets ?? [],
@@ -3064,6 +4223,8 @@ final class AppModel: ObservableObject {
         )
         localRuleSets = localMigration.ruleSets
         customRuleFlows = localMigration.flows
+        tailnets = snapshot.tailnets ?? []
+        reconcileTailnetAuthKeys()
         excludedKinds = Self.decodeExcludedKinds(snapshot.excludedKinds)
         renewalRemindersEnabled = snapshot.renewalRemindersEnabled ?? false
         clientOrder = ClientTargetOrder.normalized(
@@ -3074,6 +4235,12 @@ final class AppModel: ObservableObject {
             rawValues: snapshot.visibleClientTargets ?? ClientPlatform.phone.defaultVisibleTargets.map(\.rawValue),
             clientOrder: clientOrder
         )
+        // Newly introduced iOS client is visible on upgrade; a later explicit
+        // hide stays authoritative once the saved order already contains it.
+        if clientPlatform == .phone, let savedOrder = snapshot.clientOrder,
+           !savedOrder.contains(ClientTarget.anywhere.rawValue) {
+            visibleClientTargets.insert(.anywhere)
+        }
         isLANSharingVisible = snapshot.isLANSharingVisible ?? true
         let usedPreviousOfficialOrder = snapshot.clientOrder == nil
             || ClientTargetOrder.matchesPreviousDefault(rawValues: snapshot.clientOrder)
@@ -3151,14 +4318,33 @@ final class AppModel: ObservableObject {
         resolvedHostCountryCodeUpdatedAt = resolvedHostCountryCodeUpdatedAt.filter {
             resolvedHostCountryCodes[$0.key] != nil
         }
+        seedKnownCountries(for: nodes)
         selectedPresetID = snapshot.selectedPresetID
-        selectedTarget = clientPlatform == .mac
+        let snapshotTarget = clientPlatform == .mac
             ? snapshot.macClientPreferences?.selectedTarget ?? .shadowrocket
             : snapshot.selectedTarget
+        snapshotSelectedTarget = snapshotTarget
+        // This device's own choice wins over whatever a snapshot carried.
+        selectedTarget = savedClientSelection ?? snapshotTarget
         if !visibleClientTargets.contains(selectedTarget),
            let fallback = visibleClientOrder.first {
             selectedTarget = fallback
         }
+        // A foreground cloud sync applies snapshots even when rules did not
+        // change. Invalidating here unconditionally erased visible statistics
+        // a second or two after entering Rules, then published them again.
+        if currentRulePresentationInputs() != previousRuleInputs
+            || (selectedScheme == nil && selectedPresetID != previousPresetID) {
+            invalidateRuleSchemePresentationCaches()
+            // Keep display-only values until the replacement is ready. Removed
+            // schemes must not retain summaries; export uses the invalidated
+            // semantic caches and therefore sees the new rules immediately.
+            let retainedIDs = Set(ruleSchemes.map(\.id))
+            if rulesPageSummaries.keys.contains(where: { !retainedIDs.contains($0) }) {
+                rulesPageSummaries = rulesPageSummaries.filter { retainedIDs.contains($0.key) }
+            }
+        }
+        recordRuleInputs()
     }
 
     /// Catalog rules briefly reused broad upstream groups such as `AI 服务`,
@@ -3213,7 +4399,7 @@ final class AppModel: ObservableObject {
         let active = ClientPlatformPreferences(
             order: clientOrder.map(\.rawValue), visibleTargets: visibleClientOrder.map(\.rawValue),
             lanSharingIndex: lanSharingOrderIndex, isLANSharingVisible: isLANSharingVisible,
-            selectedTarget: selectedTarget
+            selectedTarget: snapshotSelectedTarget
         )
         let phone = clientPlatform == .phone ? active : savedPhoneClientPreferences ?? ClientPlatformPreferences(
             order: ClientPlatform.phone.defaultOrder.map(\.rawValue),
@@ -3241,6 +4427,7 @@ final class AppModel: ObservableObject {
             excludedNodeIDs: excludedNodeIDs.isEmpty
                 ? nil
                 : excludedNodeIDs.sorted { $0.uuidString < $1.uuidString },
+            nodeExportNameFilter: nodeExportNameFilter,
             customRuleFlows: customRuleFlows.isEmpty ? nil : customRuleFlows,
             localRuleSets: localRuleSets.isEmpty ? nil : localRuleSets,
             excludedKinds: Self.encodeExcludedKinds(excludedKinds),
@@ -3269,7 +4456,8 @@ final class AppModel: ObservableObject {
             resolvedHostCountryCodeUpdatedAt: prunedResolvedHostCountryCodeUpdatedAt(),
             resolvedHostCountryDatabaseVersion: IPCountryDatabase.dataVersion,
             updatedAt: updatedAt,
-            macClientPreferences: clientPlatform == .mac ? active : savedMacClientPreferences
+            macClientPreferences: clientPlatform == .mac ? active : savedMacClientPreferences,
+            tailnets: tailnets.isEmpty ? nil : tailnets
         )
     }
 
@@ -3298,8 +4486,15 @@ final class AppModel: ObservableObject {
     /// the default and is stamped with the moment it happened.
     private func persist(invalidateRuleCounts: Bool = true, updatedAt: Date = .now) {
         if invalidateRuleCounts {
-            schemeRuleCountCache.removeAll(keepingCapacity: true)
-            invalidateRuleSchemePresentationCaches()
+            let presentation = currentRulePresentationInputs()
+            if presentation.counts != ruleCountInputs {
+                ruleCountInputs = presentation.counts
+                schemeRuleCountCache.removeAll(keepingCapacity: true)
+            }
+            if presentation != rulePresentationInputs {
+                rulePresentationInputs = presentation
+                invalidateRuleSchemePresentationCaches()
+            }
         }
         guard !isDemoMode else { return }
         // Stamp the edit now, but leave the full state walk until after SwiftUI
@@ -3320,6 +4515,22 @@ final class AppModel: ObservableObject {
                 self?.flushPendingWrite()
             }
         }
+    }
+
+    /// Saves device-local caches (resolved host countries) without stamping a
+    /// user edit or scheduling an iCloud sync: a cache is not a change anyone
+    /// made, and it used to trigger a full sync every time countries resolved.
+    private func persistLocalCache() {
+        guard !isDemoMode else { return }
+        // A pending user edit writes everything, the cache included.
+        guard pendingPersistenceUpdatedAt == nil else { return }
+        // Without a recorded edit time, keep the ordinary path rather than
+        // stamp an arbitrary one into the snapshot.
+        guard let lastLocalEditAt else {
+            persist(invalidateRuleCounts: false)
+            return
+        }
+        write(currentSnapshot(updatedAt: lastLocalEditAt))
     }
 
     /// Writes whatever the coalescing window is still holding.
@@ -3413,7 +4624,7 @@ final class AppModel: ObservableObject {
     /// and expiry dates all get written into the name — and `rawURI` often
     /// carries a rotating parameter. Tower renumbers bare-flag names itself,
     /// so adding or removing one node in a region shifts every later name.
-    nonisolated private static func nodeStableIdentity(_ node: ProxyNode) -> String {
+    nonisolated static func nodeStableIdentity(_ node: ProxyNode) -> String {
         [
             node.kind.rawValue,
             node.server.lowercased(),
@@ -3547,3 +4758,20 @@ struct SubscriptionRefreshReport: Identifiable, Equatable, Sendable {
     let totalCount: Int
     let failures: [SubscriptionRefreshFailure]
 }
+
+#if DEBUG
+/// Isolated UI fixture: exercises the real refresh lifecycle without a provider request.
+private struct RefreshPresentationTestFetcher: SubscriptionFetching {
+    let nodes: [ProxyNode]
+    func fetch(_ source: SubscriptionSource) async throws -> ImportResult {
+        // Long enough for the UI test to inspect the status before it ends.
+        try await Task.sleep(for: .seconds(15))
+        let refreshed = nodes.filter { $0.sourceID != nil }.map { node in
+            var node = node
+            node.sourceID = source.id
+            return node
+        }
+        return ImportResult(nodes: refreshed, rejectedLineCount: 0, usage: nil)
+    }
+}
+#endif
