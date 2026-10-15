@@ -29,6 +29,7 @@ jobs:
             -derivedDataPath validation/DerivedData \
             -resultBundlePath validation/CoreTests.xcresult \
             -parallel-testing-enabled NO \
+            -testLanguage zh-Hans -testRegion CN \
             -only-testing:TowerTests/RuleCatalogTests \
             -only-testing:TowerTests/GroupSupplementRuleTests \
             -only-testing:TowerTests/SubscriptionRefreshTests \
