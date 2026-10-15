@@ -1,6 +1,9 @@
 name: Validate iOS 16 backport
 on:
   workflow_dispatch:
+  push:
+    branches: [ios16]
+    paths: ['.github/workflows/validate-ios16.yml']
 permissions:
   contents: read
 jobs:
