@@ -805,12 +805,16 @@ struct ProxyNode: Identifiable, Codable, Hashable {
             udpRelayEnabled.map { $0 ? "1" : "0" } ?? "",
             upMbps.map { String($0) } ?? "", downMbps.map { String($0) } ?? ""
         ])
-        fields.append(contentsOf: [
-            wireGuardPrivateKey ?? "", wireGuardPublicKey ?? "", wireGuardPreSharedKey ?? "",
-            wireGuardIPv4 ?? "", wireGuardIPv6 ?? "", wireGuardAllowedIPs ?? "",
-            wireGuardReserved ?? "", wireGuardMTU.map { String($0) } ?? "",
-            wireGuardPersistentKeepalive.map { String($0) } ?? "", wireGuardDNS ?? ""
-        ])
+        fields.append(wireGuardPrivateKey ?? "")
+        fields.append(wireGuardPublicKey ?? "")
+        fields.append(wireGuardPreSharedKey ?? "")
+        fields.append(wireGuardIPv4 ?? "")
+        fields.append(wireGuardIPv6 ?? "")
+        fields.append(wireGuardAllowedIPs ?? "")
+        fields.append(wireGuardReserved ?? "")
+        fields.append(wireGuardMTU.map { String($0) } ?? "")
+        fields.append(wireGuardPersistentKeepalive.map { String($0) } ?? "")
+        fields.append(wireGuardDNS ?? "")
         if let shadowTLS {
             // Append only for wrapped nodes: existing persisted exclusion keys
             // for ordinary nodes must not change when adding this feature.

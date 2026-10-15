@@ -1133,7 +1133,7 @@ private struct WelcomeExportExample: View {
             }
             .padding(18).towerCard()
         }
-        .coordinateSpace(.named(Self.space))
+        .coordinateSpace(name: Self.space)
         .overlay { flight }
         .towerFeedback(.selection, trigger: client)
         .towerOnChange(of: client) { deliveries += 1 }

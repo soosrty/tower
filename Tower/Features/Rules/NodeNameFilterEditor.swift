@@ -442,9 +442,8 @@ struct NodeNameFilterPreview: View {
                         }
                     }
                 }
-                .animation(TowerMotion.selection(reduceMotion: reduceMotion)) { content in
-                    content.opacity(isCurrent ? 1 : 0.45)
-                }
+                .opacity(isCurrent ? 1 : 0.45)
+                .animation(TowerMotion.selection(reduceMotion: reduceMotion), value: isCurrent)
                 .accessibilityHidden(!isCurrent)
             } else {
                 ProgressView("正在匹配…")

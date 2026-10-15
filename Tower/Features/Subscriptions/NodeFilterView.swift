@@ -164,9 +164,6 @@ struct NodeFilterSections: View {
                     Text("节点 · \(includedFilteredNodeCount) / \(filteredNodes.count)")
                         // Scope motion to glyphs; a header transaction must not
                         // animate the List's row diff when search is dismissed.
-                        .animation(TowerMotion.selection(reduceMotion: reduceMotion)) { content in
-                            content
-                        }
                     Spacer()
                     bulkSelectionButton(
                         filteredNodes: eligibleFilteredNodes,

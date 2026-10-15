@@ -211,9 +211,6 @@ struct SourceManagementView: View {
                 HStack {
                     Text("已选择 \(selectedItemCount) 项")
                         .font(.subheadline.weight(.semibold))
-                        .animation(TowerMotion.selection(reduceMotion: reduceMotion)) { content in
-                            content
-                        }
 
                     Spacer()
 

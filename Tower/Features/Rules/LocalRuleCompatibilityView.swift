@@ -45,9 +45,8 @@ struct LocalRuleCompatibilityView: View {
                             .transition(resultTransition)
                     }
                 }
-                .animation(TowerMotion.selection(reduceMotion: reduceMotion)) { content in
-                    content.opacity(isCurrent ? 1 : 0.45)
-                }
+                .opacity(isCurrent ? 1 : 0.45)
+                .animation(TowerMotion.selection(reduceMotion: reduceMotion), value: isCurrent)
                 .accessibilityHidden(!isCurrent)
             } else {
                 Text("正在检查兼容性…")
