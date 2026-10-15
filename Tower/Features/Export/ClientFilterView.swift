@@ -527,7 +527,7 @@ struct ClientFilterView: View {
         }, completion: {
             guard settlingSession?.token == token else { return }
             settlingSession = nil
-        }
+        })
     }
 
     private func cancelDragging(_ destination: ExportDestination) {
@@ -557,7 +557,7 @@ struct ClientFilterView: View {
         }, completion: {
             guard settlingSession?.token == token else { return }
             settlingSession = nil
-        }
+        })
     }
 
     private func resetDragState() {
